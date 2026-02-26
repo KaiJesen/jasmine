@@ -405,7 +405,7 @@ struct complex_net_builder_t
     using push_back_updatable = complex_net_builder_t<val_type, net_types..., cur_net_tpl<mat_t<val_type>, updator_tpl>>;
 
     template<template<typename> class cur_net_tpl>
-    using push_back_stablenet = complex_net_builder_t<val_type, net_types..., cur_net_tpl<mat_t<val_type>>>;
+    using push_back_staticnet = complex_net_builder_t<val_type, net_types..., cur_net_tpl<mat_t<val_type>>>;
 
     template<typename new_net_type>
     using push_back_impl = complex_net_builder_t<val_type, net_types..., new_net_type>;
@@ -444,7 +444,7 @@ void test_mat_net_t()
     std::cout << "final out3: " << out3 << std::endl;
     using base_net_type = complex_net_builder_t<double> // 残差网络的基础网络，包含一个线性层和一个激活层
         ::push_back_updatable<weight_net_t, nadam_t>
-        ::push_back_stablenet<sigmoid_net_t>
+        ::push_back_staticnet<sigmoid_net_t>
         ::type;
 
 
@@ -454,10 +454,10 @@ void test_mat_net_t()
         ::push_back_impl<res_net_type>           // 增加一个残差网络，基础网络是上面定义的base_net_type
         ::push_back_updatable<layer_norm_net_t, nadam_t>
         ::push_back_updatable<weight_net_t, nadam_t>
-        ::push_back_stablenet<sigmoid_net_t>
+        ::push_back_staticnet<sigmoid_net_t>
         ::push_back_updatable<weight_net_t, nadam_t>
-        ::push_back_stablenet<sigmoid_net_t>
-        ::push_back_stablenet<mse_loss_t>
+        ::push_back_staticnet<sigmoid_net_t>
+        ::push_back_staticnet<mse_loss_t>
         ::type;
     
     cpx_net_type cnet;

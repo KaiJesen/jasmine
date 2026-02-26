@@ -22,14 +22,26 @@ private:
     ffn_type m_v_net;
     softmax_type m_softmax;
     mat_t<val_type> m_q, m_k, m_v;
+    bool m_mask;
 
 public:
-    mat_head_gen_t(int const& token_len, int const& d_model, int const& seq_len = 1)
-        : m_q_net(token_len, d_model), m_k_net(token_len, d_model), m_v_net(token_len, d_model),
-          m_q(d_model, seq_len), m_k(d_model, seq_len), m_v(d_model, seq_len)
+    mat_head_gen_t(int const& d_model, int const& seq_len = 1)
+        : m_q_net(d_model, d_model), m_k_net(d_model, d_model), m_v_net(d_model, d_model),
+          m_q(d_model, seq_len), m_k(d_model, seq_len), m_v(d_model, seq_len), m_mask(false)
     {
     }
 
+    void set_param(int const& d_model, bool const& mask = false, int const& seq_len = 1)
+    {
+        m_q_net.reinit(d_model, d_model);
+        m_k_net.reinit(d_model, d_model);
+        m_v_net.reinit(d_model, d_model);
+        m_q.reshape(d_model, seq_len);
+        m_k.reshape(d_model, seq_len);
+        m_v.reshape(d_model, seq_len);
+        m_mask = mask;
+    }
+    
     template<typename mat_type>
     requires std::is_same_v<std::decay_t<mat_type>, mat_t<val_type>>
     mat_t<val_type> forward(const mat_view_t<mat_type>& input)
@@ -39,6 +51,20 @@ public:
         m_v = m_v_net.forward(input);
 
         auto attn_scores = (m_q.t().dot(m_k) / sqrt(m_q.row_num())).clone();
+        /*!ANCHOR 掩码规则说明
+        * 由于scores=Q'K，也就是说scores中的i行j列元素表示的是Q序列中第i个值与K序列中第j个值之间的分数；
+        * Q是表示的是当前的查询，K是可关注的历史。那么就需要就针对每个Q让他只能看到之前发生的K。也就是j > i的都设置为无效的
+        */
+        if (m_mask)
+        {
+            for (int i = 0; i < attn_scores.row_num(); ++i)
+            {
+                for (int j = i + 1; j < attn_scores.col_num(); ++j)
+                {
+                    attn_scores(i, j) = -std::numeric_limits<val_type>::infinity();
+                }
+            }
+        }
         auto attn_weights = m_softmax.forward(attn_scores);
         auto output = m_v.dot(attn_weights.t()).clone();
 
@@ -50,6 +76,20 @@ public:
         mat_t<val_type> delta_v = delta.dot(m_softmax.m_output);
         mat_t<val_type> delta_attn_weights = delta.t().dot(m_v);
         mat_t<val_type> delta_qt_k = m_softmax.backward(delta_attn_weights);
+        /*!LINK - 链接规则说明
+        * 由于scores=Q'K，也就是说scores中的i行j列元素表示的是Q序列中第i个值与K序列中第j个值之间的分数；
+        * Q是表示的是当前的查询，K是可关注的历史。那么就需要就针对每个Q让他只能看到之前发生的K。也就是j > i的都设置为无效的
+        */
+        if (m_mask)
+        {
+            for (int i = 0; i < delta_qt_k.row_num(); ++i)
+            {
+                for (int j = i + 1; j < delta_qt_k.col_num(); ++j)
+                {
+                    delta_qt_k(i, j) = 0;
+                }
+            }
+        }
 
         mat_t<val_type> delta_q = m_k.dot(delta_qt_k.t()) / sqrt(m_q.row_num());
         mat_t<val_type> delta_k = m_q.dot(delta_qt_k) / sqrt(m_q.row_num());
@@ -81,12 +121,6 @@ public:
         return "mat_head_gen_t";
     }
 
-    void reinit(std::vector<int> const& container)
-    {
-        m_q_net.reinit(container);
-        m_k_net.reinit(container);
-        m_v_net.reinit(container);
-    }
 };
 
 // 垂直拼接多个 mat_t 对象（按行拼接）
@@ -143,6 +177,10 @@ std::vector<mat_view_t<mat_type>> vsplit(mat_type& mat, int num_splits)
     return views;
 }
 
+/*!SECTION: MHA
+*   多头注意力机制和线型变换网络不太一样，线型变换网络初始化时传入的是输入的维度和输出的维度，但是MHA传入的是头的数目以及模型的维度。另外，在transformer中，每一层的MHA的输入和输出都是相等维度的，另外，编码器和解码器的输出维度相等，但是序列长度可能不同。
+所以，总体上来说，就维度而言，transformer实际只需要1个整形来表示输入和输出的维度，另外需要1个整形来表示头数量。因此，我们可以将mha认为是一种stable的网络。而stable的网络不能定义reinit函数。
+*/
 template <typename input_type, template<typename> class updator_type>
 class multi_head_attention_t
 {
@@ -165,8 +203,24 @@ public:
 
         for (int i = 0; i < num_heads; ++i)
         {
-            m_heads.emplace_back(m_d_head, m_d_head, seq_len);
+            m_heads.emplace_back(m_d_head, seq_len);
         }
+    }
+
+    void set_param(int num_heads, int d_model, int seq_len = 1)
+    {
+        m_num_heads = num_heads;
+        m_d_model = d_model;
+        m_d_head = d_model / num_heads;
+
+        if (d_model % num_heads != 0)
+            throw std::runtime_error("d_model must be divisible by num_heads");
+
+        for (int i = 0; i < num_heads; ++i)
+        {
+            m_heads[i].set_param(m_d_head, seq_len);
+        }
+        m_output_proj.reinit(d_model, d_model);
     }
 
     mat_t<val_type> forward(const input_type& input)
@@ -246,14 +300,14 @@ public:
 
 void test_mat_head_gen_t()
 {
-    mat_head_gen_t<mat_view_t<mat_t<double>>, adam_t> mha(4, 2);
+    mat_head_gen_t<mat_view_t<mat_t<double>>, adam_t> mha(4);
     mha.init_weight<xavier_gaussian_t>();
     mha.set_updator(0.01);
     using head_gen_type = mat_head_gen_t<mat_view_t<mat_t<double>>, adam_t>;
     std::vector<head_gen_type> heads;
 
     mat_t<double> input(4, 2, {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8});
-    mat_t<double> expected(2, 2, {0.5, 0.2, 0.3, 0.4});
+    mat_t<double> expected(4, 2, {0.5, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8});
 
     std::cout << "input: \n" << input << std::endl;
     std::cout << "expected: \n" << expected << std::endl;
@@ -286,7 +340,6 @@ void test_mha_tools()
     }
 }
 
-#if 1
 void test_multi_head_attention()
 {
     int num_heads = 4;
@@ -311,6 +364,5 @@ void test_multi_head_attention()
     output = mha.forward(input);
     std::cout << "MHA Last Output:\n" << output << std::endl;
 }
-#endif
 
 #endif
