@@ -4,6 +4,7 @@
 #include "mat_net_t.hpp"
 #include "mat_init_t.hpp"
 #include "mat_mha_t.hpp"
+#include "mat_transformer.hpp"
 
 template<typename T>
 void foo(T x)
@@ -176,8 +177,9 @@ int main()
     //test_mat_view_t();
     //test_mat_net_t();
     //test_mat_init_t();
-    test_mat_head_gen_t();
-    test_mha_tools();
-    test_multi_head_attention();
+    //test_mat_head_gen_t();
+    //test_mha_tools();
+    //test_multi_head_attention();
+    test_encoder();
     return 0;
 }

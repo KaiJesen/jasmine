@@ -37,13 +37,23 @@ concept is_backwardable =
     };
 
 template<typename net_type>
-concept is_unstable_net =
+concept is_reinitable_net =
     requires (net_type net)
     {
         net.reinit(std::vector<int>());
     };
 
 template<typename net_type>
-concept is_stable_net = !is_unstable_net<net_type>;
+concept is_unreinitable_net = !is_reinitable_net<net_type>;
+
+template<typename net_type>
+concept is_updatable_net = 
+    requires (net_type net)
+    {
+        net.set_updator(0.01);
+    };
+
+template<typename net_type>
+concept is_unupdatable_net = !is_updatable_net<net_type>;
 
 #endif

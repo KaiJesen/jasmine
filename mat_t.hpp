@@ -16,6 +16,9 @@ template <typename val_type>
 requires std::is_arithmetic_v<val_type>
 class mat_t
 {
+    template <typename U>
+    requires std::is_arithmetic_v<U>
+    friend class mat_t;
 public:
     using return_type = val_type;
 private:
@@ -203,24 +206,26 @@ public:
     requires std::is_convertible_v<other_val_type, val_type>
     mat_t& operator=(const mat_t<other_val_type>& m) noexcept
     {
-        if (this != &m)
+        if constexpr (std::is_same_v<other_val_type, val_type>)
         {
-            if (m.is_scalar())
-            {
-                destroy();
-                init_scalar(m.m_scalar_val);
+            if (this == &m)
                 return *this;
-            }
-            else
+        }
+        if (m.is_scalar())
+        {
+            destroy();
+            init_scalar(m.m_scalar_val);
+            return *this;
+        }
+        else
+        {
+            destroy();
+            init_matrix(m.row_num(), m.col_num(), m.m_row_first);
+            for (int i = 0; i < row_num(); ++i)
             {
-                destroy();
-                init_matrix(m.row_num(), m.col_num(), m.m_row_first);
-                for (int i = 0; i < row_num(); ++i)
+                for (int j = 0; j < col_num(); ++j)
                 {
-                    for (int j = 0; j < col_num(); ++j)
-                    {
-                        (*this)(i, j) = static_cast<val_type>(m(i, j));
-                    }
+                    (*this)(i, j) = static_cast<val_type>(m(i, j));
                 }
             }
         }

@@ -25,17 +25,17 @@ private:
     bool m_mask;
 
 public:
-    mat_head_gen_t(int const& d_model, int const& seq_len = 1)
+    mat_head_gen_t(int const& d_model = 1, bool const& mask = false, int const& seq_len = 1)
         : m_q_net(d_model, d_model), m_k_net(d_model, d_model), m_v_net(d_model, d_model),
-          m_q(d_model, seq_len), m_k(d_model, seq_len), m_v(d_model, seq_len), m_mask(false)
+          m_q(d_model, seq_len), m_k(d_model, seq_len), m_v(d_model, seq_len), m_mask(mask)
     {
     }
 
     void set_param(int const& d_model, bool const& mask = false, int const& seq_len = 1)
     {
-        m_q_net.reinit(d_model, d_model);
-        m_k_net.reinit(d_model, d_model);
-        m_v_net.reinit(d_model, d_model);
+        m_q_net.reinit(std::vector<int>(d_model, d_model));
+        m_k_net.reinit(std::vector<int>(d_model, d_model));
+        m_v_net.reinit(std::vector<int>(d_model, d_model));
         m_q.reshape(d_model, seq_len);
         m_k.reshape(d_model, seq_len);
         m_v.reshape(d_model, seq_len);
@@ -91,8 +91,8 @@ public:
             }
         }
 
-        mat_t<val_type> delta_q = m_k.dot(delta_qt_k.t()) / sqrt(m_q.row_num());
-        mat_t<val_type> delta_k = m_q.dot(delta_qt_k) / sqrt(m_q.row_num());
+        mat_t<val_type> delta_q = m_k.dot(delta_qt_k.t()) / static_cast<val_type>(sqrt(m_q.row_num()));
+        mat_t<val_type> delta_k = m_q.dot(delta_qt_k) / static_cast<val_type>(sqrt(m_q.row_num()));
 
         mat_t<val_type> delta_input =
             m_q_net.backward(delta_q) + m_k_net.backward(delta_k) + m_v_net.backward(delta_v);
@@ -182,7 +182,7 @@ std::vector<mat_view_t<mat_type>> vsplit(mat_type& mat, int num_splits)
 所以，总体上来说，就维度而言，transformer实际只需要1个整形来表示输入和输出的维度，另外需要1个整形来表示头数量。因此，我们可以将mha认为是一种stable的网络。而stable的网络不能定义reinit函数。
 */
 template <typename input_type, template<typename> class updator_type>
-class multi_head_attention_t
+class mat_mha_t
 {
 public:
     using val_type = typename input_type::return_type;
@@ -195,19 +195,20 @@ private:
     int m_d_head;
 
 public:
-    multi_head_attention_t(int num_heads, int d_model, int seq_len = 1)
+    mat_mha_t(int num_heads = 1, int d_model = 1, bool mask = false, int seq_len = 1)
         : m_output_proj(d_model, d_model), m_num_heads(num_heads), m_d_model(d_model), m_d_head(d_model / num_heads)
     {
+        /* 设置默认构造参数目的是让其可以没有参数进行构造，以便放入其他复杂网络结构中 */
         if (d_model % num_heads != 0)
             throw std::runtime_error("d_model must be divisible by num_heads");
 
         for (int i = 0; i < num_heads; ++i)
         {
-            m_heads.emplace_back(m_d_head, seq_len);
+            m_heads.emplace_back(m_d_head, mask, seq_len);
         }
     }
 
-    void set_param(int num_heads, int d_model, int seq_len = 1)
+    void set_param(int num_heads, int d_model, bool mask = false, int seq_len = 1)
     {
         m_num_heads = num_heads;
         m_d_model = d_model;
@@ -216,11 +217,12 @@ public:
         if (d_model % num_heads != 0)
             throw std::runtime_error("d_model must be divisible by num_heads");
 
+        m_heads.resize(num_heads);
         for (int i = 0; i < num_heads; ++i)
         {
-            m_heads[i].set_param(m_d_head, seq_len);
+            m_heads[i].set_param(m_d_head, mask, seq_len);
         }
-        m_output_proj.reinit(d_model, d_model);
+        m_output_proj.reinit(std::vector<int>(d_model, d_model));
     }
 
     mat_t<val_type> forward(const input_type& input)
@@ -251,7 +253,7 @@ public:
         return final_output;
     }
 
-    mat_t<val_type> backward(const mat_view_t<mat_t<val_type>>& delta)
+    mat_t<val_type> backward(const input_type& delta)
     {
         // 反向传播到线性变换层
         auto delta_concat = m_output_proj.backward(delta);
@@ -293,6 +295,11 @@ public:
             head.template init_weight<init_type>();
         }
         m_output_proj.template init_weight<init_type>();
+    }
+
+    std::string net_type() const
+    {
+        return std::string("MHA") + "(heads:" + std::to_string(m_num_heads) + ", d_model:" + std::to_string(m_d_model) + ")";
     }
 };
 
@@ -346,7 +353,7 @@ void test_multi_head_attention()
     int d_model = 8;
     int seq_len = 2;
 
-    multi_head_attention_t<mat_t<double>, nadam_t> mha(num_heads, d_model, seq_len);
+    mat_mha_t<mat_t<double>, nadam_t> mha(num_heads, d_model, seq_len);
     mha.init_weight<xavier_gaussian_t>();
     mha.set_updator(0.01);
 

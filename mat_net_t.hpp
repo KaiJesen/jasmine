@@ -65,9 +65,9 @@ public:
     template <typename other_type>
     mat_t<val_type> backward(const other_type& delta)
     {
-        auto delta_weight = delta.dot(m_input.t());
+        auto delta_weight = delta.dot(m_input.t()).clone();
         auto delta_bias = hsum(delta);
-        mat_t<val_type> ret = m_weight.t().dot(delta);
+        mat_t<val_type> ret = m_weight.t().dot(delta).clone();
         // 更新权重和偏置
         m_weight_updator.update(delta_weight, m_weight);
         m_bias_updator.update(delta_bias, m_bias);
@@ -283,6 +283,11 @@ public:
         return m_net;
     }
 
+    base_net_type const& base_net() const
+    {
+        return m_net;
+    }
+
     mat_t<val_type> forward(const mat_t<val_type>& input)
     {
         return m_net.forward(input) + input;
@@ -290,7 +295,7 @@ public:
     template <typename other_type>
     auto backward(const other_type& delta)
     {
-        return m_net.backward(delta) + delta;
+        return (m_net.backward(delta) + delta).clone();
     }
     std::string net_type() const
     {
@@ -310,6 +315,11 @@ public:
         return m_net.template get<nums...>();
     }
 
+    template <size_t...nums>
+    decltype(auto) get() const
+    {
+        return m_net.template get<nums...>();
+    }
 };
 
 template <typename... net_types>
@@ -342,7 +352,7 @@ public:
     void reinit(container_type const& container)      // 如果是稳定网络则不需要重新初始化
     {
         using mbr_net_type = std::tuple_element_t<N, std::tuple<net_types...>>;
-        if constexpr (is_unstable_net<mbr_net_type>)    // 有状态的网络层需要初始化权重
+        if constexpr (is_reinitable_net<mbr_net_type>)    // 有状态的网络层需要初始化权重
         {
             if (I + 1 >= container.size())
             {
@@ -361,6 +371,26 @@ public:
                 reinit<container_type, N + 1, I>(container);
             }
         }
+    }
+
+    template <size_t N, typename...upr_arg_types>
+    void set_updator__(upr_arg_types&&... args)
+    {
+        using mbr_net_type = std::tuple_element_t<N, std::tuple<net_types...>>;
+        if constexpr (is_updatable_net<mbr_net_type>)
+        {
+            std::get<N>(m_nets).set_updator(std::forward<upr_arg_types>(args)...);
+        }
+        if constexpr (N + 1 < sizeof...(net_types))
+        {
+            set_updator__<N + 1, upr_arg_types...>(std::forward<upr_arg_types>(args)...);
+        }
+    }
+
+    template <typename...upr_arg_types>
+    void set_updator(upr_arg_types&&... args)
+    {
+        set_updator__<0, upr_arg_types...>(std::forward<upr_arg_types>(args)...);
     }
 
     template <typename init_type>
@@ -396,8 +426,24 @@ public:
         }
     }
 
+    template<size_t N, size_t...nums>
+    decltype(auto) get() const
+    {
+        if constexpr (sizeof...(nums) == 0)
+        {
+            return std::get<N>(m_nets);
+        }
+        else
+        {
+            return std::get<N>(m_nets).template get<nums...>();
+        }
+    }
 };
 
+/*
+ * 复杂网络构造器存在意义说明：如果直接构建复杂网络需要一次性输入各层的网络实例，不够灵活，且不够清晰。复杂网络构造器则提供了一套接口，可以逐步构建复杂网络的结构，并且在构建过程中可以清晰地看到每一步的网络结构变化，同时也可以在构建过程中设置每一层的参数，最后一步才生成复杂网络实例。
+ * 并且可以不用为每层网络设置val_type参数，复杂网络构造器会自动推断出每层网络的val_type参数，避免了重复输入参数的麻烦。
+ */
 template <typename val_type, typename...net_types>
 struct complex_net_builder_t
 {
