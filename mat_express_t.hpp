@@ -222,6 +222,34 @@ auto operator+(lval_type const& left, rval_type const& right)
     return mat_add_t<lval_type, rval_type>(left, right);
 }
 
+template<typename lval_type, typename rval_type>
+requires is_matrix<lval_type> && is_matrix<rval_type>
+decltype(auto) operator+=(lval_type& left, rval_type const& right)
+{
+    for (int i = 0; i < left.row_num(); ++i)
+    {
+        for (int j = 0; j < left.col_num(); ++j)
+        {
+            left(i, j) += right(i, j);
+        }
+    }
+    return left;
+}
+
+template<typename lval_type, typename rval_type>
+requires is_matrix<lval_type> && std::is_arithmetic_v<rval_type>
+decltype(auto) operator+=(lval_type& left, rval_type const& right)
+{
+    for (int i = 0; i < left.row_num(); ++i)
+    {
+        for (int j = 0; j < left.col_num(); ++j)
+        {
+            left(i, j) += right;
+        }
+    }
+    return left;
+}
+
 template <typename lval_type, typename rval_type>
 class mat_sub_t:public mat_express_2_param_stable_t<lval_type, rval_type, mat_sub_t>
 {

@@ -71,6 +71,22 @@ public:
         return output;
     }
 
+    template<typename mat_type>
+    requires std::is_same_v<std::decay_t<mat_type>, mat_t<val_type>>
+    mat_t<val_type> forward(const mat_view_t<mat_type>& decoder_input, const mat_view_t<mat_type>& encoder_input)
+    {
+        m_q = m_q_net.forward(decoder_input); // Q 为 [d_model, seq_len]
+        m_k = m_k_net.forward(encoder_input);
+        m_v = m_v_net.forward(encoder_input);
+
+        auto attn_scores = (m_q.t().dot(m_k) / sqrt(m_q.row_num())).clone();
+        // 较差注意力不需要mask层
+        auto attn_weights = m_softmax.forward(attn_scores);
+        auto output = m_v.dot(attn_weights.t()).clone();
+
+        return output;
+    }
+
     mat_t<val_type> backward(const mat_view_t<mat_t<val_type>>& delta)
     {
         mat_t<val_type> delta_v = delta.dot(m_softmax.m_output);
@@ -97,6 +113,18 @@ public:
         mat_t<val_type> delta_input =
             m_q_net.backward(delta_q) + m_k_net.backward(delta_k) + m_v_net.backward(delta_v);
 
+        return delta_input;
+    }
+
+    mat_t<val_type> backward(const mat_view_t<mat_t<val_type>>& delta, mat_view_t<mat_t<val_type>>& encoder_delta)
+    {
+        mat_t<val_type> delta_v = delta.dot(m_softmax.m_output);
+        mat_t<val_type> delta_attn_weights = delta.t().dot(m_v);
+        mat_t<val_type> delta_qt_k = m_softmax.backward(delta_attn_weights);
+        mat_t<val_type> delta_q = m_k.dot(delta_qt_k.t()) / static_cast<val_type>(sqrt(m_q.row_num()));
+        mat_t<val_type> delta_k = m_q.dot(delta_qt_k) / static_cast<val_type>(sqrt(m_q.row_num()));
+        encoder_delta += ((m_k_net.backward(delta_k) + m_v_net.backward(delta_v)));
+        mat_t<val_type> delta_input = m_q_net.backward(delta_q);
         return delta_input;
     }
 
@@ -253,6 +281,37 @@ public:
         return final_output;
     }
 
+    mat_t<val_type> forward(const input_type& input, const input_type& encoder_input)
+    {
+        // Step 1: 检查输入维度是否合法
+        if (input.row_num() != m_d_model)
+            throw std::runtime_error("Input row dimension must match d_model");
+        if (encoder_input.row_num() != m_d_model)
+            throw std::runtime_error("Encoder input row dimension must match d_model");
+
+        // Step 2: 按头数分割输入矩阵
+        auto input_splits = vsplit(input, m_num_heads);
+        auto encoder_input_splits = vsplit(encoder_input, m_num_heads);
+
+        // Step 3: 每个头独立进行正向传播
+        std::vector<mat_t<val_type>> head_outputs;
+        head_outputs.reserve(m_num_heads);
+
+        for (int i = 0; i < m_num_heads; ++i)
+        {
+            auto head_output = m_heads[i].forward(input_splits[i], encoder_input_splits[i]);
+            head_outputs.push_back(head_output);
+        }
+
+        // Step 4: 拼接所有头的输出
+        mat_t<val_type> concatenated_output = vconcat(head_outputs);
+
+        // Step 5: 通过输出映射网络得到最终结果
+        auto final_output = m_output_proj.forward(concatenated_output);
+
+        return final_output;
+    }
+
     mat_t<val_type> backward(const input_type& delta)
     {
         // 反向传播到线性变换层
@@ -271,6 +330,32 @@ public:
         for (int i = 0; i < m_num_heads; ++i)
         {
             auto delta_input = m_heads[i].backward(deltas[i]);
+            total_delta_views[i].assign(delta_input); // 使用 assign 将结果写入对应位置
+        }
+
+        return total_delta;
+    }
+
+    // 交叉注意力机制使用，encoder_delta会在各层使用累加的方式计算，但是要记得最后除以层数
+    mat_t<val_type> backward(const input_type& delta, mat_t<val_type>& encoder_delta)
+    {
+        // 反向传播到线性变换层
+        auto delta_concat = m_output_proj.backward(delta);
+
+        // 按行分割 delta_concat 为多个子矩阵（视图）
+        auto deltas = vsplit(delta_concat, m_num_heads);
+
+        // 创建一个与输入大小相同的零矩阵，用于累加所有头的梯度
+        mat_t<val_type> total_delta(delta.row_num(), delta.col_num(), 0.0);
+
+        // 为 total_delta 创建视图，方便按块赋值
+        std::vector<mat_view_t<mat_t<val_type>>> total_delta_views = vsplit(total_delta, m_num_heads);
+        std::vector<mat_view_t<mat_t<val_type>>> encoder_delta_views = vsplit(encoder_delta, m_num_heads);
+
+        // 对每个头执行反向传播，并将结果赋值到对应的视图中
+        for (int i = 0; i < m_num_heads; ++i)
+        {
+            auto delta_input = m_heads[i].backward(deltas[i], encoder_delta_views[i]);
             total_delta_views[i].assign(delta_input); // 使用 assign 将结果写入对应位置
         }
 
@@ -302,6 +387,46 @@ public:
         return std::string("MHA") + "(heads:" + std::to_string(m_num_heads) + ", d_model:" + std::to_string(m_d_model) + ")";
     }
 };
+
+template <typename input_type, template<typename> class updator_type>
+class mat_mhca_t:public mat_mha_t<input_type, updator_type>
+{
+public:
+    using base_type = mat_mha_t<input_type, updator_type>;
+    using val_type = typename input_type::return_type;
+private:
+    mat_t<val_type>* m_encoder_output;   // 用于保存编码器的输出，以便交叉注意力机制使用
+    mat_t<val_type>* m_encoder_delta;    // 用于保存编码器的梯度，以便交叉注意力机制使用
+public:
+    mat_mhca_t(int num_heads = 1, int d_model = 1, bool mask = false, int seq_len = 1): base_type(num_heads, d_model, mask, seq_len)
+    {
+        m_encoder_output = nullptr;
+        m_encoder_delta = nullptr;
+    }
+
+    void set_encoder_param(mat_t<val_type>& encoder_output, mat_t<val_type>& encoder_delta)
+    {
+        m_encoder_output = &encoder_output;
+        m_encoder_delta = &encoder_delta;
+    }
+
+    mat_t<val_type> forward(const input_type& input)
+    {
+        if (m_encoder_output == nullptr)
+            throw std::runtime_error("Encoder output not set for cross attention");
+
+        return base_type::forward(input, *m_encoder_output);
+    }
+
+    mat_t<val_type> backward(const input_type& delta)
+    {
+        if (m_encoder_delta == nullptr)
+            throw std::runtime_error("Encoder delta not set for cross attention");
+
+        return base_type::backward(delta, *m_encoder_delta);
+    }
+};
+
 
 #include "mat_updator_t.hpp"
 
