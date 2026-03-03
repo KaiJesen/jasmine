@@ -43,15 +43,17 @@ public:
         return mean(pow(base_type::m_input - target));
     }
 
-    std::string net_type() const
+    std::string net_type(int const& indent = 0) const
     {
         std::stringstream ss;
-        ss << "mse_loss_t";
+        ss << print_indent(indent) << "mse_loss_t";
         return ss.str();
     }
 
     template <typename init_type>
     void init_weight(){}
+
+    void step(){}
 };
 
 

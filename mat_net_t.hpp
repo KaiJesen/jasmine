@@ -74,11 +74,17 @@ public:
         return ret;
     }
 
-    std::string net_type() const
+    std::string net_type(int const& indent = 0) const
     {
         std::stringstream ss;
-        ss << "weight_net_t:(in:" << m_weight.col_num() << ", out:" << m_weight.row_num() << ")";
+        ss << print_indent(indent) << "weight_net_t:(in:" << m_weight.col_num() << ", out:" << m_weight.row_num() << ")";
         return ss.str();
+    }
+
+    void step()
+    {
+        m_weight_updator.step();
+        m_bias_updator.step();
     }
 };
 
@@ -109,15 +115,20 @@ public:
         return delta_sigmoid.clone();
     }
 
-    std::string net_type() const
+    std::string net_type(int const& indent = 0) const
     {
         std::stringstream ss;
-        ss << "sigmoid_net_t";
+        ss << print_indent(indent) << "sigmoid_net_t";
         return ss.str();
     }
 
     template<typename init_type>
     void init_weight()
+    {
+        // 什么也不做
+    }
+
+    void step()
     {
         // 什么也不做
     }
@@ -136,9 +147,9 @@ public:
     {
         m_input = input.clone();
         //return relu(m_input).clone();
-        auto ret = (m_input > 0) * m_input;     // 直接用表达式模板计算，避免中间变量
+        //auto ret = (m_input > 0) * m_input;     // 直接用表达式模板计算，避免中间变量
         //std::cout << "ReLu forward: input \n" << input << " \noutput \n" << ret << std::endl;
-        return ret;
+        return (m_input > 0) * m_input;     // 直接用表达式模板计算，避免中间变量
     }
 
     template <typename other_type>
@@ -148,18 +159,25 @@ public:
         {
             throw std::runtime_error("delta size does not match input size");
         }
-        auto delta_relu = delta.clone() * (m_input > 0);
-        return delta_relu.clone();
+        //auto delta_relu = delta.clone() * (m_input > 0);
+        //return delta_relu.clone();
+        return (delta * (m_input > 0)).clone();     // 直接用表达式模板计算，避免中间变量，表达式模板不应该被保存为中间变量，因为会导致引用失效
     }
-    std::string net_type() const
+
+    std::string net_type(int const& indent = 0) const
     {
         std::stringstream ss;
-        ss << "relu_net_t";
+        ss << print_indent(indent) << "relu_net_t";
         return ss.str();
     }
 
     template<typename init_type>
     void init_weight()
+    {
+        // 什么也不做
+    }
+
+    void step()
     {
         // 什么也不做
     }
@@ -216,10 +234,10 @@ public:
         return L_input.clone();
     }
 
-    std::string net_type() const
+    std::string net_type(int const& indent = 0) const
     {
         std::stringstream ss;
-        ss << "layer_norm_net_t";
+        ss << print_indent(indent) << "layer_norm_net_t";
         return ss.str();
     }
 
@@ -228,6 +246,12 @@ public:
     {
         init_matrix<init_type>(m_gama);
         init_matrix<init_type>(m_beta);
+    }
+
+    void step()
+    {
+        m_gama_updator.step();
+        m_beta_updator.step();
     }
 };
 
@@ -252,10 +276,10 @@ public:
         return grad;
     }
 
-    std::string net_type() const
+    std::string net_type(int const& indent = 0) const
     {
         std::stringstream ss;
-        ss << "hsoftmax_net_t";
+        ss << print_indent(indent) << "hsoftmax_net_t";
         return ss.str();
     }
 
@@ -264,6 +288,9 @@ public:
     {
         // 不需要初始化权重
     }
+
+    void step()
+    {}
 };
 
 template <typename base_net_type>
@@ -297,12 +324,13 @@ public:
     {
         return (m_net.backward(delta) + delta).clone();
     }
-    std::string net_type() const
+    std::string net_type(int const& indent = 0) const
     {
         std::stringstream ss;
-        ss << "residual_net_t:" << m_net.net_type();
+        ss << print_indent(indent) << "residual_net_t:\n" << m_net.net_type(indent + 2);
         return ss.str();
     }
+
     template<typename init_type>
     void init_weight()
     {
@@ -319,6 +347,11 @@ public:
     decltype(auto) get() const
     {
         return m_net.template get<nums...>();
+    }
+
+    void step()
+    {
+        m_net.step();
     }
 };
 
@@ -399,12 +432,18 @@ public:
         std::apply([](auto&&... nets) {((nets.template init_weight<init_type>()),...); }, m_nets);
     }
 
-    std::string net_type() const
+    void step()
+    {
+        std::apply([](auto&&... nets) {((nets.step()),...); }, m_nets);
+    }
+
+    std::string net_type(int const& indent = 0) const
     {
         std::stringstream ss;
-        ss << "complex_net_t = [";
-        std::apply([&ss](auto&&... nets) {((ss << nets.net_type() << " >> "),...); }, m_nets);
-        ss << "$output]";
+        ss << print_indent(indent) << "complex_net_t = [";
+        std::apply([&ss, indent](auto&&... nets) {((ss << std::endl << nets.net_type(indent + 2)),...); }, m_nets);
+        ss << std::endl
+        << print_indent(indent) << "]";
         return ss.str();
     }
 

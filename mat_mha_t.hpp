@@ -144,9 +144,16 @@ public:
         m_v_net.template init_weight<init_type>();
     }
 
-    std::string net_type() const
+    std::string net_type(int const& indent = 0) const
     {
-        return "mat_head_gen_t";
+        return print_indent(indent) + "mat_head_gen_t";
+    }
+
+    void step()
+    {
+        m_q_net.step();
+        m_k_net.step();
+        m_v_net.step();
     }
 
 };
@@ -382,10 +389,20 @@ public:
         m_output_proj.template init_weight<init_type>();
     }
 
-    std::string net_type() const
+    std::string net_type(int const& indent = 0) const
     {
-        return std::string("MHA") + "(heads:" + std::to_string(m_num_heads) + ", d_model:" + std::to_string(m_d_model) + ")";
+        return print_indent(indent) + "MHA(heads:" + std::to_string(m_num_heads) + ", d_model:" + std::to_string(m_d_model) + ")";
     }
+
+    void step()
+    {
+        for (auto& head: m_heads)
+        {
+            head.step();
+        }
+        m_output_proj.step();
+    }
+
 };
 
 template <typename input_type, template<typename> class updator_type>
@@ -425,6 +442,12 @@ public:
 
         return base_type::backward(delta, *m_encoder_delta);
     }
+
+    void step()
+    {
+        base_type::step();
+    }
+
 };
 
 

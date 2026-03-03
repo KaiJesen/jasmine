@@ -181,6 +181,7 @@ int main()
     //test_mha_tools();
     //test_multi_head_attention();
     //test_encoder();
-    test_decoder();
+    //test_decoder();
+    test_tf_kernel();
     return 0;
 }

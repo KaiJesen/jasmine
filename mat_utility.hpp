@@ -89,5 +89,12 @@ decltype(auto) rapply(_Fn&& __f, _Tuple&& __t)
                          _Indices{});
 }
 
+std::string print_indent(int const indent)
+{
+    std::string ret;
+    for (int i = 0; i < indent; ++i)
+        ret += "  ";
+    return ret;
+}
 
 #endif

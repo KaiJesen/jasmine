@@ -159,6 +159,20 @@ public:
         }
     }
 
+    template<typename scalar_type>
+    requires std::is_arithmetic_v<scalar_type>
+    mat_t& operator=(scalar_type s) noexcept
+    {
+        for (int i = 0; i < row_num(); ++i)
+        {
+            for (int j = 0; j < col_num(); ++j)
+            {
+                (*this)(i, j) = static_cast<val_type>(s);
+            }
+        }
+        return *this;
+    }
+
     mat_t& operator=(const mat_t<val_type>& m) noexcept
     { 
         if (this != &m)
