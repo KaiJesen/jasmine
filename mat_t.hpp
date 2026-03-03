@@ -20,7 +20,7 @@ class mat_t
     requires std::is_arithmetic_v<U>
     friend class mat_t;
 public:
-    using return_type = val_type;
+    using ele_type = val_type;
 private:
     int m_dims[2];          // 维度数组，0为内层维度，1为外层维度
     val_type *m_data;       // 由先内层后外层紧密排列
@@ -41,7 +41,7 @@ private:
         m_data = nullptr;
     }
 
-    inline void init_scalar(const return_type& val) noexcept
+    inline void init_scalar(const ele_type& val) noexcept
     {
         m_scalar = true;
         m_scalar_val = val;
@@ -73,7 +73,7 @@ public:
         : m_dims{0, 0}, m_data(nullptr), m_row_first(true), m_scalar(false), m_scalar_val(0)
     {}
 
-    mat_t(const return_type& val) noexcept
+    mat_t(const ele_type& val) noexcept
         : m_dims{1, 1}, m_data(nullptr), m_row_first(true), m_scalar(true), m_scalar_val(val)
     {
         init_scalar(val);

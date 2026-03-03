@@ -8,8 +8,8 @@ template <typename agent_type>
 class mat_view_t
 { 
 public:
-    using val_type = typename agent_type::return_type;
-    using return_type = val_type;
+    using val_type = typename agent_type::ele_type;
+    using ele_type = val_type;
 private:
     agent_type &m_mat;
     int m_row_offset;

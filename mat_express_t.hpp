@@ -38,10 +38,10 @@ class mat_express_2_param_stable_t
 public:
     using lval_storage_type = storage_type<lval_type>;
     using rval_storage_type = storage_type<rval_type>;
-    using lval_base_type = typename std::decay_t<lval_storage_type>::return_type;
-    using rval_base_type = typename std::decay_t<rval_storage_type>::return_type;
+    using lval_base_type = typename std::decay_t<lval_storage_type>::ele_type;
+    using rval_base_type = typename std::decay_t<rval_storage_type>::ele_type;
     using derived_type = tpl<lval_type, rval_type>;
-    using return_type = std::common_type_t<lval_base_type, rval_base_type>;
+    using ele_type = std::common_type_t<lval_base_type, rval_base_type>;
 
     mat_express_2_param_stable_t(lval_type const& left, rval_type const& right)
         : m_left(left), m_right(right)
@@ -93,9 +93,9 @@ public:
     }
 
     // 计算所有元素的值，并赋值给一个新的mat_t对象并返回
-    mat_t<return_type> clone() const
+    mat_t<ele_type> clone() const
     {
-        mat_t<return_type> m(row_num(), col_num());
+        mat_t<ele_type> m(row_num(), col_num());
         for (int i = 0; i < row_num(); ++i)
         {
             for (int j = 0; j < col_num(); ++j)
@@ -106,7 +106,7 @@ public:
         return m;
     }
 
-    operator mat_t<return_type>() const
+    operator mat_t<ele_type>() const
     {
         return clone();
     }
@@ -126,7 +126,7 @@ public:
     using base_type = mat_express_2_param_stable_t<lval_type, rval_type, mat_greater_t>;
     using lval_base_type = typename base_type::lval_base_type;
     using rval_base_type = typename base_type::rval_base_type;
-    using return_type = std::common_type_t<lval_base_type, rval_base_type>;
+    using ele_type = std::common_type_t<lval_base_type, rval_base_type>;
     mat_greater_t(lval_type const& left, rval_type const& right)
         : base_type(left, right)
     {
@@ -160,7 +160,7 @@ public:
     using base_type = mat_express_2_param_stable_t<lval_type, rval_type, mat_less_t>;
     using lval_base_type = typename base_type::lval_base_type;
     using rval_base_type = typename base_type::rval_base_type;
-    using return_type = std::common_type_t<lval_base_type, rval_base_type>;
+    using ele_type = std::common_type_t<lval_base_type, rval_base_type>;
 
     mat_less_t(lval_type const& left, rval_type const& right)
         : base_type(left, right)
@@ -195,7 +195,7 @@ public:
     using base_type = mat_express_2_param_stable_t<lval_type, rval_type, mat_add_t>;
     using lval_base_type = typename base_type::lval_base_type;
     using rval_base_type = typename base_type::rval_base_type;
-    using return_type = std::common_type_t<lval_base_type, rval_base_type>;
+    using ele_type = std::common_type_t<lval_base_type, rval_base_type>;
 
 
     mat_add_t(lval_type const& left, rval_type const& right)
@@ -260,7 +260,7 @@ public:
     using base_type = mat_express_2_param_stable_t<lval_type, rval_type, mat_sub_t>;
     using lval_base_type = typename base_type::lval_base_type;
     using rval_base_type = typename base_type::rval_base_type;
-    using return_type = std::common_type_t<lval_base_type, rval_base_type>;
+    using ele_type = std::common_type_t<lval_base_type, rval_base_type>;
 
     mat_sub_t(lval_type const& left, rval_type const& right)
         : base_type(left, right)
@@ -295,7 +295,7 @@ public:
     using base_type = mat_express_2_param_stable_t<lval_type, rval_type, mat_mul_t>;
     using lval_base_type = typename base_type::lval_base_type;
     using rval_base_type = typename base_type::rval_base_type;
-    using return_type = std::common_type_t<lval_base_type, rval_base_type>;
+    using ele_type = std::common_type_t<lval_base_type, rval_base_type>;
 
     mat_mul_t(lval_type const& left, rval_type const& right)
         : base_type(left, right)
@@ -330,7 +330,7 @@ public:
     using base_type = mat_express_2_param_stable_t<lval_type, rval_type, mat_div_t>;
     using lval_base_type = typename base_type::lval_base_type;
     using rval_base_type = typename base_type::rval_base_type;
-    using return_type = std::common_type_t<lval_base_type, rval_base_type>;
+    using ele_type = std::common_type_t<lval_base_type, rval_base_type>;
 
 
     mat_div_t(lval_type const& left, rval_type const& right)
@@ -363,8 +363,8 @@ class mat_express_1_param_stable_t
 public:
     using derived_type = tpl<val_type>;
     using val_storage_type = storage_type<val_type>;
-    using val_base_type = typename std::decay_t<val_storage_type>::return_type;
-    using return_type = val_base_type;
+    using val_base_type = typename std::decay_t<val_storage_type>::ele_type;
+    using ele_type = val_base_type;
 
     mat_express_1_param_stable_t(val_type const& val)
         : m_val(val)
@@ -413,9 +413,9 @@ public:
         return ::dot(*reinterpret_cast<derived_type const*>(this), m);
     }
 
-    mat_t<return_type> clone() const
+    mat_t<ele_type> clone() const
     {
-        mat_t<return_type> m(row_num(), col_num());
+        mat_t<ele_type> m(row_num(), col_num());
         for (int i = 0; i < row_num(); ++i)
         {
             for (int j = 0; j < col_num(); ++j)
@@ -426,7 +426,7 @@ public:
         return m;
     }
 
-    operator mat_t<return_type>() const
+    operator mat_t<ele_type>() const
     {
         return clone();
     }
@@ -441,7 +441,7 @@ class mat_exp_t:public mat_express_1_param_stable_t<val_type, mat_exp_t>
 {
 public:
     using base_type = mat_express_1_param_stable_t<val_type, mat_exp_t>;
-    using return_type = typename val_type::return_type;
+    using ele_type = typename val_type::ele_type;
     using val_base_type = typename base_type::val_base_type;
 
     mat_exp_t(val_type const& val)
@@ -483,7 +483,7 @@ class mat_sigmoid_t:public mat_express_1_param_stable_t<val_type, mat_sigmoid_t>
 public:
     using base_type = mat_express_1_param_stable_t<val_type, mat_sigmoid_t>;
     using val_base_type = typename base_type::val_base_type;
-    using return_type = typename val_type::return_type;
+    using ele_type = typename val_type::ele_type;
 
     mat_sigmoid_t(val_type const& val)
         : mat_express_1_param_stable_t<val_type, mat_sigmoid_t>(val)
@@ -519,8 +519,8 @@ template <typename val_type>
 requires is_matrix<val_type>
 auto sum(val_type const& val)
 { 
-    using return_type = typename val_type::return_type;
-    return_type s = 0.;
+    using ele_type = typename val_type::ele_type;
+    ele_type s = 0.;
     for (int i = 0; i < val.row_num(); ++i)
         for (int j = 0; j < val.col_num(); ++j)
             s += val(i, j);
@@ -531,11 +531,11 @@ template <typename val_type>
 requires is_matrix<val_type>
 auto vsum(val_type const& val)           // 每一列的和，返回一个1行col_num列的矩阵
 {
-    using return_type = typename val_type::return_type;
-    mat_t<return_type> result(1, val.col_num());
+    using ele_type = typename val_type::ele_type;
+    mat_t<ele_type> result(1, val.col_num());
     for (int j = 0; j < val.col_num(); ++j)
     {
-        return_type s = 0.;
+        ele_type s = 0.;
         for (int i = 0; i < val.row_num(); ++i)
         {
             s += val(i, j);
@@ -549,11 +549,11 @@ template <typename val_type>
 requires is_matrix<val_type>
 auto hsum(val_type const& val)           // 每一行的和，返回一个row_num行1列的矩阵
 {
-    using return_type = typename val_type::return_type;
-    mat_t<return_type> result(val.row_num(), 1);
+    using ele_type = typename val_type::ele_type;
+    mat_t<ele_type> result(val.row_num(), 1);
     for (int i = 0; i < val.row_num(); ++i)
     {
-        return_type s = 0.;
+        ele_type s = 0.;
         for (int j = 0; j < val.col_num(); ++j)
         {
             s += val(i, j);
@@ -587,7 +587,7 @@ auto mean(val_type const& val)
 template <typename input_type>
 auto pow(input_type const& val, double const p = 2.)
 {
-    using val_type = typename std::decay_t<input_type>::return_type;
+    using val_type = typename std::decay_t<input_type>::ele_type;
     mat_t<val_type> ret(val.row_num(), val.col_num());
     for (int i = 0; i < val.row_num(); ++i)
         for (int j = 0; j < val.col_num(); ++j)
@@ -599,8 +599,8 @@ template<typename input_type>
 requires is_matrix<input_type>
 auto max(input_type const& val)
 { 
-    using return_type = typename input_type::return_type;
-    return_type ret = std::numeric_limits<return_type>::lowest();
+    using ele_type = typename input_type::ele_type;
+    ele_type ret = std::numeric_limits<ele_type>::lowest();
     for (int i = 0; i < val.row_num(); ++i)
         for (int j = 0; j < val.col_num(); ++j)
             if (val(i, j) > ret)
@@ -612,11 +612,11 @@ template<typename input_type>
 requires is_matrix<input_type>
 auto hmax(input_type const& val)
 {
-    using return_type = typename input_type::return_type;
-    mat_t<return_type> ret(val.row_num(), 1);
+    using ele_type = typename input_type::ele_type;
+    mat_t<ele_type> ret(val.row_num(), 1);
     for (int i = 0; i < val.row_num(); ++i)
     {
-        return_type row_max = std::numeric_limits<return_type>::lowest();
+        ele_type row_max = std::numeric_limits<ele_type>::lowest();
         for (int j = 0; j < val.col_num(); ++j)
         {
             if (val(i, j) > row_max)
@@ -632,11 +632,11 @@ class mat_softmax_t:public mat_express_1_param_stable_t<val_type, mat_softmax_t>
 {
 public:
     using base_type = mat_express_1_param_stable_t<val_type, mat_softmax_t>;
-    using return_type = typename val_type::return_type;
+    using ele_type = typename val_type::ele_type;
     using val_base_type = typename base_type::val_base_type;
 private:
-    return_type m_sum;
-    return_type m_max;     // 用于数值稳定性的最大值
+    ele_type m_sum;
+    ele_type m_max;     // 用于数值稳定性的最大值
 public:
 
     mat_softmax_t(val_type const& val)
@@ -681,7 +681,7 @@ auto softmax(val_type const& val)
 template <typename input_type>
 auto hsoftmax(const input_type& input)
 {
-    using val_type = typename std::decay_t<input_type>::return_type;
+    using val_type = typename std::decay_t<input_type>::ele_type;
     // 求得每行的最大值
     mat_t<val_type> max_val = hmax(input);
     // 求矩阵减去每行的最大值后的指数
@@ -698,7 +698,7 @@ requires is_matrix<lval_type> && is_matrix<rval_type>       // 矩阵点乘要�
 class mat_dot_t
 {
 public:
-    using return_type = std::common_type_t<typename lval_type::return_type, typename rval_type::return_type>;
+    using ele_type = std::common_type_t<typename lval_type::ele_type, typename rval_type::ele_type>;
 private:
     lval_type const& m_lval;
     rval_type const& m_rval;
@@ -729,7 +729,7 @@ public:
 
     auto operator()(int i, int j) const
     {
-        return_type s = 0.;
+        ele_type s = 0.;
         for (int k = 0; k < m_lval.col_num(); ++k)
             s += m_lval(i, k) * m_rval(k, j);
         return s;
@@ -757,14 +757,14 @@ public:
         return ss.str();
     }
 
-    operator mat_t<return_type>() const
+    operator mat_t<ele_type>() const
     {
         return clone();
     }
 
-    mat_t<return_type> clone() const
+    mat_t<ele_type> clone() const
     {
-        mat_t<return_type> m(row_num(), col_num());
+        mat_t<ele_type> m(row_num(), col_num());
         for (int i = 0; i < row_num(); ++i)
         {
             for (int j = 0; j < col_num(); ++j)

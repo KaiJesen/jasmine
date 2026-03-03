@@ -13,7 +13,7 @@ template <typename input_type, template<typename> class updator_type>
 class weight_net_t
 {
 public:
-    using val_type = typename input_type::return_type;
+    using val_type = typename input_type::ele_type;
 private:
     mat_t<val_type> m_weight;
     updator_type<val_type> m_weight_updator;
@@ -92,7 +92,7 @@ template <typename input_type>
 class sigmoid_net_t
 {
 public:
-    using val_type = typename input_type::return_type;
+    using val_type = typename input_type::ele_type;
 private:
     mat_t<val_type> m_output;                // 前一次的输入，反向传播时用于快捷计算
 public:
@@ -138,7 +138,7 @@ template <typename input_type>
 class relu_net_t
 {
 private:
-    using val_type = typename input_type::return_type;
+    using val_type = typename input_type::ele_type;
     mat_t<val_type> m_input;                // 前一次的输入，反向传播时用于快捷计算
 public:
     relu_net_t() = default;
@@ -188,7 +188,7 @@ template <typename input_type, template<typename> class updator_type>
 class layer_norm_net_t
 {
 private:
-    using val_type = typename input_type::return_type;
+    using val_type = typename input_type::ele_type;
     mat_t<val_type> m_hx;
     mat_t<val_type> m_mean;
     mat_t<val_type> m_std;
@@ -259,7 +259,7 @@ template <typename input_type>
 class hsoftmax_net_t
 {
 public:
-    using val_type = typename input_type::return_type;
+    using val_type = typename input_type::ele_type;
     mat_t<val_type> m_output;
 
     mat_t<val_type> forward(const input_type& input)

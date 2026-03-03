@@ -10,8 +10,8 @@ template <typename input_type, template<typename> class updator_type>
 class mat_head_gen_t
 {
 public:
-    using val_type = typename input_type::return_type;
-    using return_type = typename input_type::return_type;
+    using val_type = typename input_type::ele_type;
+    using ele_type = typename input_type::ele_type;
 
 private:
     using ffn_type = weight_net_t<input_type, updator_type>;
@@ -220,7 +220,7 @@ template <typename input_type, template<typename> class updator_type>
 class mat_mha_t
 {
 public:
-    using val_type = typename input_type::return_type;
+    using val_type = typename input_type::ele_type;
 
 private:
     std::vector<mat_head_gen_t<input_type, updator_type>> m_heads;
@@ -410,7 +410,7 @@ class mat_mhca_t:public mat_mha_t<input_type, updator_type>
 {
 public:
     using base_type = mat_mha_t<input_type, updator_type>;
-    using val_type = typename input_type::return_type;
+    using val_type = typename input_type::ele_type;
 private:
     mat_t<val_type>* m_encoder_output;   // 用于保存编码器的输出，以便交叉注意力机制使用
     mat_t<val_type>* m_encoder_delta;    // 用于保存编码器的梯度，以便交叉注意力机制使用

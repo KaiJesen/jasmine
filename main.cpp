@@ -5,6 +5,7 @@
 #include "mat_init_t.hpp"
 #include "mat_mha_t.hpp"
 #include "mat_transformer_base.hpp"
+#include "mat_RoPE_t.hpp"
 
 template<typename T>
 void foo(T x)
@@ -182,6 +183,7 @@ int main()
     //test_multi_head_attention();
     //test_encoder();
     //test_decoder();
-    test_tf_kernel();
+    //test_tf_kernel();
+    test_RoPE();
     return 0;
 }

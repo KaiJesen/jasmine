@@ -12,7 +12,7 @@ template <typename input_type>
 class mat_loss_t
 { 
 public:
-    using val_type = typename input_type::return_type;
+    using val_type = typename input_type::ele_type;
     mat_loss_t() = default;
 
     mat_t<val_type> m_input;
