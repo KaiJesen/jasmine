@@ -1,5 +1,5 @@
-#ifndef __TRANSFORMER_BASE_HPP__
-#define __TRANSFORMER_BASE_HPP__
+#ifndef __MAT_TRANSFORMER_KERNEL_T_HPP__
+#define __MAT_TRANSFORMER_KERNEL_T_HPP__
 
 #include "mat_net_t.hpp"
 #include "mat_mha_t.hpp"
@@ -537,6 +537,62 @@ public:
 #include "mat_init_t.hpp"
 #include "mat_loss_t.hpp"
 
+void test_base_type()
+{
+    using val_type = double;
+    mat_t<val_type> input(4, 2, {0.1, 0.2, 0.3, 0.4, 0.1, 0.2, 0.3, 0.4});
+    mat_t<val_type> target(4, 2, {0.1, 0.2, 0.3, 0.4, 0.1, 0.2, 0.3, 0.4}); 
+    int train_steps = 20000;
+
+    res_mha_t<val_type, nadam_t> res_mha;
+    res_mha.base_net().set_param(2, 4, false, 1);
+    res_mha.base_net().set_updator(0.01);
+    res_mha.init_weight<xavier_gaussian_t>();
+    for (int i = 0; i < train_steps; ++i)
+    {        
+        auto output = res_mha.forward(input);
+        res_mha.backward(output - target);
+        res_mha.step();
+    }
+    std::cout << "res_mha output: \n" << res_mha.forward(input) << std::endl;
+
+    res_mha_norm_t<val_type, nadam_t> res_mha_norm;
+    res_mha_norm.get<0>().base_net().set_param(2, 4, false, 1);
+    res_mha_norm.get<0>().base_net().set_updator(0.01);
+    res_mha_norm.init_weight<xavier_gaussian_t>();
+    for (int i = 0; i < train_steps; ++i)
+    {
+        auto output = res_mha_norm.forward(input);
+        res_mha_norm.backward(output - target);
+        res_mha_norm.step();
+    }
+    std::cout << "res_mha_norm output: \n" << res_mha_norm.forward(input) << std::endl;
+    res_ffn_t<val_type, nadam_t> res_ffn;
+    res_ffn.base_net().reinit(std::vector<int>{4, 4});
+    res_ffn.base_net().set_updator(0.01);
+    res_ffn.init_weight<xavier_gaussian_t>();
+    for (int i = 0; i < train_steps; ++i)
+    {
+        auto output = res_ffn.forward(input);
+        res_ffn.backward(output - target);
+        res_ffn.step();
+    }
+    std::cout << "res_ffn output: \n" << res_ffn.forward(input) << std::endl;
+
+    res_ffn_norm_t<val_type, nadam_t> res_ffn_norm;
+    res_ffn_norm.get<0>().base_net().reinit(std::vector<int>{4, 4});
+    res_ffn_norm.get<0>().base_net().set_updator(0.01);
+    res_ffn_norm.get<1>().set_updator(0.01);
+    res_ffn_norm.init_weight<xavier_gaussian_t>();
+    for (int i = 0; i < train_steps; ++i)
+    {
+        auto output = res_ffn_norm.forward(input);
+        res_ffn_norm.backward(output - target);
+        res_ffn_norm.step();
+    }
+    std::cout << "res_ffn_norm output: \n" << res_ffn_norm.forward(input) << std::endl;
+}
+
 void test_encoder()
 {
     //encoder_t<float, nadam_t> encoder(2, 2, 4, 1);
@@ -557,13 +613,20 @@ void test_encoder()
     cnet.set_updator(lr);                  // 设置学习率，set_updator会自动递归调用下面的所有层并且设置相同的参数
     cnet.init_weight<xavier_gaussian_t>();
     std::cout << cnet.net_type() << std::endl;
-    mat_t<double> input(4, 1, {0.1, 0.2, 0.3, 0.4});
-    mat_t<double> target(4, 1, {0.5, 0.6, 0.7, 0.8});
+    mat_t<double> input(4, 2, {   0.1, 0.4
+                                , 0.2, 0.3
+                                , 0.3, 0.2
+                                , 0.4, 0.1});
+    mat_t<double> target(4, 2, {  0.1, 0.4
+                                , 0.2, 0.3
+                                , 0.3, 0.2
+                                , 0.4, 0.1});
     std::cout << "before training encoder output: \n" << cnet.forward(input) << std::endl;
     for (int i = 0; i < 2000; ++i)
     {
         cnet.forward(input);
         cnet.backward(target);
+        cnet.step();
     }
     std::cout << "after training encoder output: \n" << cnet.forward(input) << std::endl;
 }

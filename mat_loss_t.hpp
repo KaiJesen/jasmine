@@ -38,6 +38,7 @@ public:
         return base_type::m_input - target;
     }
 
+    // 根据目标计算误差，输入是目标值，输出是误差值
     val_type loss(const mat_t<val_type>& target) const
     {
         return mean(pow(base_type::m_input - target));

@@ -4,8 +4,9 @@
 #include "mat_net_t.hpp"
 #include "mat_init_t.hpp"
 #include "mat_mha_t.hpp"
-#include "mat_transformer_base.hpp"
+#include "mat_transformer_kernel_t.hpp"
 #include "mat_RoPE_t.hpp"
+#include "mat_transformer_t.hpp"
 
 template<typename T>
 void foo(T x)
@@ -176,14 +177,17 @@ int main()
     //test_mat_t();
     //test_mat_express_t();
     //test_mat_view_t();
+    //test_weight_net();
     //test_mat_net_t();
     //test_mat_init_t();
     //test_mat_head_gen_t();
     //test_mha_tools();
     //test_multi_head_attention();
+    test_base_type();
     //test_encoder();
     //test_decoder();
     //test_tf_kernel();
-    test_RoPE();
+    //test_RoPE();
+    //test_tf_base();
     return 0;
 }

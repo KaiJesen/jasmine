@@ -216,8 +216,10 @@ public:
         {
             m_gama = mat_t<val_type>(input.row_num(), 1);
             m_beta = mat_t<val_type>(input.row_num(), 1);
-            init_matrix<he_gaussian_t>(m_gama);
-            init_matrix<he_gaussian_t>(m_beta);
+            m_gama = val_type(1);
+            m_beta = val_type(0);
+            //init_matrix<he_gaussian_t>(m_gama);
+            //init_matrix<he_gaussian_t>(m_beta);
         }
         return (m_gama * m_hx + m_beta).clone();
     }
@@ -228,10 +230,16 @@ public:
         auto L_gama = hsum(delta * m_hx);
         auto L_beta = hsum(delta);
         double m = static_cast<double>(delta.row_num());
-        auto L_input = (delta - (m_hx * vsum(m_hx * delta) + vsum(delta))/m) * m_gama / m_std;
+        //auto L_input = ((delta - (m_hx * vsum(m_hx * delta) + vsum(delta))/m) * m_gama / m_std).clone();
+        //auto L_input = ((delta * m_gama - vsum(delta * m_gama) / m - m_hx * vsum(m_hx * (delta * m_gama)) / m) / m_std).clone();
+        auto dx_norm = delta * m_gama;
+        auto sum_dx_norm = hsum(dx_norm);
+        auto sum_dx_norm_x_hx = hsum(dx_norm * m_hx);
+        auto L_input = ((dx_norm * m - sum_dx_norm - m_hx * sum_dx_norm_x_hx) / m / m_std).clone();
+
         m_gama_updator.update(L_gama, m_gama);
         m_beta_updator.update(L_beta, m_beta);
-        return L_input.clone();
+        return L_input;
     }
 
     std::string net_type(int const& indent = 0) const
@@ -519,6 +527,41 @@ struct test_net_t
 
 #include "mat_loss_t.hpp"
 
+void test_weight_net()
+{
+    #if 0
+    weight_net_t<mat_t<double>, nadam_t> net(2, 3);
+    weight_net_t<mat_t<double>, adam_t> net2(3, 3);
+    net.init_weight<xavier_gaussian_t>();
+    net.set_updator(0.1);
+    net2.init_weight<xavier_gaussian_t>();
+    net2.set_updator(0.1);
+    #endif
+    using net_type = complex_net_builder_t<double>
+        ::push_back_updatable<weight_net_t, nadam_t>
+        ::push_back_updatable<weight_net_t, adam_t>
+        ::push_back_staticnet<sigmoid_net_t>
+        ::push_back_staticnet<mse_loss_t>
+        ::type;
+    net_type net;
+    net.reinit(std::vector<int>{2, 3, 3});
+    net.init_weight<xavier_gaussian_t>();
+    net.set_updator(0.1);
+    mat_t<double> input(2, 2, {0.5, 0.8, 0.3, 0.7});
+    mat_t<double> label(3, 2, {0.2, 0.4, 0.6, 0.8, 0.1, 0.9});
+    for (int i = 0; i < 1000; ++i)
+    {
+        auto output = net.forward(input);
+        //output = net2.forward(output);
+        //auto delta = (output - label).clone();
+        //delta = net2.backward(delta);
+        net.backward(label);
+        //net2.step();
+        net.step();
+    }
+    std::cout << "final output: " << (net.forward(input)) << std::endl;
+}
+
 void test_mat_net_t()
 { 
     std::cout << "mat_net_t test" << std::endl;
@@ -551,10 +594,11 @@ void test_mat_net_t()
     cnet.get<2>().set_updator(0.1);
     //cnet.get<0>().set_updator(0.1);
     //cnet.get<3>().set_updator(0.1);
-    cnet.reinit(std::vector<int>{4, 3, 1});
+    cnet.reinit(std::vector<int>{4, 3, 2});
     cnet.init_weight<xavier_gaussian_t>();
     std::cout << cnet.net_type() << std::endl;
-    mat_t<double> input(3, 1, {0.5, 0.5});
+    mat_t<double> input(3, 2, {0.1, 0.2, 0.3, 0.4, 0.5, 0.6});
+    mat_t<double> label(2, 2, {0.3, 0.7, 0.9, 0.1});
     std::cout << "first output: " << cnet.forward(input) << std::endl;
     while (true)
     {
@@ -570,9 +614,10 @@ void test_mat_net_t()
             auto output = cnet.forward(input);
             //auto delta = output - 0.8;
             //std::cout << " delta: " << delta << std::endl;
-            cnet.backward(0.8);
+            cnet.backward(label);
+            cnet.step();
         }
-        std::cout << "\tloss: " << cnet.back().loss(0.8) << std::endl;
+        std::cout << "\tloss: " << cnet.back().loss(label) << std::endl;
     }
     std::cout << "final output: " << cnet.forward(input) << "\nloss:" << cnet.back().loss(0.8) << std::endl;
 }
