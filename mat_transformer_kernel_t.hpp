@@ -539,7 +539,7 @@ public:
 
 void test_base_type()
 {
-    using val_type = double;
+    using val_type = float;
     mat_t<val_type> input(4, 2, {0.1, 0.2, 0.3, 0.4, 0.1, 0.2, 0.3, 0.4});
     mat_t<val_type> target(4, 2, {0.1, 0.2, 0.3, 0.4, 0.1, 0.2, 0.3, 0.4}); 
     int train_steps = 20000;

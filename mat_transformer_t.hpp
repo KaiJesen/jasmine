@@ -84,6 +84,7 @@ public:
 
 };
 
+
 #include "mat_loss_t.hpp"
 
 template<typename val_type>
@@ -114,9 +115,12 @@ void test_tf_base()
                                 , 0.7, 0.8});
 
     /* 设置运行参数 */
-    double lr = 0.01;
+    double lr = 0.01;       // 经过测试，如果学习率设置过高则训练出的结果是均值
     std::cout << "Input learning rate: ";
     std::cin >> lr;
+    int train_steps = 200;
+    std::cout << "Input train steps: ";
+    std::cin >> train_steps;
     cnet.set_updator(lr);
     cnet.init_weight<xavier_gaussian_t>();
 
@@ -125,7 +129,7 @@ void test_tf_base()
     auto output = cnet.forward(de_input);
     std::cout << "Before training Output: \n" << output << std::endl;
 
-    for (int i = 0; i < 200; ++i)
+    for (int i = 0; i < train_steps; ++i)
     {
         output = cnet.forward(de_input);
         cnet.backward(label);

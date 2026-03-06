@@ -183,11 +183,11 @@ int main()
     //test_mat_head_gen_t();
     //test_mha_tools();
     //test_multi_head_attention();
-    test_base_type();
+    //test_base_type();
     //test_encoder();
     //test_decoder();
     //test_tf_kernel();
     //test_RoPE();
-    //test_tf_base();
+    test_tf_base();
     return 0;
 }
