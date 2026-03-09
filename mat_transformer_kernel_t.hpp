@@ -290,7 +290,7 @@ public:
     {
         if (m_encoder_delta.row_num() != input.row_num() || m_encoder_delta.col_num() != input.col_num())
         {
-            m_encoder_delta.reshape(input.row_num(), input.col_num());
+            m_encoder_delta.reshape(m_encoder_output.row_num(), m_encoder_output.col_num());
         }
         m_encoder_delta = 0.0;
 

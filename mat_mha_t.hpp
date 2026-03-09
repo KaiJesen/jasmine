@@ -65,7 +65,9 @@ public:
                 }
             }
         }
+        //std::cout << "attn_scores: " << attn_scores << std::endl;
         auto attn_weights = m_softmax.forward(attn_scores);
+        //std::cout << "attn_weights: " << attn_weights << std::endl;
         auto output = m_v.dot(attn_weights.t()).clone();
 
         return output;
@@ -106,7 +108,7 @@ public:
                 }
             }
         }
-
+        //std::cout << "delta_qt_k: " << delta_qt_k << std::endl;
         mat_t<val_type> delta_q = m_k.dot(delta_qt_k.t()) / static_cast<val_type>(sqrt(m_q.row_num()));
         mat_t<val_type> delta_k = m_q.dot(delta_qt_k) / static_cast<val_type>(sqrt(m_q.row_num()));
 

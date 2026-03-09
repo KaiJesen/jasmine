@@ -7,6 +7,7 @@
 #include "mat_transformer_kernel_t.hpp"
 #include "mat_RoPE_t.hpp"
 #include "mat_transformer_t.hpp"
+#include "transformer_test.hpp"
 
 template<typename T>
 void foo(T x)
@@ -188,6 +189,7 @@ int main()
     //test_decoder();
     //test_tf_kernel();
     //test_RoPE();
-    test_tf_base();
+    //test_tf_base();
+    test_transformer();
     return 0;
 }

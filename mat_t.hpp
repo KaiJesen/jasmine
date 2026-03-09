@@ -132,8 +132,8 @@ public:
             }
             else
             {
-                m_scalar = false;
                 destroy();
+                m_scalar = false;
                 m_dims[0] = m.m_dims[0];
                 m_dims[1] = m.m_dims[1];
                 m_row_first = m.m_row_first;
