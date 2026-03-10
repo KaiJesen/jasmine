@@ -343,6 +343,18 @@ public:
     mat_view_t<mat_t<val_type>> t() noexcept;
     mat_view_t<mat_t<val_type>> view(int const& row_offset = 0, int const& col_offset = 0, int const& row_size = -1, int const& col_size = -1) noexcept;
     mat_view_t<const mat_t<val_type>> view(int const& row_offset = 0, int const& col_offset = 0, int const& row_size = -1, int const& col_size = -1) const noexcept;
+    mat_view_t<mat_t<val_type>> col(int const& col_num) noexcept;
+    mat_view_t<const mat_t<val_type>> col(int const& col_num) const noexcept;
+    mat_view_t<mat_t<val_type>> row(int const& row_num) noexcept;
+    mat_view_t<const mat_t<val_type>> row(int const& row_num) const noexcept;
+    mat_view_t<mat_t<val_type>> back_col() noexcept;
+    mat_view_t<const mat_t<val_type>> back_col() const noexcept;
+    mat_view_t<mat_t<val_type>> back_row() noexcept;
+    mat_view_t<const mat_t<val_type>> back_row() const noexcept;
+    mat_view_t<mat_t<val_type>> front_col() noexcept;
+    mat_view_t<const mat_t<val_type>> front_col() const noexcept;
+    mat_view_t<mat_t<val_type>> front_row() noexcept;
+    mat_view_t<const mat_t<val_type>> front_row() const noexcept;
 
     mat_t<val_type>& t_() noexcept
     {

@@ -190,6 +190,7 @@ int main()
     //test_tf_kernel();
     //test_RoPE();
     //test_tf_base();
+    //test_sequence_mha();
     test_transformer();
     return 0;
 }

@@ -158,6 +158,90 @@ mat_view_t<const mat_t<val_type>> mat_t<val_type>::view(int const& row_offset, i
     return mv;
 }
 
+template<typename val_type>
+requires std::is_arithmetic_v<val_type>
+mat_view_t<mat_t<val_type>> mat_t<val_type>::col(int const& idx) noexcept
+{
+    return mat_view_t<mat_t<val_type>>(*this, 0, idx, row_num(), 1);
+}
+
+template<typename val_type>
+requires std::is_arithmetic_v<val_type>
+mat_view_t<const mat_t<val_type>> mat_t<val_type>::col(int const& idx) const noexcept
+{
+    return mat_view_t<const mat_t<val_type>>(*this, 0, idx, row_num(), 1);
+}    
+
+template<typename val_type>
+requires std::is_arithmetic_v<val_type>
+mat_view_t<mat_t<val_type>> mat_t<val_type>::row(int const& idx) noexcept
+{
+    return mat_view_t<mat_t<val_type>>(*this, idx, 0, 1, col_num());
+}
+
+template<typename val_type>
+requires std::is_arithmetic_v<val_type>
+mat_view_t<const mat_t<val_type>> mat_t<val_type>::row(int const& idx) const noexcept
+{
+    return mat_view_t<const mat_t<val_type>>(*this, idx, 0, 1, col_num());
+}
+
+template<typename val_type>
+requires std::is_arithmetic_v<val_type>
+mat_view_t<mat_t<val_type>> mat_t<val_type>::back_col() noexcept
+{
+    return mat_view_t<mat_t<val_type>>(*this, 0, col_num() - 1, row_num(), 1);
+}
+
+template<typename val_type>
+requires std::is_arithmetic_v<val_type>
+mat_view_t<const mat_t<val_type>> mat_t<val_type>::back_col() const noexcept
+{
+    return mat_view_t<const mat_t<val_type>>(*this, 0, col_num() - 1, row_num(), 1);
+}
+
+template<typename val_type>
+requires std::is_arithmetic_v<val_type>
+mat_view_t<mat_t<val_type>> mat_t<val_type>::back_row() noexcept
+{
+    return mat_view_t<mat_t<val_type>>(*this, row_num() - 1, 0, 1, col_num());
+}
+
+template<typename val_type>
+requires std::is_arithmetic_v<val_type>
+mat_view_t<const mat_t<val_type>> mat_t<val_type>::back_row() const noexcept
+{
+    return mat_view_t<const mat_t<val_type>>(*this, row_num() - 1, 0, 1, col_num());
+}
+
+template<typename val_type>
+requires std::is_arithmetic_v<val_type>
+mat_view_t<mat_t<val_type>> mat_t<val_type>::front_col() noexcept
+{
+    return mat_view_t<mat_t<val_type>>(*this, 0, 0, row_num(), 1);
+}
+
+template<typename val_type>
+requires std::is_arithmetic_v<val_type>
+mat_view_t<const mat_t<val_type>> mat_t<val_type>::front_col() const noexcept
+{
+    return mat_view_t<const mat_t<val_type>>(*this, 0, 0, row_num(), 1);
+}
+
+template<typename val_type>
+requires std::is_arithmetic_v<val_type>
+mat_view_t<mat_t<val_type>> mat_t<val_type>::front_row() noexcept
+{
+    return mat_view_t<mat_t<val_type>>(*this, 0, 0, 1, col_num());
+}
+
+template<typename val_type>
+requires std::is_arithmetic_v<val_type>
+mat_view_t<const mat_t<val_type>> mat_t<val_type>::front_row() const noexcept
+{
+    return mat_view_t<const mat_t<val_type>>(*this, 0, 0, 1, col_num());
+}
+
 void test_mat_view_t()
 { 
     mat_t<double> m(3, 3, {1.1, 1.2, 1.3,
