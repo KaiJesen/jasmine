@@ -130,21 +130,6 @@ public:
         std::cout << "test input: \n" << input_sos.front_col() << std::endl;
         std::cout << "test first: \n" << m_net.forward(input_sos.front_col()) << std::endl;
         
-        /* 逐次将解码器的输入进行输入，获得输出 */
-        mat_t<test_val_type> pred_input(input_dim, 1023);
-        auto pred_input_sos = add_sos(pred_input);
-        int len = 1;
-        while (true)
-        {
-            auto cur_input = pred_input_sos.view(0, 0, d_model, len);
-            auto output = m_net.forward(cur_input);
-            //std::cout << "---- seq_idx: " << len << std::endl << "input: \n" << cur_input << std::endl << " output: \n" << output.back_col() << std::endl;
-            pred_input_sos.col(len++).assign(output.back_col());
-            if (is_eos(output))break;
-            if (len >= 10)break;
-        }
-        std::cout << "final input with flags: \n" << pred_input_sos.view(0, 0, d_model, len) << std::endl;
-        std::cout << "label: \n" << label_eos << std::endl;
 
     }
 
@@ -159,6 +144,7 @@ public:
         
         auto en_input_expand = expand_encoder_input(en_input);
         std::cout << "predict expanded encoder input: \n" << en_input_expand << std::endl;
+        #if 0
         mat_t<test_val_type> de_input(d_model, 1024);
         int seq_len = 0;
         de_input(input_dim, seq_len++) = 1.;
@@ -183,6 +169,23 @@ public:
         //std::cout << "final output: \n" << final_output << std::endl;
         //std::cout << "origin output: \n" << de_input.view(0, 0, d_model, seq_len) << std::endl;
         return final_output;
+        #endif
+
+        /* 逐次将解码器的输入进行输入，获得输出 */
+        mat_t<test_val_type> pred_input(input_dim, 1023);
+        auto pred_input_sos = add_sos(pred_input);
+        int len = 1;
+        while (true)
+        {
+            auto cur_input = pred_input_sos.view(0, 0, d_model, len);
+            auto output = m_net.forward(cur_input);
+            //std::cout << "---- seq_idx: " << len << std::endl << "input: \n" << cur_input << std::endl << " output: \n" << output.back_col() << std::endl;
+            pred_input_sos.col(len++).assign(output.back_col());
+            if (is_eos(output))break;
+            if (len >= 10)break;
+        }
+        std::cout << "final input with flags: \n" << pred_input_sos.view(0, 0, d_model, len) << std::endl;
+        return remove_flags(pred_input_sos).view(0, 1, input_dim, len - 1).clone();
     }
 
 };
@@ -239,20 +242,29 @@ void test_transformer()
     test_transformer_t net;
     net.init(1e-4);
     int input_dim = test_transformer_t::input_dim;
-    mat_t<test_val_type> en_input(input_dim, 3,    { 0.5, 0.8, 0.3
+    mat_t<test_val_type> en_input(input_dim, 3,    
+                                            { 0.5, 0.8, 0.3
                                             , 0.7, 0.2, 0.4
                                             , 0.6, 0.8, 0.1
                                             , 0.9, 0.3, 0.7});
-    mat_t<test_val_type> de_input(input_dim, 3,    { 0.4, 0.5, 0.6
+    mat_t<test_val_type> de_input(input_dim, 3,    
+                                            { 0.4, 0.5, 0.6
                                             , 0.7, 0.8, 0.9
                                             , 0.1, 0.2, 0.3
                                             , 0.4, 0.5, 0.6});
-    mat_t<test_val_type> label(input_dim, 3,       { 0.3, 0.2, 0.1
+    mat_t<test_val_type> label(input_dim, 3,       
+                                            { 0.3, 0.2, 0.1
                                             , 0.8, 0.5, 0.1
                                             , 0.7, 0.8, 0.9
                                             , 0.4, 0.3, 0.2});
     net.train(en_input, de_input, label, 50000);
-    //std::cout << net.predict(en_input) << std::endl;
+    net.predict(en_input);
+    /*
+    测试结果：
+    由于预测结果与标签存在微小偏差，而迭代的过程会积累并放大偏差，所以导致推理结果和标签不一致；
+    - 可以通过增加Embedding层来解决这个问题；
+    - 也可以通过在训练过程中有概率地将一部分模型的输出混入到输入中，训练模型在微小偏差下的兼容性。
+    */
 }
 
 #endif
