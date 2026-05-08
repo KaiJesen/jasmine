@@ -14,7 +14,7 @@
  * 3. 将测试数据通过标签增加工具增加标签作为训练的数据对transformer进行训练；
  * 4. 编码器输入测试数据，解码器输入SOS标签，观察输出结果是否正确。
 */
-using test_val_type = float;
+using test_val_type = double;
 
 mat_t<test_val_type> sos(int const& input_row_num)
 {
@@ -293,7 +293,7 @@ void test_transformer()
     std::cout << "input with sos \n" << input_sos << "\nlabel with eos \n" << label_eos << std::endl;
     #endif
     test_transformer_t net;
-    net.init(1e-4);
+    net.init(1e-5);
     int input_dim = test_transformer_t::input_dim;
     mat_t<test_val_type> en_input(input_dim, 3,    
                                             { 0.5, 0.8, 0.3
