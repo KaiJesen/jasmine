@@ -111,8 +111,7 @@ public:
         {
             throw std::runtime_error("delta size does not match input size");
         }
-        auto delta_sigmoid = delta * (1 - m_output) * m_output;
-        return delta_sigmoid.clone();
+        return (delta * (1 - m_output) * m_output).clone();
     }
 
     std::string net_type(int const& indent = 0) const
@@ -149,7 +148,7 @@ public:
         //return relu(m_input).clone();
         //auto ret = (m_input > 0) * m_input;     // 直接用表达式模板计算，避免中间变量
         //std::cout << "ReLu forward: input \n" << input << " \noutput \n" << ret << std::endl;
-        return (m_input > 0) * m_input;     // 直接用表达式模板计算，避免中间变量
+        return ((m_input > 0) * m_input).clone();
     }
 
     template <typename other_type>
@@ -209,9 +208,9 @@ public:
     mat_t<val_type> forward(const input_type& input)
     {
         m_mean = vmean(input);
-        auto delta = input - m_mean;
-        m_std = sqrt(vmean(pow(delta.clone(), 2.0)));
-        m_hx = delta / m_std;
+        mat_t<val_type> delta = (input - m_mean).clone();
+        m_std = sqrt(vsum(pow(delta, 2.0)));
+        m_hx = (delta / m_std).clone();
         if (m_gama.valid() == false)
         {
             m_gama = mat_t<val_type>(input.row_num(), 1);
@@ -325,8 +324,9 @@ public:
 
     mat_t<val_type> forward(const mat_t<val_type>& input)
     {
-        return m_net.forward(input) + input;
+        return (m_net.forward(input) + input).clone();
     }
+
     template <typename other_type>
     auto backward(const other_type& delta)
     {

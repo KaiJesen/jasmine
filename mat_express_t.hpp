@@ -416,10 +416,9 @@ public:
     mat_t<ele_type> clone() const
     {
         mat_t<ele_type> m(row_num(), col_num());
-        #pragma omp parallel for
+        // 不在 clone 里开 parallel：训练中会频繁物化表达式，并行区开销远大于收益
         for (int i = 0; i < row_num(); ++i)
         {
-            #pragma omp parallel for
             for (int j = 0; j < col_num(); ++j)
             {
                 m(i, j) = (*this)(i, j);
@@ -767,10 +766,8 @@ public:
     mat_t<ele_type> clone() const
     {
         mat_t<ele_type> m(row_num(), col_num());
-        #pragma omp parallel for
         for (int i = 0; i < row_num(); ++i)
         {
-            #pragma omp parallel for
             for (int j = 0; j < col_num(); ++j)
             {
                 m(i, j) = (*this)(i, j);

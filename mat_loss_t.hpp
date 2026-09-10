@@ -20,7 +20,7 @@ public:
     mat_t<val_type> forward(const input_type& input)
     {
         m_input = input.clone();
-        return input;
+        return m_input;
     }
 };
 

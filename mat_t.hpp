@@ -26,7 +26,7 @@ private:
     val_type *m_data;       // 由先内层后外层紧密排列
     bool m_row_first;    // 是否为行优先存储
     bool m_scalar = false;  // 是否为标量
-    val_type m_scalar_val;
+    val_type m_scalar_val{};
     void destroy() noexcept
     {
         if (m_scalar)       // 标量矩阵，不进行释放

@@ -110,8 +110,8 @@ public:
 
     static constexpr int en_layers = 3;
     static constexpr int de_layers = 2;
-    static constexpr int head_num = 3;
-    static constexpr int d_model = 6;
+    static constexpr int head_num = 2;          // d_head = d_model/head_num = 5
+    static constexpr int d_model = 10;
     static constexpr int input_dim = d_model - 2;   // 需要预留2个标志位
 
     auto& tf_base()
@@ -126,7 +126,7 @@ public:
 
     void init(test_val_type lr)
     {
-        tf_base().set_param(en_layers, de_layers, head_num, d_model);
+        tf_base().set_param(en_layers, de_layers, head_num, d_model, d_model * 4);
         ffn().reinit({d_model, d_model});
         m_net.init_weight<xavier_gaussian_t>();
         m_net.set_updator(lr);
@@ -163,15 +163,50 @@ public:
             , T_multiplier
             , lr_decay_rate);
         
-        int print_step = train_times / 100;
+        int print_step = train_times < 100 ? 1 : train_times / 100;
+
+        std::cout << m_net.net_type() << std::endl;
+        
+        // Scheduled sampling 参数
+        // teacher_forcing_ratio: 训练初期=1.0（全部使用真实输入），逐渐衰减到 0.5（50% 混入模型输出）
+        // 目的是让模型学会在自回归推理时处理自己的偏差，而非只适应完美输入
+        double initial_teacher_forcing = 1.0;
+        double final_teacher_forcing = 0.5;
+        int seq_len = label_eos.col_num();
         
         std::cout << std::endl;
         for (int i = 0; i < train_times; i++)
         {
             m_net.set_updator(lr_decay.get_lr());
-            auto output = m_net.forward(input_sos);
+            
+            double progress = static_cast<double>(i) / train_times;
+            double tf_ratio = initial_teacher_forcing + (final_teacher_forcing - initial_teacher_forcing) * progress;
+            
+            // 自回归构建混合输入：完全模拟推理场景
+            // 从干净的 input_sos 开始，逐 token 预测并决定是否混入模型输出
+            mat_t<test_val_type> cur_input = input_sos.clone();
+            for (int step = 1; step < seq_len; ++step) // step 指向要混合的输入列（跳过 SOS）
+            {
+                // 用当前（可能已混合的）输入做 forward，得到模型预测
+                auto pred = m_net.forward(cur_input);
+                // pred(r, step-1) = 模型对 step 位置 token 的预测
+                // （自回归：输入 [x0..x_{step-1}] 输出对应位置的预测，输出列 step-1 预测第 step 个 token）
+                
+                double rand_val = static_cast<double>(rand()) / RAND_MAX;
+                if (rand_val > tf_ratio)
+                {
+                    // 混入模型自己的输出，而不是真实输入
+                    for (int r = 0; r < input_dim; ++r)
+                        cur_input(r, step) = pred(r, step - 1);
+                }
+                // else: cur_input(r, step) 保持原始 teacher 值
+            }
+            
+            // 最终 forward + backward：输入是自回归混合版本，标签始终是正确答案
+            m_net.forward(cur_input);
             m_net.backward(label_eos);
             m_net.step();
+            
             lr_decay.step();
             if (i % print_step == 0)
             {
@@ -268,7 +303,7 @@ void test_sequence_mha()
     std::cout << "output2: \n" << mha.forward(input2) << std::endl;
     std::cout << ((input2.front_col() - input1) < 0.0001) << std::endl;
     // 对于transformer也是一样，保持编码器输入不变，如果保持解码器输入的第一个位置不变，那么输出的第一个位置也应该是一样的
-    transformer_base_t<mat_t<test_val_type>, nadam_t> tf_base(2, 3, 2, 6);
+    transformer_base_t<mat_t<test_val_type>, nadam_t> tf_base(2, 3, 2, 6, 24);
     tf_base.init_weight<xavier_gaussian_t>();
     mat_t<test_val_type> en_input(6, 3, {0.5, 0.8, 0.3
                                 , 0.7, 0.2, 0.4
@@ -299,17 +334,29 @@ void test_transformer()
                                             { 0.5, 0.8, 0.3
                                             , 0.7, 0.2, 0.4
                                             , 0.6, 0.8, 0.1
-                                            , 0.9, 0.3, 0.7});
+                                            , 0.9, 0.3, 0.7
+                                            , 0.2, 0.6, 0.4
+                                            , 0.1, 0.9, 0.5
+                                            , 0.3, 0.5, 0.8
+                                            , 0.8, 0.1, 0.6});
     mat_t<test_val_type> de_input(input_dim, 3,    
                                             { 0.4, 0.5, 0.6
                                             , 0.7, 0.8, 0.9
                                             , 0.1, 0.2, 0.3
-                                            , 0.4, 0.5, 0.6});
+                                            , 0.4, 0.5, 0.6
+                                            , 0.9, 0.1, 0.8
+                                            , 0.2, 0.3, 0.5
+                                            , 0.6, 0.7, 0.4
+                                            , 0.5, 0.9, 0.2});
     mat_t<test_val_type> label(input_dim, 3,       
                                             { 0.3, 0.2, 0.1
                                             , 0.8, 0.5, 0.1
                                             , 0.7, 0.8, 0.9
-                                            , 0.4, 0.3, 0.2});
+                                            , 0.4, 0.3, 0.2
+                                            , 0.6, 0.2, 0.5
+                                            , 0.9, 0.1, 0.3
+                                            , 0.5, 0.7, 0.4
+                                            , 0.1, 0.6, 0.8});
     int train_times = 100000;
     std::cout << "Input train times: ";
     std::cin >> train_times;

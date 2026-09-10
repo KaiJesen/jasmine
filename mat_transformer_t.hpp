@@ -28,8 +28,8 @@ private:
     RoPE_type m_rope;
 
 public:
-    transformer_base_t(size_t en_layers = 1, size_t de_layers = 1, size_t head_num = 1, int d_model = 1)
-    : m_kernel(en_layers, de_layers, head_num, d_model), m_rope(d_model)
+    transformer_base_t(size_t en_layers = 1, size_t de_layers = 1, size_t head_num = 1, int d_model = 1, int d_ff = 0)
+    : m_kernel(en_layers, de_layers, head_num, d_model, d_ff ? d_ff : d_model * 4), m_rope(d_model)
     {
     }
 
@@ -60,9 +60,9 @@ public:
         m_kernel.template init_weight<init_type>();
     }
 
-    void set_param(size_t en_layers, size_t de_layers, size_t head_num, int d_model)
+    void set_param(size_t en_layers, size_t de_layers, size_t head_num, int d_model, int d_ff = 0)
     {
-        m_kernel.set_param(en_layers, de_layers, head_num, d_model);
+        m_kernel.set_param(en_layers, de_layers, head_num, d_model, d_ff ? d_ff : d_model * 4);
         m_rope.set_param(d_model);
     }
 
@@ -102,7 +102,7 @@ void test_tf_base()
         ;
     net_type cnet;
     auto& tf_base = cnet.get<0>();
-    tf_base.set_param(2, 3, 2, 4);
+    tf_base.set_param(2, 3, 2, 4, 16);
     auto& ffn = cnet.get<1>();
     ffn.reinit({4, 4});
 

@@ -33,9 +33,9 @@ public:
 
     void set_param(int const& d_model, bool const& mask = false, int const& seq_len = 1)
     {
-        m_q_net.reinit(std::vector<int>(d_model, d_model));
-        m_k_net.reinit(std::vector<int>(d_model, d_model));
-        m_v_net.reinit(std::vector<int>(d_model, d_model));
+        m_q_net.reinit(std::vector<int>{d_model, d_model});
+        m_k_net.reinit(std::vector<int>{d_model, d_model});
+        m_v_net.reinit(std::vector<int>{d_model, d_model});
         m_q.reshape(d_model, seq_len);
         m_k.reshape(d_model, seq_len);
         m_v.reshape(d_model, seq_len);
@@ -46,21 +46,9 @@ public:
     requires std::is_same_v<std::decay_t<mat_type>, mat_t<val_type>>
     mat_t<val_type> forward(const mat_view_t<mat_type>& input)
     {
-        #pragma omp parallel sections num_threads(3)
-        {
-            #pragma omp section
-            {
-                m_q = m_q_net.forward(input); // Q 为 [d_model, seq_len]
-            }
-            #pragma omp section
-            {
-                m_k = m_k_net.forward(input);
-            }
-            #pragma omp section
-            {
-                m_v = m_v_net.forward(input);
-            }
-        }
+        m_q = m_q_net.forward(input);
+        m_k = m_k_net.forward(input);
+        m_v = m_v_net.forward(input);
 
         auto attn_scores = (m_q.t().dot(m_k) / sqrt(m_q.row_num())).clone();
         /*!ANCHOR 掩码规则说明
@@ -89,21 +77,9 @@ public:
     requires std::is_same_v<std::decay_t<mat_type>, mat_t<val_type>>
     mat_t<val_type> forward(const mat_view_t<mat_type>& decoder_input, const mat_view_t<mat_type>& encoder_input)
     {
-        #pragma omp parallel sections num_threads(3)
-        {
-            #pragma omp section
-            {
-                m_q = m_q_net.forward(decoder_input); // Q 为 [d_model, seq_len]
-            }
-            #pragma omp section
-            {
-                m_k = m_k_net.forward(encoder_input);
-            }
-            #pragma omp section
-            {
-                m_v = m_v_net.forward(encoder_input);
-            }
-        }
+        m_q = m_q_net.forward(decoder_input);
+        m_k = m_k_net.forward(encoder_input);
+        m_v = m_v_net.forward(encoder_input);
 
         auto attn_scores = (m_q.t().dot(m_k) / sqrt(m_q.row_num())).clone();
         // 较差注意力不需要mask层
@@ -136,10 +112,7 @@ public:
         mat_t<val_type> delta_q = m_k.dot(delta_qt_k.t()) / static_cast<val_type>(sqrt(m_q.row_num()));
         mat_t<val_type> delta_k = m_q.dot(delta_qt_k) / static_cast<val_type>(sqrt(m_q.row_num()));
 
-        mat_t<val_type> delta_input =
-            m_q_net.backward(delta_q) + m_k_net.backward(delta_k) + m_v_net.backward(delta_v);
-
-        return delta_input;
+        return (m_q_net.backward(delta_q) + m_k_net.backward(delta_k) + m_v_net.backward(delta_v)).clone();
     }
 
     mat_t<val_type> backward(const mat_view_t<mat_t<val_type>>& delta, mat_view_t<mat_t<val_type>>& encoder_delta)
@@ -283,7 +256,7 @@ public:
         {
             m_heads[i].set_param(m_d_head, mask, seq_len);
         }
-        m_output_proj.reinit(std::vector<int>(d_model, d_model));
+        m_output_proj.reinit(std::vector<int>{d_model, d_model});
     }
 
     mat_t<val_type> forward(const input_type& input)
@@ -297,7 +270,6 @@ public:
 
         // Step 3: 每个头独立进行正向传播
         std::vector<mat_t<val_type>> head_outputs(m_num_heads);
-        #pragma omp parallel for
         for (int i = 0; i < m_num_heads; ++i)
         {
             head_outputs[i] = m_heads[i].forward(input_splits[i]);
@@ -326,7 +298,6 @@ public:
 
         // Step 3: 每个头独立进行正向传播
         std::vector<mat_t<val_type>> head_outputs(m_num_heads);
-        #pragma omp parallel for
         for (int i = 0; i < m_num_heads; ++i)
         {
             head_outputs[i] = m_heads[i].forward(input_splits[i], encoder_input_splits[i]);
@@ -355,12 +326,10 @@ public:
         // 为 total_delta 创建视图，方便按块赋值
         std::vector<mat_view_t<mat_t<val_type>>> total_delta_views = vsplit(total_delta, m_num_heads);
 
-        // 对每个头执行反向传播，并将结果赋值到对应的视图中
-        #pragma omp parallel for
         for (int i = 0; i < m_num_heads; ++i)
         {
             auto delta_input = m_heads[i].backward(deltas[i]);
-            total_delta_views[i].assign(delta_input); // 使用 assign 将结果写入对应位置
+            total_delta_views[i].assign(delta_input);
         }
 
         return total_delta;
@@ -382,12 +351,10 @@ public:
         std::vector<mat_view_t<mat_t<val_type>>> total_delta_views = vsplit(total_delta, m_num_heads);
         std::vector<mat_view_t<mat_t<val_type>>> encoder_delta_views = vsplit(encoder_delta, m_num_heads);
 
-        // 对每个头执行反向传播，并将结果赋值到对应的视图中
-        #pragma omp parallel for
         for (int i = 0; i < m_num_heads; ++i)
         {
             auto delta_input = m_heads[i].backward(deltas[i], encoder_delta_views[i]);
-            total_delta_views[i].assign(delta_input); // 使用 assign 将结果写入对应位置
+            total_delta_views[i].assign(delta_input);
         }
 
         return total_delta;

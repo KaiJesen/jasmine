@@ -26,6 +26,7 @@ using res_mhca_norm_t = complex_net_builder_t<val_type>
 template<typename val_type, template<typename> class updator_type>
 using base_ffn_t = complex_net_builder_t<val_type>
     ::template push_back_updatable<weight_net_t, updator_type>
+    ::template push_back_updatable<weight_net_t, updator_type>
     ::template push_back_staticnet<relu_net_t>
     ::type;
 
@@ -66,8 +67,9 @@ using decoder_layer_t = complex_net_builder_t<val_type>
  * {
  *      0. res_ffn_t: 包含一个残差ffn层，输入输出维度相同
  *      {
- *           0. weight_net_t: 包含一个线性层，输入输出维度相同
- *           1. relu_net_t: 包含一个ReLU激活层，输入输出维度相同
+ *           0. weight_net_t: 包含一个线性层，输入d_model，输出d_ff
+ *           1. weight_net_t: 包含一个线性层，输入d_ff，输出d_model
+ *           2. relu_net_t: 包含一个ReLU激活层，输入输出维度相同
  *      }
  *      1. layer_norm_net_t: 包含一个层归一化层，输入输出维度相同
  * }
@@ -80,23 +82,26 @@ public:
 private:
     std::vector<encoder_layer_t<val_type, updator_type>> m_layers;
 public:
-    encoder_t(int const& n_layers = 1, int const& head_num = 1, int const& d_model = 1, int const& seq_len = 1)
+    encoder_t(int const& n_layers = 1, int const& head_num = 1, int const& d_model = 1, int d_ff = 0, int const& seq_len = 1)
     {
+        if (d_ff == 0) d_ff = d_model * 4;
         m_layers.resize(n_layers);
         for (int i = 0; i < n_layers; ++i)
         {
             get_mha(i).set_param(head_num, d_model, false, seq_len);
-            get_ffn(i).reinit(std::vector<int>{d_model, d_model});
+            get_ffn_front(i).reinit(std::vector<int>{d_model, d_ff});
+            get_ffn_back(i).reinit(std::vector<int>{d_ff, d_model});
         }
     }
 
-    void set_param(int const& n_layers, int const& head_num, int const& d_model, int const& seq_len)
+    void set_param(int const& n_layers, int const& head_num, int const& d_model, int const& d_ff, int const& seq_len)
     {
         m_layers.resize(n_layers);
         for (int i = 0; i < n_layers; ++i)
         {
             get_mha(i).set_param(head_num, d_model, false, seq_len);
-            get_ffn(i).reinit(std::vector<int>{d_model, d_model});
+            get_ffn_front(i).reinit(std::vector<int>{d_model, d_ff});
+            get_ffn_back(i).reinit(std::vector<int>{d_ff, d_model});
         }
     }
 
@@ -128,9 +133,14 @@ public:
         return m_layers[i].template get<0, 1>();
     }
 
-    auto& get_ffn(int const& i)
+    auto& get_ffn_front(int const& i)
     {
         return m_layers[i].template get<1, 0, 0>();
+    }
+
+    auto& get_ffn_back(int const& i)
+    {
+        return m_layers[i].template get<1, 0, 1>();
     }
 
     auto& get_ffn_norm(int const& i)
@@ -148,9 +158,14 @@ public:
         return m_layers[i].template get<0, 1>().base_net();
     }
     
-    auto& get_ffn(int const& i) const
+    auto& get_ffn_front(int const& i) const
     {
         return m_layers[i].template get<1, 0, 0>();
+    }
+    
+    auto& get_ffn_back(int const& i) const
+    {
+        return m_layers[i].template get<1, 0, 1>();
     }
 
     auto& get_ffn_norm(int const& i) const
@@ -170,7 +185,8 @@ public:
         {
             get_mha(i).template init_weight<init_type>();       // 初始化每一层的权重
             get_mha_norm(i).template init_weight<init_type>();
-            get_ffn(i).template init_weight<init_type>();       
+            get_ffn_front(i).template init_weight<init_type>();       
+            get_ffn_back(i).template init_weight<init_type>();       
             get_ffn_norm(i).template init_weight<init_type>();
         }
     }
@@ -182,7 +198,7 @@ public:
         for (size_t i = 0; i < size(); ++i)
         {
             ss << "\n" << print_indent(indent + 2) << "Layer " << i << " mha: " << get_mha(i).net_type() << "-->";
-            ss << "ffn: " << get_ffn(i).net_type();
+            ss << "ffn: " << get_ffn_front(i).net_type() << "-->" << get_ffn_back(i).net_type();
         }
         ss << std::endl << print_indent(indent) << "]";
         return ss.str();
@@ -195,7 +211,8 @@ public:
         {
             get_mha(i).template set_updator(std::forward<upr_arg_types>(args)...);
             get_mha_norm(i).template set_updator(std::forward<upr_arg_types>(args)...);
-            get_ffn(i).template set_updator(std::forward<upr_arg_types>(args)...);
+            get_ffn_front(i).template set_updator(std::forward<upr_arg_types>(args)...);
+            get_ffn_back(i).template set_updator(std::forward<upr_arg_types>(args)...);
             get_ffn_norm(i).template set_updator(std::forward<upr_arg_types>(args)...);
         }
     }
@@ -206,7 +223,8 @@ public:
         {
             get_mha(i).step();
             get_mha_norm(i).step();
-            get_ffn(i).step();
+            get_ffn_front(i).step();
+            get_ffn_back(i).step();
             get_ffn_norm(i).step();
         }
     }
@@ -252,19 +270,21 @@ private:
     encoder_t<val_type, updator_type>* m_encoder;   
     std::vector<decoder_layer_t<val_type, updator_type>> m_layers;
 public:
-    decoder_t(int const& n_layers = 1, int const& head_num = 1, int const& d_model = 1, int const& seq_len = 1): m_encoder(nullptr)
+    decoder_t(int const& n_layers = 1, int const& head_num = 1, int const& d_model = 1, int d_ff = 0, int const& seq_len = 1): m_encoder(nullptr)
     {
+        if (d_ff == 0) d_ff = d_model * 4;
         m_layers.resize(n_layers);
         for (int i = 0; i < n_layers; ++i)
         {
             get_mha(i).set_param(head_num, d_model, true, seq_len);
             get_mhca(i).set_param(head_num, d_model, false, seq_len);
             get_mhca(i).set_encoder_param(m_encoder_output, m_encoder_delta);
-            get_ffn(i).reinit(std::vector<int>{d_model, d_model});
+            get_ffn_front(i).reinit(std::vector<int>{d_model, d_ff});
+            get_ffn_back(i).reinit(std::vector<int>{d_ff, d_model});
         }
     }
 
-    void set_param(int const& n_layers, int const& head_num, int const& d_model, int const& seq_len = 1)
+    void set_param(int const& n_layers, int const& head_num, int const& d_model, int const& d_ff, int const& seq_len = 1)
     {
         m_layers.resize(n_layers);
         for (size_t i = 0; i < size(); ++i)
@@ -272,7 +292,8 @@ public:
             get_mha(i).set_param(head_num, d_model, true, seq_len);
             get_mhca(i).set_param(head_num, d_model, false, seq_len);
             get_mhca(i).set_encoder_param(m_encoder_output, m_encoder_delta);   // 设置编码器输出和梯度的引用，以便交叉注意力机制使用
-            get_ffn(i).reinit(std::vector<int>{d_model, d_model});
+            get_ffn_front(i).reinit(std::vector<int>{d_model, d_ff});
+            get_ffn_back(i).reinit(std::vector<int>{d_ff, d_model});
         }
     }
 
@@ -346,7 +367,8 @@ public:
             get_mha_norm(i).template init_weight<init_type>();  // 初始化每一层的多头注意力机制的归一化层
             get_mhca(i).template init_weight<init_type>();      // 初始化每一层的交叉多头注意力机制
             get_mhca_norm(i).template init_weight<init_type>(); // 初始化每一层的交叉多头注意力机制的归一化层
-            get_ffn(i).template init_weight<init_type>();       // 初始化每一层的前馈网络
+            get_ffn_front(i).template init_weight<init_type>();       // 初始化每一层的前馈网络
+            get_ffn_back(i).template init_weight<init_type>();       // 初始化每一层的前馈网络
             get_ffn_norm(i).template init_weight<init_type>();  // 初始化每一层的前馈网络的归一化层
         }
     }
@@ -359,7 +381,7 @@ public:
         {
             ss << "\n" << print_indent(indent + 2) << "Layer " << i << " mha: " << get_mha(i).net_type() << "-->";
             ss << "mhca: " << get_mhca(i).net_type() << "-->";
-            ss << "ffn: " << get_ffn(i).net_type();
+            ss << "ffn: " << get_ffn_front(i).net_type() << "-->" << get_ffn_back(i).net_type();
         }
         ss << std::endl << print_indent(indent) << "]";
         return ss.str();
@@ -374,7 +396,8 @@ public:
             get_mha_norm(i).template set_updator(std::forward<upr_param_types>(params)...);
             get_mhca(i).template set_updator(std::forward<upr_param_types>(params)...);
             get_mhca_norm(i).template set_updator(std::forward<upr_param_types>(params)...);
-            get_ffn(i).template set_updator(std::forward<upr_param_types>(params)...);
+            get_ffn_front(i).template set_updator(std::forward<upr_param_types>(params)...);
+            get_ffn_back(i).template set_updator(std::forward<upr_param_types>(params)...);
             get_ffn_norm(i).template set_updator(std::forward<upr_param_types>(params)...);
         }
     }
@@ -407,9 +430,14 @@ public:
         return m_layers[i].template get<1, 1>();
     }
 
-    auto& get_ffn(int const& i)
+    auto& get_ffn_front(int const& i)
     {
         return m_layers[i].template get<2, 0, 0>();
+    }
+    
+    auto& get_ffn_back(int const& i)
+    {
+        return m_layers[i].template get<2, 0, 1>();
     }
 
     auto& get_ffn_norm(int const& i)
@@ -437,9 +465,14 @@ public:
         return m_layers[i].template get<1, 1>().base_net();
     }
 
-    auto& get_ffn(int const& i) const
+    auto& get_ffn_front(int const& i) const
     {
         return m_layers[i].template get<2, 0, 0>();
+    }
+    
+    auto& get_ffn_back(int const& i) const
+    {
+        return m_layers[i].template get<2, 0, 1>();
     }
 
     auto& get_ffn_norm(int const& i) const
@@ -460,8 +493,8 @@ private:
     decoder_type m_decoder;
 
 public:
-    transformer_kernel_t(int const& en_layers = 1, int const& de_layers = 1, int const& head_num = 1, int const& d_model = 1, int const& seq_len = 1)
-        : m_encoder(en_layers, head_num, d_model, seq_len), m_decoder(de_layers, head_num, d_model, seq_len)
+    transformer_kernel_t(int const& en_layers = 1, int const& de_layers = 1, int const& head_num = 1, int const& d_model = 1, int d_ff = 0, int const& seq_len = 1)
+        : m_encoder(en_layers, head_num, d_model, d_ff ? d_ff : d_model * 4, seq_len), m_decoder(de_layers, head_num, d_model, d_ff ? d_ff : d_model * 4, seq_len)
     {
         m_decoder.set_encoder(m_encoder);   // 将编码器的引用传递给解码器，以便交叉注意力机制使用
     }
@@ -507,10 +540,10 @@ public:
     }
 
     // 编解码器序列长度可能不一样，因此不设置，而且序列长度仅影响初始化时候的qkv缓存长度，实际不影响运行
-    void set_param(int const& en_layers, int const& de_layers, int const& head_num, int const& d_model)
+    void set_param(int const& en_layers, int const& de_layers, int const& head_num, int const& d_model, int const& d_ff)
     {
-        m_encoder.set_param(en_layers, head_num, d_model, 1);
-        m_decoder.set_param(de_layers, head_num, d_model, 1);
+        m_encoder.set_param(en_layers, head_num, d_model, d_ff, 1);
+        m_decoder.set_param(de_layers, head_num, d_model, d_ff, 1);
     }
 
     std::string net_type(int const& indent = 0) const
@@ -568,7 +601,7 @@ void test_base_type()
     }
     std::cout << "res_mha_norm output: \n" << res_mha_norm.forward(input) << std::endl;
     res_ffn_t<val_type, nadam_t> res_ffn;
-    res_ffn.base_net().reinit(std::vector<int>{4, 4});
+    res_ffn.base_net().reinit(std::vector<int>{4, 16, 4});
     res_ffn.base_net().set_updator(0.01);
     res_ffn.init_weight<xavier_gaussian_t>();
     for (int i = 0; i < train_steps; ++i)
@@ -580,7 +613,7 @@ void test_base_type()
     std::cout << "res_ffn output: \n" << res_ffn.forward(input) << std::endl;
 
     res_ffn_norm_t<val_type, nadam_t> res_ffn_norm;
-    res_ffn_norm.get<0>().base_net().reinit(std::vector<int>{4, 4});
+    res_ffn_norm.get<0>().base_net().reinit(std::vector<int>{4, 16, 4});
     res_ffn_norm.get<0>().base_net().set_updator(0.01);
     res_ffn_norm.get<1>().set_updator(0.01);
     res_ffn_norm.init_weight<xavier_gaussian_t>();
@@ -606,7 +639,7 @@ void test_encoder()
         ::push_back_staticnet<mse_loss_t>
         ::type;
     net_type cnet;
-    cnet.template get<0>().set_param(2, 2, 4, 1);           // 设置编码器的参数，注意，这里要单独设置，因为和权重网络不一样
+    cnet.template get<0>().set_param(2, 2, 4, 16, 1);           // 设置编码器的参数，注意，这里要单独设置，因为和权重网络不一样
     std::cout << "input lr:";
     double lr = 0.01;
     std::cin >> lr;
@@ -639,7 +672,7 @@ void test_decoder()
         ::push_back_staticnet<mse_loss_t>
         ::type;
     net_type cnet;
-    cnet.template get<0>().set_param(2, 2, 4, 1);           // 设置解码器的参数，注意，这里要单独设置，因为和权重网络不一样
+    cnet.template get<0>().set_param(2, 2, 4, 16, 1);           // 设置解码器的参数，注意，这里要单独设置，因为和权重网络不一样
     std::cout << "input lr:";
     double lr = 0.01;
     std::cin >> lr;
@@ -682,7 +715,7 @@ void test_tf_kernel()
     net_type cnet;
     tf_type& tf = cnet.template get<0>();
     // 编码器层数、解码器层数、注意力头数、模型维度、序列长度
-    tf.set_param(3, 2, 2, 4);           // 设置编码器和解码器的参数，注意，这里要单独设置，因为和权重网络不一样
+    tf.set_param(3, 2, 2, 4, 16);           // 设置编码器和解码器的参数，注意，这里要单独设置，因为和权重网络不一样
 
     /* 设置学习率，初始化权重 */
     std::cout << cnet.net_type() << std::endl;
