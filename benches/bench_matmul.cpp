@@ -2,6 +2,8 @@
 #include "mat_t.hpp"
 #include "mat_express_t.hpp"
 
+
+using namespace jasmine;
 static void BM_MatDot(benchmark::State& state)
 {
     const int n = static_cast<int>(state.range(0));

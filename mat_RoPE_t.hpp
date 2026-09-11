@@ -4,6 +4,8 @@
 #include "mat_view_t.hpp"
 #include "mat_express_t.hpp"
 
+namespace jasmine {
+
 // 一个可以变动的缓存矩阵，用于RoPE的计算
 template<typename val_type>
 class mat_cache_t
@@ -231,4 +233,6 @@ public:
 };
 
 
+
+} // namespace jasmine
 #endif

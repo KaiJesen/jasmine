@@ -6,6 +6,8 @@
 #include "mat_net_t.hpp"
 #include "mat_init_t.hpp"
 
+namespace jasmine {
+
 template <typename val_type>
 class sgd_t
 {
@@ -219,4 +221,6 @@ public:
 
 };
 
+
+} // namespace jasmine
 #endif

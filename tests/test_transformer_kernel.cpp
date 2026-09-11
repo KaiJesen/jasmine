@@ -6,6 +6,8 @@
 #include "mat_updator_t.hpp"
 #include "test_helpers.hpp"
 
+
+using namespace jasmine;
 template <typename val_type>
 using tf_upr_tpl = cache_updator_t<val_type, nadam_t>;
 

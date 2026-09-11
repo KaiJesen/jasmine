@@ -8,6 +8,9 @@
 #include "mat_net_t.hpp"
 #include "mat_transformer_kernel_t.hpp"
 #include "mat_RoPE_t.hpp"
+#include "mat_loss_t.hpp"
+
+namespace jasmine {
 
 /*
  * transformer的基座，可以在上面增加各种识别层，比如：softmax层用于分类，线性层用于回归，或者其他的层。这个类的设计目的是为了提供一个统一的接口来调用transformer的前向传播和反向传播，同时提供一个接口来设置优化器的参数，进行训练。
@@ -90,10 +93,10 @@ public:
 };
 
 
-#include "mat_loss_t.hpp"
-
 template<typename val_type>
 using base_upr_tpl = cache_updator_t<val_type, nadam_t>;
 
 
+
+} // namespace jasmine
 #endif

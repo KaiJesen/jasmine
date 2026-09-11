@@ -1,6 +1,8 @@
 #include <iostream>
 #include "transformer_test.hpp"
 
+
+using namespace jasmine;
 int main()
 {
     test_transformer_t net;

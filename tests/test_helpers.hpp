@@ -5,6 +5,8 @@
 #include <gtest/gtest.h>
 #include "mat_t.hpp"
 
+
+using namespace jasmine;
 template <typename MatA, typename MatB>
 void ExpectNearMat(const MatA& a, const MatB& b, double tol = 1e-5)
 {

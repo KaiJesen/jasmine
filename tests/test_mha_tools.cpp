@@ -2,6 +2,8 @@
 #include "mat_mha_t.hpp"
 #include "test_helpers.hpp"
 
+
+using namespace jasmine;
 TEST(MhaTools, VConcatVSplitRoundTrip)
 {
     std::vector<mat_t<double>> inputs;

@@ -3,6 +3,8 @@
 #include <vector>
 #include <type_traits>
 
+namespace jasmine {
+
 template<typename val_type>
 concept is_matrix = 
     requires(val_type m, int i, int j) 
@@ -56,4 +58,6 @@ concept is_updatable_net =
 template<typename net_type>
 concept is_unupdatable_net = !is_updatable_net<net_type>;
 
+
+} // namespace jasmine
 #endif

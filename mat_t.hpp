@@ -9,6 +9,8 @@
 
 #include "mat_utility.hpp"
 
+namespace jasmine {
+
 template<typename val_type>
 class mat_view_t;           // 这里先声明，因为后面要用到这个来声明转置函数
 
@@ -382,4 +384,6 @@ public:
 
 
 
+
+} // namespace jasmine
 #endif

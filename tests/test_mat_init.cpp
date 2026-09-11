@@ -3,6 +3,8 @@
 #include "mat_t.hpp"
 #include "mat_init_t.hpp"
 
+
+using namespace jasmine;
 TEST(MatInit, StrategiesProduceFiniteNonZero)
 {
     mat_t<double> m(3, 4);

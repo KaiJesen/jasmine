@@ -5,6 +5,8 @@
 #include "mat_concepts.hpp"
 #include "mat_t.hpp"
 
+namespace jasmine {
+
 static std::default_random_engine g_random_engine;
 
 template <typename init_type>
@@ -118,4 +120,6 @@ void init_matrix(mat_type& m, args_types&&... args)
 }
 
 
+
+} // namespace jasmine
 #endif

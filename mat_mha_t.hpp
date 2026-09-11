@@ -1,10 +1,15 @@
 #ifndef __MAT_MHA_T_HPP__
 #define __MAT_MHA_T_HPP__
 
+#include <cmath>
+#include <limits>
+
 #include "mat_t.hpp"
 #include "mat_view_t.hpp"
 #include "mat_net_t.hpp"
 #include "mat_express_t.hpp"
+
+namespace jasmine {
 
 template <typename input_type, template<typename> class updator_type>
 class mat_head_gen_t
@@ -50,7 +55,7 @@ public:
         m_k = m_k_net.forward(input);
         m_v = m_v_net.forward(input);
 
-        auto attn_scores = (m_q.t().dot(m_k) / sqrt(m_q.row_num())).clone();
+        auto attn_scores = (m_q.t().dot(m_k) / std::sqrt(m_q.row_num())).clone();
         /*!ANCHOR 掩码规则说明
         * 由于scores=Q'K，也就是说scores中的i行j列元素表示的是Q序列中第i个值与K序列中第j个值之间的分数；
         * Q是表示的是当前的查询，K是可关注的历史。那么就需要就针对每个Q让他只能看到之前发生的K。也就是j > i的都设置为无效的
@@ -81,7 +86,7 @@ public:
         m_k = m_k_net.forward(encoder_input);
         m_v = m_v_net.forward(encoder_input);
 
-        auto attn_scores = (m_q.t().dot(m_k) / sqrt(m_q.row_num())).clone();
+        auto attn_scores = (m_q.t().dot(m_k) / std::sqrt(m_q.row_num())).clone();
         // 较差注意力不需要mask层
         auto attn_weights = m_softmax.forward(attn_scores);
         auto output = m_v.dot(attn_weights.t()).clone();
@@ -109,8 +114,8 @@ public:
             }
         }
         //std::cout << "delta_qt_k: " << delta_qt_k << std::endl;
-        mat_t<val_type> delta_q = m_k.dot(delta_qt_k.t()) / static_cast<val_type>(sqrt(m_q.row_num()));
-        mat_t<val_type> delta_k = m_q.dot(delta_qt_k) / static_cast<val_type>(sqrt(m_q.row_num()));
+        mat_t<val_type> delta_q = m_k.dot(delta_qt_k.t()) / static_cast<val_type>(std::sqrt(m_q.row_num()));
+        mat_t<val_type> delta_k = m_q.dot(delta_qt_k) / static_cast<val_type>(std::sqrt(m_q.row_num()));
 
         return (m_q_net.backward(delta_q) + m_k_net.backward(delta_k) + m_v_net.backward(delta_v)).clone();
     }
@@ -120,8 +125,8 @@ public:
         mat_t<val_type> delta_v = delta.dot(m_softmax.m_output);
         mat_t<val_type> delta_attn_weights = delta.t().dot(m_v);
         mat_t<val_type> delta_qt_k = m_softmax.backward(delta_attn_weights);
-        mat_t<val_type> delta_q = m_k.dot(delta_qt_k.t()) / static_cast<val_type>(sqrt(m_q.row_num()));
-        mat_t<val_type> delta_k = m_q.dot(delta_qt_k) / static_cast<val_type>(sqrt(m_q.row_num()));
+        mat_t<val_type> delta_q = m_k.dot(delta_qt_k.t()) / static_cast<val_type>(std::sqrt(m_q.row_num()));
+        mat_t<val_type> delta_k = m_q.dot(delta_qt_k) / static_cast<val_type>(std::sqrt(m_q.row_num()));
         encoder_delta += ((m_k_net.backward(delta_k) + m_v_net.backward(delta_v)));
         mat_t<val_type> delta_input = m_q_net.backward(delta_q);
         return delta_input;
@@ -459,4 +464,6 @@ public:
 
 
 
+
+} // namespace jasmine
 #endif

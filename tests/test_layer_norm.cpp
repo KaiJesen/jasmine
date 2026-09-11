@@ -4,6 +4,8 @@
 #include "mat_updator_t.hpp"
 #include "test_helpers.hpp"
 
+
+using namespace jasmine;
 TEST(LayerNorm, PerColumnZeroMeanUnitVariance)
 {
     layer_norm_net_t<mat_t<double>, nadam_t> ln;

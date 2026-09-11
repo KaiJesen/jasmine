@@ -4,6 +4,8 @@
 
 #include "mat_concepts.hpp"
 
+namespace jasmine {
+
 template <typename val_type>
 requires is_serializable<val_type>
 std::ostream& operator<<(std::ostream& os, const val_type& m)
@@ -238,4 +240,6 @@ struct cosine_annealing_decay
     }
 };
 
+
+} // namespace jasmine
 #endif

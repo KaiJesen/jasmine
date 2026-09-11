@@ -7,6 +7,8 @@
 #include "mat_concepts.hpp"
 #include "mat_express_t.hpp"
 
+namespace jasmine {
+
 // 损失函数做成和网络一样的形式，但是只有反向传播有意义，正向传播直接透传
 template <typename input_type>
 class mat_loss_t
@@ -58,4 +60,6 @@ public:
 };
 
 
+
+} // namespace jasmine
 #endif

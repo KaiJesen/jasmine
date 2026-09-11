@@ -4,6 +4,8 @@
 #include "mat_loss_t.hpp"
 #include "test_helpers.hpp"
 
+
+using namespace jasmine;
 template <size_t N>
 struct test_net_t
 {

@@ -5,6 +5,8 @@
 #include "mat_express_t.hpp"
 #include "test_helpers.hpp"
 
+
+using namespace jasmine;
 TEST(MatBasic, ShapeAndTransposeView)
 {
     mat_t<double> m(3, 3, {

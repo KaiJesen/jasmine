@@ -2,6 +2,8 @@
 #include "mat_mha_t.hpp"
 #include "mat_init_t.hpp"
 
+
+using namespace jasmine;
 static void BM_MhaForward(benchmark::State& state)
 {
     const int num_heads = static_cast<int>(state.range(0));

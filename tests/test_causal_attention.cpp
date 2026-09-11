@@ -4,6 +4,8 @@
 #include "mat_init_t.hpp"
 #include "test_helpers.hpp"
 
+
+using namespace jasmine;
 using val_type = float;
 
 TEST(CausalAttention, MaskedMhaFirstPositionStable)

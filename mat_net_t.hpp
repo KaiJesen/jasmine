@@ -9,6 +9,8 @@
 
 #include "mat_updator_t.hpp"
 
+namespace jasmine {
+
 template <typename input_type, template<typename> class updator_type>
 class weight_net_t
 {
@@ -552,4 +554,6 @@ struct complex_net_builder_t
 };
 
 
+
+} // namespace jasmine
 #endif

@@ -5,6 +5,8 @@
 #include "mat_updator_t.hpp"
 #include "test_helpers.hpp"
 
+
+using namespace jasmine;
 static double mse(const mat_t<double>& a, const mat_t<double>& b)
 {
     double s = 0.0;

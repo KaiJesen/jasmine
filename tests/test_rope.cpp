@@ -3,6 +3,8 @@
 #include "mat_RoPE_t.hpp"
 #include "test_helpers.hpp"
 
+
+using namespace jasmine;
 TEST(RoPE, UniteAndNetForwardFinite)
 {
     mat_RoPE_t<float> rope(64);

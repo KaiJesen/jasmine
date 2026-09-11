@@ -1,7 +1,7 @@
 #ifndef __MAT_EXPRESS_T_HPP__
 #define __MAT_EXPRESS_T_HPP__
 #include <cassert>
-#include <math.h>
+#include <cmath>
 #include <sstream>
 #include <tuple>
 #include <string>
@@ -10,6 +10,8 @@
 
 #include "mat_concepts.hpp"
 #include "mat_view_t.hpp"
+
+namespace jasmine {
 
 template<typename lval_type, typename rval_type>
 requires is_matrix<lval_type> && is_matrix<rval_type>
@@ -89,7 +91,7 @@ public:
     template<typename other_type>
     auto dot(const other_type& m) const
     {
-        return ::dot(*reinterpret_cast<derived_type const*>(this), m);
+        return jasmine::dot(*reinterpret_cast<derived_type const*>(this), m);
     }
 
     // 计算所有元素的值，并赋值给一个新的mat_t对象并返回
@@ -410,7 +412,7 @@ public:
     template<typename other_type>
     auto dot(const other_type& m) const
     {
-        return ::dot(*reinterpret_cast<derived_type const*>(this), m);
+        return jasmine::dot(*reinterpret_cast<derived_type const*>(this), m);
     }
 
     mat_t<ele_type> clone() const
@@ -452,7 +454,7 @@ public:
 
     auto work(val_base_type i) const
     {
-        return exp(i);
+        return std::exp(i);
     }
 
     static std::string type_name()
@@ -473,7 +475,7 @@ template <typename val_type>
 requires std::is_arithmetic_v<val_type>
 val_type sigmoid(val_type const& val)
 {
-    return 1.0 / (1.0 + exp(-val));
+    return 1.0 / (1.0 + std::exp(-val));
 }
 
 
@@ -493,7 +495,7 @@ public:
 
     auto work(val_base_type i) const
     {
-        return 1.0 / (1.0 + exp(-i));
+        return 1.0 / (1.0 + std::exp(-i));
     }
 
     static std::string type_name()
@@ -656,7 +658,7 @@ public:
 
     auto work(val_base_type i) const
     {
-        return exp(i - m_max) / m_sum;
+        return std::exp(i - m_max) / m_sum;
     }
 
     static std::string type_name()
@@ -739,7 +741,7 @@ public:
     template<typename other_type>
     auto dot(const other_type& m) const
     {
-        return ::dot(*this, m);
+        return jasmine::dot(*this, m);
     }
 
     std::string to_string() const
@@ -791,7 +793,7 @@ template<typename other_type>
 requires is_matrix<other_type>
 auto mat_t<val_type>::dot(const other_type& m) const
 {
-    return ::dot(*this, m);
+    return jasmine::dot(*this, m);
 }
 
 template <typename val_type>
@@ -799,7 +801,7 @@ template<typename other_type>
 requires is_matrix<other_type>
 auto mat_view_t<val_type>::dot(const other_type& m) const
 {
-    return ::dot(*this, m);
+    return jasmine::dot(*this, m);
 }
 
 template<typename val_type>
@@ -813,4 +815,6 @@ auto sqrt(val_type const& val)
     return result;
 }
 
+
+} // namespace jasmine
 #endif

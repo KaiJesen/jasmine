@@ -6,6 +6,9 @@
 #include "mat_transformer_t.hpp"
 #include "mat_transformer_kernel_t.hpp"
 #include "mat_net_t.hpp"
+#include <iomanip>
+
+namespace jasmine {
 
 /*!SECTION
  * 测试场景：
@@ -66,7 +69,6 @@ inline bool is_eos(mat_t<test_val_type>& mat)
     return back_col(mat)(mat.row_num() - 1, 0) > 0.8; // 判断是否为EOS标签 
 }
 
-#include <iomanip>
 inline void print_tui_display(int current, int total, double lr, double loss)
 {
     const int bar_width = 60;
@@ -275,4 +277,6 @@ public:
 };
 
 
+
+} // namespace jasmine
 #endif

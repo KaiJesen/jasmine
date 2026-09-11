@@ -4,6 +4,8 @@
 #include "mat_net_t.hpp"
 #include "mat_mha_t.hpp"
 
+namespace jasmine {
+
 // 定义基本的堆叠单元
 template<typename val_type, template<typename> class updator_type>
 using res_mha_t = residual_net_t<mat_mha_t<mat_t<val_type>, updator_type>>;
@@ -600,4 +602,6 @@ public:
 };
 
 
+
+} // namespace jasmine
 #endif

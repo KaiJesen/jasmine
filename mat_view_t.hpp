@@ -4,6 +4,8 @@
 #include "mat_t.hpp"
 #include "mat_utility.hpp"
 
+namespace jasmine {
+
 template <typename agent_type>
 class mat_view_t
 { 
@@ -243,4 +245,6 @@ mat_view_t<const mat_t<val_type>> mat_t<val_type>::front_row() const noexcept
 }
 
 
+
+} // namespace jasmine
 #endif

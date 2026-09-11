@@ -4,6 +4,8 @@
 #include "mat_loss_t.hpp"
 #include "mat_updator_t.hpp"
 
+
+using namespace jasmine;
 template <typename val_type>
 using upr_tpl = cache_updator_t<val_type, nadam_t>;
 
