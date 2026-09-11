@@ -2,6 +2,7 @@
 #define __MAT_ROPE_HPP__
 
 #include "mat_view_t.hpp"
+#include "mat_express_t.hpp"
 
 // 一个可以变动的缓存矩阵，用于RoPE的计算
 template<typename val_type>
@@ -228,19 +229,6 @@ public:
         return ss.str();
     }
 };
-
-void test_RoPE()
-{
-    mat_RoPE_t<float> rope(64);
-    std::cout << rope.forward_unite(0, 0) << std::endl;
-    std::cout << rope.forward_unite(0, 1) << std::endl;
-    std::cout << rope.forward_unite(0, 2) << std::endl;
-
-    RoPE_net_t<mat_t<double>> rope_net(4);
-
-    std::cout << rope_net.forward(mat_t<double>(4, 4, {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6})) << std::endl;
-
-}
 
 
 #endif

@@ -1,0 +1,8 @@
+add_executable(train_transformer train_transformer.cpp)
+target_link_libraries(train_transformer PRIVATE jasmine_headers)
+
+add_executable(train_tf_base train_tf_base.cpp)
+target_link_libraries(train_tf_base PRIVATE jasmine_headers)
+
+add_executable(train_tf_kernel train_tf_kernel.cpp)
+target_link_libraries(train_tf_kernel PRIVATE jasmine_headers)

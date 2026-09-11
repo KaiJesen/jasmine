@@ -813,20 +813,4 @@ auto sqrt(val_type const& val)
     return result;
 }
 
-void test_mat_express_t()
-{ 
-    mat_t m1{3, 3, {1,2,3,
-                   4,5,6,
-                   7,8,9}};
-    mat_t m2{3, 3, {9,8,7,
-                   6,5,4,
-                   3,2,1}};
-    auto m3 = ((m1 + m2 - m1) * m2 / m1).dot(m2).dot(m2);
-    std::cout << m3 << std::endl;
-
-    mat_t<double> m4{2, 4, {2, 2, 2, 2,
-                            3, 3, 3, 3}};
-    std::cout << hsoftmax(m4) << std::endl;
-}
-
 #endif

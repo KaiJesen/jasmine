@@ -137,20 +137,26 @@ public:
         m_net.set_updator(lr);
     }
 
+    void set_lr(test_val_type lr)
+    {
+        m_net.set_lr(lr);
+    }
 
-    void train(mat_t<test_val_type> const& en_input, mat_t<test_val_type> const& de_input, mat_t<test_val_type> const& label, int train_times)
+
+    void train(mat_t<test_val_type> const& en_input, mat_t<test_val_type> const& /*de_input*/, mat_t<test_val_type> const& label, int train_times)
     {
         auto en_input_expand = expand_encoder_input(en_input);
         std::cout << "expanded encoder input: \n" << en_input_expand << std::endl;
-        mat_t<test_val_type> input_sos = add_sos(de_input);
-        std::cout << "input with flags: \n" << input_sos << std::endl;
+        // 与 predict 对齐：decoder teacher forcing 必须是 shifted label
+        // input  = [SOS, y1, y2, y3]
+        // target = [y1, y2, y3, EOS]
+        mat_t<test_val_type> input_sos = add_sos(label);
+        std::cout << "decoder teacher input (SOS+label): \n" << input_sos << std::endl;
         mat_t<test_val_type> label_eos = add_eos(label);
         std::cout << "label with flags: \n" << label_eos << std::endl;
-        // 编码器先进行编码
-        tf_base().encoder_forward(en_input_expand);
         int epoch_max = train_times;
         int init_decay_steps = 100;
-        double max_lr = 1e-4;
+        double max_lr = 3e-4;
         double min_lr = 1e-6;
         double warmup_rate = 0.2;
         double T_multiplier = 2.0;
@@ -166,45 +172,59 @@ public:
         int print_step = train_times < 100 ? 1 : train_times / 100;
 
         std::cout << m_net.net_type() << std::endl;
-        
-        // Scheduled sampling 参数
-        // teacher_forcing_ratio: 训练初期=1.0（全部使用真实输入），逐渐衰减到 0.5（50% 混入模型输出）
-        // 目的是让模型学会在自回归推理时处理自己的偏差，而非只适应完美输入
-        double initial_teacher_forcing = 1.0;
-        double final_teacher_forcing = 0.5;
+
+        // 前一段纯 TF 学拟合；后段 scheduled sampling 对齐 predict 自回归。
+        constexpr bool use_scheduled_sampling = true;
+        constexpr double ss_warmup_frac = 0.3;   // 前 30% 步纯 teacher forcing
+        constexpr double final_teacher_forcing = 0.1;
+        // EOS 维在 MSE 里只占 1/(d_model*T)，加重其梯度，否则 AR 时很难压过 0.8 阈值
+        constexpr test_val_type eos_loss_weight = 8.0;
         int seq_len = label_eos.col_num();
+        int const sos_row = input_dim;
+        int const eos_row = input_dim + 1;
         
         std::cout << std::endl;
         for (int i = 0; i < train_times; i++)
         {
-            m_net.set_updator(lr_decay.get_lr());
-            
-            double progress = static_cast<double>(i) / train_times;
-            double tf_ratio = initial_teacher_forcing + (final_teacher_forcing - initial_teacher_forcing) * progress;
-            
-            // 自回归构建混合输入：完全模拟推理场景
-            // 从干净的 input_sos 开始，逐 token 预测并决定是否混入模型输出
+            // 只改学习率，不要 set_updator（会重置 Nadam 动量）
+            m_net.set_lr(static_cast<test_val_type>(lr_decay.get_lr()));
+            // 每步重算 encoder：权重在 backward 里会更新，若只 encode 一次，
+            // train/TF 评估用的是旧 memory，predict 却用新权重重算 → 首 token 就会对不上
+            tf_base().encoder_forward(en_input_expand);
+
             mat_t<test_val_type> cur_input = input_sos.clone();
-            for (int step = 1; step < seq_len; ++step) // step 指向要混合的输入列（跳过 SOS）
+            if (use_scheduled_sampling)
             {
-                // 用当前（可能已混合的）输入做 forward，得到模型预测
-                auto pred = m_net.forward(cur_input);
-                // pred(r, step-1) = 模型对 step 位置 token 的预测
-                // （自回归：输入 [x0..x_{step-1}] 输出对应位置的预测，输出列 step-1 预测第 step 个 token）
-                
-                double rand_val = static_cast<double>(rand()) / RAND_MAX;
-                if (rand_val > tf_ratio)
+                double progress = static_cast<double>(i) / train_times;
+                double tf_ratio = 1.0;
+                if (progress > ss_warmup_frac)
                 {
-                    // 混入模型自己的输出，而不是真实输入
-                    for (int r = 0; r < input_dim; ++r)
-                        cur_input(r, step) = pred(r, step - 1);
+                    double ss_progress = (progress - ss_warmup_frac) / (1.0 - ss_warmup_frac);
+                    tf_ratio = 1.0 + (final_teacher_forcing - 1.0) * ss_progress;
                 }
-                // else: cur_input(r, step) 保持原始 teacher 值
+                for (int step = 1; step < seq_len; ++step)
+                {
+                    auto pred = m_net.forward(cur_input.view(0, 0, d_model, step));
+                    double rand_val = static_cast<double>(rand()) / RAND_MAX;
+                    if (rand_val > tf_ratio)
+                    {
+                        // 与 predict 一致：回灌上一拍整列，并清掉 SOS 泄漏
+                        cur_input.col(step).assign(pred.back_col());
+                        cur_input(sos_row, step) = 0;
+                    }
+                }
             }
-            
-            // 最终 forward + backward：输入是自回归混合版本，标签始终是正确答案
+
             m_net.forward(cur_input);
-            m_net.backward(label_eos);
+            // 等价于对 EOS 行梯度乘 eos_loss_weight：fake = (1-w)*pred + w*label
+            mat_t<test_val_type> backward_target = label_eos.clone();
+            auto const& pred = m_net.template get<3>().m_input;
+            for (int j = 0; j < backward_target.col_num(); ++j)
+            {
+                backward_target(eos_row, j) =
+                    (1 - eos_loss_weight) * pred(eos_row, j) + eos_loss_weight * label_eos(eos_row, j);
+            }
+            m_net.backward(backward_target);
             m_net.step();
             
             lr_decay.step();
@@ -213,12 +233,15 @@ public:
                 print_tui_display(i/print_step, 100, lr_decay.get_lr(), m_net.template get<3>().loss(label_eos));
             }
         }
-        std::cout << "label: \n" << label_eos << std::endl;
-        //std::cout << "train output: \n" << m_net.forward(input_sos) << std::endl;
-        //std::cout << "test input: \n" << input_sos.front_col() << std::endl;
-        //std::cout << "test first: \n" << m_net.forward(input_sos.front_col()) << std::endl;
-        
-
+        std::cout << "\nlabel: \n" << label_eos << std::endl;
+        // teacher forcing 评估：与 predict 一样先用当前权重重算 encoder
+        tf_base().encoder_forward(en_input_expand);
+        auto teacher_out = m_net.forward(input_sos);
+        std::cout << "teacher-forcing output: \n" << teacher_out << std::endl;
+        std::cout << "teacher-forcing loss: " << m_net.template get<3>().loss(label_eos) << std::endl;
+        // 仅 SOS 前缀的首 token，应与 teacher_out 第 0 列、predict 第 1 列一致
+        auto sos_only_out = m_net.forward(input_sos.view(0, 0, d_model, 1).clone());
+        std::cout << "SOS-only first output (should match TF col0): \n" << sos_only_out << std::endl;
     }
 
     mat_t<test_val_type> remove_flags(const mat_t<test_val_type>& mat)
@@ -228,47 +251,20 @@ public:
 
     auto predict(mat_t<test_val_type>& en_input)
     {
-        // 构建只有1个SOS标志的矩阵，然后递归得出预测结果
-        
         auto en_input_expand = expand_encoder_input(en_input);
-        //std::cout << "predict expanded encoder input: \n" << en_input_expand << std::endl;
-        #if 0
-        mat_t<test_val_type> de_input(d_model, 1024);
-        int seq_len = 0;
-        de_input(input_dim, seq_len++) = 1.;
         tf_base().encoder_forward(en_input_expand);
-        while (true)
-        {
-            if (seq_len >= 10)
-            {
-                break;
-            }
-            std::cout << "decoder input: \n" << de_input.view(0, 0, d_model, seq_len) << std::endl;
-            auto output = m_net.forward(de_input.view(0, 0, d_model, seq_len));
-            std::cout << "seq_idx: " << seq_len << " output: \n" << output.back_col() << std::endl;
-            if (is_eos(output))
-            {
-                break;
-            }
-            de_input.col(seq_len++).assign(back_col(output));
-        }
-        std::cout << "final decoder input with flags: \n" << de_input.view(0, 0, d_model, seq_len) << std::endl;
-        auto final_output = remove_flags(de_input).view(0, 1, input_dim, seq_len - 1).clone();
-        //std::cout << "final output: \n" << final_output << std::endl;
-        //std::cout << "origin output: \n" << de_input.view(0, 0, d_model, seq_len) << std::endl;
-        return final_output;
-        #endif
 
-        /* 逐次将解码器的输入进行输入，获得输出 */
         mat_t<test_val_type> pred_input(input_dim, 1023);
         auto pred_input_sos = add_sos(pred_input);
+        int const sos_row = input_dim;
         int len = 1;
         while (true)
         {
             auto cur_input = pred_input_sos.view(0, 0, d_model, len);
             auto output = m_net.forward(cur_input);
-            //std::cout << "---- seq_idx: " << len << std::endl << "input: \n" << cur_input << std::endl << " output: \n" << output.back_col() << std::endl;
-            pred_input_sos.col(len++).assign(output.back_col());
+            pred_input_sos.col(len).assign(output.back_col());
+            pred_input_sos(sos_row, len) = 0; // 生成步不应带 SOS
+            ++len;
             if (is_eos(output))break;
             if (len >= 10)break;
         }
@@ -278,97 +274,5 @@ public:
 
 };
 
-void test_sequence_mha()
-{
-    /*!SECTION
-    * 按照原理来讲对于有mask的mha，输入的长度是1和输入长度是2的序列，其第1个位置输出应该是一样的，本示例就是要验证这个功能
-    */
-    mat_mha_t<mat_t<test_val_type>, nadam_t> mha(2, 6, true, 10);
-    mha.init_weight<xavier_gaussian_t>();
-    mat_t<test_val_type> input1(6, 1, {0.5
-                                , 0.3
-                                , 0.2
-                                , 0.1
-                                , 0.3
-                                , 0.5});
-    mat_t<test_val_type> input2(6, 2, {0.5, 0.8
-                                , 0.3, 0.7
-                                , 0.2, 0.4
-                                , 0.1, 0.2
-                                , 0.3, 0.4
-                                , 0.5, 0.6});
-    std::cout << "input1: \n" << input1 << std::endl;
-    std::cout << "input2: \n" << input2 << std::endl;
-    std::cout << "output1: \n" << mha.forward(input1) << std::endl;
-    std::cout << "output2: \n" << mha.forward(input2) << std::endl;
-    std::cout << ((input2.front_col() - input1) < 0.0001) << std::endl;
-    // 对于transformer也是一样，保持编码器输入不变，如果保持解码器输入的第一个位置不变，那么输出的第一个位置也应该是一样的
-    transformer_base_t<mat_t<test_val_type>, nadam_t> tf_base(2, 3, 2, 6, 24);
-    tf_base.init_weight<xavier_gaussian_t>();
-    mat_t<test_val_type> en_input(6, 3, {0.5, 0.8, 0.3
-                                , 0.7, 0.2, 0.4
-                                , 0.6, 0.8, 0.1
-                                , 0.9, 0.3, 0.7
-                                , 0.3, 0.7, 0.2
-                                , 0.4, 0.5, 0.6});
-    tf_base.encoder_forward(en_input);
-    std::cout << "tf_base output1: \n" << tf_base.forward(input1) << std::endl;
-    std::cout << "tf_base output2: \n" << tf_base.forward(input2) << std::endl;
-}
-
-
-void test_transformer()
-{
-    #if 0
-    // 测试标签增加是否有效
-    mat_t<test_val_type> input(2, 2, {0.5, 0.8, 0.3, 0.7});
-    mat_t<test_val_type> label(3, 2, {0.2, 0.4, 0.6, 0.8, 0.1, 0.9});
-    auto input_sos = add_sos(input);
-    auto label_eos = add_eos(label);
-    std::cout << "input with sos \n" << input_sos << "\nlabel with eos \n" << label_eos << std::endl;
-    #endif
-    test_transformer_t net;
-    net.init(1e-5);
-    int input_dim = test_transformer_t::input_dim;
-    mat_t<test_val_type> en_input(input_dim, 3,    
-                                            { 0.5, 0.8, 0.3
-                                            , 0.7, 0.2, 0.4
-                                            , 0.6, 0.8, 0.1
-                                            , 0.9, 0.3, 0.7
-                                            , 0.2, 0.6, 0.4
-                                            , 0.1, 0.9, 0.5
-                                            , 0.3, 0.5, 0.8
-                                            , 0.8, 0.1, 0.6});
-    mat_t<test_val_type> de_input(input_dim, 3,    
-                                            { 0.4, 0.5, 0.6
-                                            , 0.7, 0.8, 0.9
-                                            , 0.1, 0.2, 0.3
-                                            , 0.4, 0.5, 0.6
-                                            , 0.9, 0.1, 0.8
-                                            , 0.2, 0.3, 0.5
-                                            , 0.6, 0.7, 0.4
-                                            , 0.5, 0.9, 0.2});
-    mat_t<test_val_type> label(input_dim, 3,       
-                                            { 0.3, 0.2, 0.1
-                                            , 0.8, 0.5, 0.1
-                                            , 0.7, 0.8, 0.9
-                                            , 0.4, 0.3, 0.2
-                                            , 0.6, 0.2, 0.5
-                                            , 0.9, 0.1, 0.3
-                                            , 0.5, 0.7, 0.4
-                                            , 0.1, 0.6, 0.8});
-    int train_times = 100000;
-    std::cout << "Input train times: ";
-    std::cin >> train_times;
-
-    net.train(en_input, de_input, label, train_times);
-    net.predict(en_input);
-    /*
-    测试结果：
-    由于预测结果与标签存在微小偏差，而迭代的过程会积累并放大偏差，所以导致推理结果和标签不一致；
-    - 可以通过增加Embedding层来解决这个问题；
-    - 也可以通过在训练过程中有概率地将一部分模型的输出混入到输入中，训练模型在微小偏差下的兼容性。
-    */
-}
 
 #endif

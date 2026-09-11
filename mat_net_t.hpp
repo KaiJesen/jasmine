@@ -62,6 +62,12 @@ public:
         m_bias_updator.set(std::forward<upr_arg_types>(args)...);
     }
 
+    void set_lr(val_type lr)
+    {
+        m_weight_updator.set_lr(lr);
+        m_bias_updator.set_lr(lr);
+    }
+
     template <typename other_type>
     mat_t<val_type> backward(const other_type& delta)
     {
@@ -182,18 +188,19 @@ public:
     }
 };
 
-// 纵向的标准化层，即对每一列进行标准化
+// 纵向的标准化层，即对每一列（每个 token）在特征维上做 LayerNorm
 template <typename input_type, template<typename> class updator_type>
 class layer_norm_net_t
 {
 private:
     using val_type = typename input_type::ele_type;
+    static constexpr val_type eps = static_cast<val_type>(1e-5);
     mat_t<val_type> m_hx;
     mat_t<val_type> m_mean;
     mat_t<val_type> m_std;
-    mat_t<val_type> m_gama;     // 缩放参数
+    mat_t<val_type> m_gama;     // 缩放参数 [d_model, 1]
     updator_type<val_type> m_gama_updator;
-    mat_t<val_type> m_beta;     // 平移参数
+    mat_t<val_type> m_beta;     // 平移参数 [d_model, 1]
     updator_type<val_type> m_beta_updator;
 public:
     layer_norm_net_t() = default;
@@ -205,35 +212,43 @@ public:
         m_beta_updator.set(std::forward<upr_arg_types>(args)...);
     }
 
+    void set_lr(val_type lr)
+    {
+        m_gama_updator.set_lr(lr);
+        m_beta_updator.set_lr(lr);
+    }
+
     mat_t<val_type> forward(const input_type& input)
     {
+        // 对每一列在 row（特征）维上标准化
         m_mean = vmean(input);
-        mat_t<val_type> delta = (input - m_mean).clone();
-        m_std = sqrt(vsum(pow(delta, 2.0)));
-        m_hx = (delta / m_std).clone();
+        mat_t<val_type> centered = (input - m_mean).clone();
+        // var = mean(x^2), std = sqrt(var + eps)；先 clone 再 sqrt，避免表达式模板无法物化
+        mat_t<val_type> var = (vmean(pow(centered, 2.0)) + eps).clone();
+        m_std = sqrt(var);
+        m_hx = (centered / m_std).clone();
         if (m_gama.valid() == false)
         {
             m_gama = mat_t<val_type>(input.row_num(), 1);
             m_beta = mat_t<val_type>(input.row_num(), 1);
             m_gama = val_type(1);
             m_beta = val_type(0);
-            //init_matrix<he_gaussian_t>(m_gama);
-            //init_matrix<he_gaussian_t>(m_beta);
         }
         return (m_gama * m_hx + m_beta).clone();
     }
 
     template <typename other_type>
     auto backward(const other_type& delta)
-    { 
+    {
+        // gamma/beta 梯度：沿序列维（列）累加
         auto L_gama = hsum(delta * m_hx);
         auto L_beta = hsum(delta);
-        double m = static_cast<double>(delta.row_num());
-        //auto L_input = ((delta - (m_hx * vsum(m_hx * delta) + vsum(delta))/m) * m_gama / m_std).clone();
-        //auto L_input = ((delta * m_gama - vsum(delta * m_gama) / m - m_hx * vsum(m_hx * (delta * m_gama)) / m) / m_std).clone();
+
+        // 输入梯度：沿特征维（行）归约，需与 forward 的 vmean/vsum 一致
+        val_type m = static_cast<val_type>(delta.row_num());
         auto dx_norm = delta * m_gama;
-        auto sum_dx_norm = hsum(dx_norm);
-        auto sum_dx_norm_x_hx = hsum(dx_norm * m_hx);
+        auto sum_dx_norm = vsum(dx_norm);
+        auto sum_dx_norm_x_hx = vsum(dx_norm * m_hx);
         auto L_input = ((dx_norm * m - sum_dx_norm - m_hx * sum_dx_norm_x_hx) / m / m_std).clone();
 
         m_gama_updator.update(L_gama, m_gama);
@@ -251,8 +266,7 @@ public:
     template<typename init_type>
     void init_weight()
     {
-        init_matrix<init_type>(m_gama);
-        init_matrix<init_type>(m_beta);
+        // LayerNorm 仿射参数在首次 forward 时懒初始化为 gamma=1, beta=0
     }
 
     void step()
@@ -361,6 +375,17 @@ public:
     {
         m_net.step();
     }
+
+    template <typename...upr_arg_types>
+    void set_updator(upr_arg_types&&... args)
+    {
+        m_net.set_updator(std::forward<upr_arg_types>(args)...);
+    }
+
+    void set_lr(val_type lr)
+    {
+        m_net.set_lr(lr);
+    }
 };
 
 template <typename... net_types>
@@ -432,6 +457,25 @@ public:
     void set_updator(upr_arg_types&&... args)
     {
         set_updator__<0, upr_arg_types...>(std::forward<upr_arg_types>(args)...);
+    }
+
+    template <size_t N>
+    void set_lr__(val_type lr)
+    {
+        using mbr_net_type = std::tuple_element_t<N, std::tuple<net_types...>>;
+        if constexpr (requires(mbr_net_type& net, val_type v) { net.set_lr(v); })
+        {
+            std::get<N>(m_nets).set_lr(lr);
+        }
+        if constexpr (N + 1 < sizeof...(net_types))
+        {
+            set_lr__<N + 1>(lr);
+        }
+    }
+
+    void set_lr(val_type lr)
+    {
+        set_lr__<0>(lr);
     }
 
     template <typename init_type>
@@ -507,119 +551,5 @@ struct complex_net_builder_t
 
 };
 
-
-template<size_t N>
-struct test_net_t
-{
-    using val_type = int;
-    int forward(int x)
-    {
-        std::cout << "testnet " << N << " forward" << std::endl;
-        return x + 1;
-    }
-
-    int backward(int delta)
-    {
-        std::cout << "testnet " << N << " backward" << std::endl;
-        return delta - 1;
-    }
-};
-
-#include "mat_loss_t.hpp"
-
-void test_weight_net()
-{
-    #if 0
-    weight_net_t<mat_t<double>, nadam_t> net(2, 3);
-    weight_net_t<mat_t<double>, adam_t> net2(3, 3);
-    net.init_weight<xavier_gaussian_t>();
-    net.set_updator(0.1);
-    net2.init_weight<xavier_gaussian_t>();
-    net2.set_updator(0.1);
-    #endif
-    using net_type = complex_net_builder_t<double>
-        ::push_back_updatable<weight_net_t, nadam_t>
-        ::push_back_updatable<weight_net_t, adam_t>
-        ::push_back_staticnet<sigmoid_net_t>
-        ::push_back_staticnet<mse_loss_t>
-        ::type;
-    net_type net;
-    net.reinit(std::vector<int>{2, 3, 3});
-    net.init_weight<xavier_gaussian_t>();
-    net.set_updator(0.1);
-    mat_t<double> input(2, 2, {0.5, 0.8, 0.3, 0.7});
-    mat_t<double> label(3, 2, {0.2, 0.4, 0.6, 0.8, 0.1, 0.9});
-    for (int i = 0; i < 1000; ++i)
-    {
-        auto output = net.forward(input);
-        //output = net2.forward(output);
-        //auto delta = (output - label).clone();
-        //delta = net2.backward(delta);
-        net.backward(label);
-        //net2.step();
-        net.step();
-    }
-    std::cout << "final output: " << (net.forward(input)) << std::endl;
-}
-
-void test_mat_net_t()
-{ 
-    std::cout << "mat_net_t test" << std::endl;
-    auto cnet2 = complex_net_t<test_net_t<1>, test_net_t<2>, test_net_t<3>>();
-    auto out2 = cnet2.forward(0);
-    std::cout << "final out2: " << out2 << std::endl;
-    auto out3 = cnet2.backward(3);
-    std::cout << "final out3: " << out3 << std::endl;
-    using base_net_type = complex_net_builder_t<double> // 残差网络的基础网络，包含一个线性层和一个激活层
-        ::push_back_updatable<weight_net_t, nadam_t>
-        ::push_back_staticnet<sigmoid_net_t>
-        ::type;
-
-
-    using res_net_type = residual_net_t<base_net_type>;
-
-    using cpx_net_type = complex_net_builder_t<double>
-        ::push_back_impl<res_net_type>           // 增加一个残差网络，基础网络是上面定义的base_net_type
-        ::push_back_updatable<layer_norm_net_t, nadam_t>
-        ::push_back_updatable<weight_net_t, nadam_t>
-        ::push_back_staticnet<sigmoid_net_t>
-        ::push_back_updatable<weight_net_t, nadam_t>
-        ::push_back_staticnet<sigmoid_net_t>
-        ::push_back_staticnet<mse_loss_t>
-        ::type;
-    
-    cpx_net_type cnet;
-    cnet.get<0>().base_net().reinit(std::vector<int>{3, 4});        // 初始化残差网络的基础网络的维度，用于布置好内部的矩阵
-    cnet.get<0, 0>().set_updator(0.1);                  // 设置残差网络内部的线性层的权重更新器的参数
-    cnet.get<2>().set_updator(0.1);
-    //cnet.get<0>().set_updator(0.1);
-    //cnet.get<3>().set_updator(0.1);
-    cnet.reinit(std::vector<int>{4, 3, 2});
-    cnet.init_weight<xavier_gaussian_t>();
-    std::cout << cnet.net_type() << std::endl;
-    mat_t<double> input(3, 2, {0.1, 0.2, 0.3, 0.4, 0.5, 0.6});
-    mat_t<double> label(2, 2, {0.3, 0.7, 0.9, 0.1});
-    std::cout << "first output: " << cnet.forward(input) << std::endl;
-    while (true)
-    {
-        std::cout << "train times: ";
-        int train_times;
-        std::cin >> train_times;
-        if (train_times <= 0)
-        {
-            break;
-        }
-        for (int i = 0; i < train_times; i++)
-        {
-            auto output = cnet.forward(input);
-            //auto delta = output - 0.8;
-            //std::cout << " delta: " << delta << std::endl;
-            cnet.backward(label);
-            cnet.step();
-        }
-        std::cout << "\tloss: " << cnet.back().loss(label) << std::endl;
-    }
-    std::cout << "final output: " << cnet.forward(input) << "\nloss:" << cnet.back().loss(0.8) << std::endl;
-}
 
 #endif

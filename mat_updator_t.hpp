@@ -130,7 +130,9 @@ public:
              val_type beta1 = 0.9, double beta2 = 0.999, double epsilon = 1e-8)
     {
         m_beta1 = beta1;
+        m_beta1_t = 1;
         m_beta2 = beta2;
+        m_beta2_t = 1;
         m_learning_rate = learning_rate;
         m_epsilon = epsilon;
         m_t = 0;

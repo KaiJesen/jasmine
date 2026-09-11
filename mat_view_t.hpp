@@ -242,24 +242,5 @@ mat_view_t<const mat_t<val_type>> mat_t<val_type>::front_row() const noexcept
     return mat_view_t<const mat_t<val_type>>(*this, 0, 0, 1, col_num());
 }
 
-void test_mat_view_t()
-{ 
-    mat_t<double> m(3, 3, {1.1, 1.2, 1.3,
-                             2.1, 2.2, 2.3,
-                             3.1, 3.2, 3.3});
-    mat_view_t<mat_t<double>> mv(m, 1, 1, 2, 1);
-    std::cout << mv << "transposed view \n" << mv.t() << std::endl;
-}
-
-void test_mat_t()
-{
-    mat_t<double> m0(1.);
-    mat_t<int> m(2, 3, {1, 2, 3, 4, 5, 6});
-    std::cout << m.to_string() << std::endl;
-    std::cout << m.t_() << std::endl << m.t() << std::endl;
-    mat_t<int> m2(1);
-    std::cout << m2 << std::endl;
-}
-
 
 #endif

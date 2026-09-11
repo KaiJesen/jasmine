@@ -117,18 +117,5 @@ void init_matrix(mat_type& m, args_types&&... args)
     init_t<init_type>::cal(m, std::forward<args_types>(args)...);
 }
 
-void test_mat_init_t()
-{
-    mat_t<double> m(3, 4);
-    init_matrix<xavier_gaussian_t>(m);
-    std::cout << m.to_string() << std::endl;
-    init_matrix<xavier_uniform_t>(m);
-    std::cout << m.to_string() << std::endl;
-    init_matrix<he_gaussian_t>(m);
-    std::cout << m.to_string() << std::endl;
-    init_matrix<he_uniform_t>(m);
-    std::cout << m.to_string() << std::endl;
-    
-}
 
 #endif
