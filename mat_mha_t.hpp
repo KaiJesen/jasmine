@@ -3,11 +3,13 @@
 
 #include <cmath>
 #include <limits>
+#include <memory>
 
 #include "mat_t.hpp"
 #include "mat_view_t.hpp"
 #include "mat_net_t.hpp"
 #include "mat_express_t.hpp"
+#include "mat_RoPE_t.hpp"
 
 namespace jasmine {
 
@@ -28,12 +30,25 @@ private:
     softmax_type m_softmax;
     mat_t<val_type> m_q, m_k, m_v;
     bool m_mask;
+    using rope_net_type = RoPE_net_t<mat_t<val_type>>;
+    std::shared_ptr<rope_net_type> m_rope;  // 来自 rope_registry，按 d_head 共享；空则不做 RoPE
 
 public:
     mat_head_gen_t(int const& d_model = 1, bool const& mask = false, int const& seq_len = 1)
         : m_q_net(d_model, d_model), m_k_net(d_model, d_model), m_v_net(d_model, d_model),
-          m_q(d_model, seq_len), m_k(d_model, seq_len), m_v(d_model, seq_len), m_mask(mask)
+          m_q(d_model, seq_len), m_k(d_model, seq_len), m_v(d_model, seq_len), m_mask(mask),
+          m_rope(nullptr)
     {
+    }
+
+    void set_rope(std::shared_ptr<rope_net_type> rope)
+    {
+        m_rope = std::move(rope);
+    }
+
+    std::shared_ptr<rope_net_type> rope() const
+    {
+        return m_rope;
     }
 
     void set_param(int const& d_model, bool const& mask = false, int const& seq_len = 1)
@@ -45,6 +60,11 @@ public:
         m_k.reshape(d_model, seq_len);
         m_v.reshape(d_model, seq_len);
         m_mask = mask;
+        // 默认从注册中心取该头维对应的 RoPE（同 d 共享）
+        if (d_model > 0 && d_model % 2 == 0)
+            m_rope = rope_registry_t<val_type>::instance().get(d_model);
+        else
+            m_rope.reset();
     }
     
     template<typename mat_type>
@@ -54,6 +74,11 @@ public:
         m_q = m_q_net.forward(input);
         m_k = m_k_net.forward(input);
         m_v = m_v_net.forward(input);
+        if (m_rope)
+        {
+            m_q = m_rope->forward(m_q);
+            m_k = m_rope->forward(m_k);
+        }
 
         auto attn_scores = (m_q.t().dot(m_k) / std::sqrt(m_q.row_num())).clone();
         /*!ANCHOR 掩码规则说明
@@ -70,9 +95,7 @@ public:
                 }
             }
         }
-        //std::cout << "attn_scores: " << attn_scores << std::endl;
         auto attn_weights = m_softmax.forward(attn_scores);
-        //std::cout << "attn_weights: " << attn_weights << std::endl;
         auto output = m_v.dot(attn_weights.t()).clone();
 
         return output;
@@ -85,9 +108,14 @@ public:
         m_q = m_q_net.forward(decoder_input);
         m_k = m_k_net.forward(encoder_input);
         m_v = m_v_net.forward(encoder_input);
+        if (m_rope)
+        {
+            m_q = m_rope->forward(m_q);
+            m_k = m_rope->forward(m_k);
+        }
 
         auto attn_scores = (m_q.t().dot(m_k) / std::sqrt(m_q.row_num())).clone();
-        // 较差注意力不需要mask层
+        // 交叉注意力不需要mask层
         auto attn_weights = m_softmax.forward(attn_scores);
         auto output = m_v.dot(attn_weights.t()).clone();
 
@@ -113,9 +141,13 @@ public:
                 }
             }
         }
-        //std::cout << "delta_qt_k: " << delta_qt_k << std::endl;
         mat_t<val_type> delta_q = m_k.dot(delta_qt_k.t()) / static_cast<val_type>(std::sqrt(m_q.row_num()));
         mat_t<val_type> delta_k = m_q.dot(delta_qt_k) / static_cast<val_type>(std::sqrt(m_q.row_num()));
+        if (m_rope)
+        {
+            delta_q = m_rope->backward(delta_q);
+            delta_k = m_rope->backward(delta_k);
+        }
 
         return (m_q_net.backward(delta_q) + m_k_net.backward(delta_k) + m_v_net.backward(delta_v)).clone();
     }
@@ -127,6 +159,11 @@ public:
         mat_t<val_type> delta_qt_k = m_softmax.backward(delta_attn_weights);
         mat_t<val_type> delta_q = m_k.dot(delta_qt_k.t()) / static_cast<val_type>(std::sqrt(m_q.row_num()));
         mat_t<val_type> delta_k = m_q.dot(delta_qt_k) / static_cast<val_type>(std::sqrt(m_q.row_num()));
+        if (m_rope)
+        {
+            delta_q = m_rope->backward(delta_q);
+            delta_k = m_rope->backward(delta_k);
+        }
         encoder_delta += ((m_k_net.backward(delta_k) + m_v_net.backward(delta_v)));
         mat_t<val_type> delta_input = m_q_net.backward(delta_q);
         return delta_input;
@@ -252,6 +289,7 @@ public:
         {
             m_heads.emplace_back(m_d_head, mask, seq_len);
         }
+        bind_rope();
     }
 
     void set_param(int num_heads, int d_model, bool mask = false, int seq_len = 1)
@@ -269,6 +307,17 @@ public:
             m_heads[i].set_param(m_d_head, mask, seq_len);
         }
         m_output_proj.reinit(std::vector<int>{d_model, d_model});
+        bind_rope();
+    }
+
+    /** 显式绑定/刷新各头的 RoPE（同 d_head 共享注册中心条目） */
+    void bind_rope(int max_seq_len = 0)
+    {
+        std::shared_ptr<RoPE_net_t<mat_t<val_type>>> rope;
+        if (m_d_head > 0 && m_d_head % 2 == 0)
+            rope = rope_registry_t<val_type>::instance().get(m_d_head, max_seq_len);
+        for (auto& head : m_heads)
+            head.set_rope(rope);
     }
 
     mat_t<val_type> forward(const input_type& input)

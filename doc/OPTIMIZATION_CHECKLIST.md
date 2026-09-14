@@ -8,25 +8,27 @@
 
 ## P0 — 正确性（先修）
 
-- [ ] **RoPE 2×2 共用同一 θ**
+- [x] **RoPE 2×2 共用同一 θ**
   - 文件：`mat_RoPE_t.hpp`
   - 问题：同一旋转块的 cos / −sin 使用了不同的角度索引，不是正交 2×2
   - 验收：单元测试对比已知角度的旋转结果（黄金值）
 
-- [ ] **RoPE 频率与位置公式对齐常见定义（或文档化为刻意变体）**
+- [x] **RoPE 频率与位置公式对齐常见定义（或文档化为刻意变体）**
   - 目标：`θ_{i,m} = m / 10000^(2i/d)`（或等价形式），位置用 token 下标 `m` 而非 packed column `j`
   - 验收：与手算 / 参考实现在小 `d_model` 上误差 < 1e-10
 
-- [ ] **明确 RoPE 作用位置**
-  - 现状：在进 encoder/decoder 前对输入旋一次（`mat_transformer_t.hpp`）
-  - 决策：保持并写清文档，或改为仅作用在 attention 的 Q/K 上
-  - 验收：文档与实现一致；encoder 侧若可训练 embedding，反向能穿过 RoPE
+- [x] **明确 RoPE 作用位置**
+  - 现状：各层 MHA/MHCA 在 Q/K 投影后旋转（`mat_head_gen_t`）；`rope_registry_t` 按 `d_head` 共享
+  - 决策：不再在 `transformer_base_t` 入口旋转整段输入
+  - 验收：文档与实现一致；encoder 侧若可训练 embedding，反向能穿过 RoPE（经 Q/K 路径）
 
 - [ ] **RoPE / 因果注意力黄金测试**
   - 扩展：`tests/test_rope.cpp`、`tests/test_causal_attention.cpp`
   - 不只查「有限」，要查数值契约
 
 ---
+
+
 
 ## P1 — 模型结构保真
 
@@ -43,6 +45,8 @@
   - 例：`mat_mha_t.hpp` 中 encoder 梯度「记得除以层数」——当前实现是累加后一次 `backward`，不应除
 
 ---
+
+
 
 ## P2 — 推理与训练效率
 
@@ -67,11 +71,13 @@
   - 替换朴素三重循环 `mat_dot_t`
   - 验收：`BM_*` 在 `n≥256` 量级有数量级提升
 
-- [ ] **削减不必要的 `.clone()`**
+- [ ] **削减不必要的** `.clone()`
   - 层边界保留物化；纯中间表达式在生命周期安全时延迟物化
   - 验收：相同数值 + bench 分配/耗时下降
 
 ---
+
+
 
 ## P3 — 任务与损失（从玩具走向可用）
 
@@ -89,9 +95,11 @@
 
 ---
 
+
+
 ## P4 — 工程卫生
 
-- [ ] **`mat_t::operator()` 越界策略**
+- [ ] `mat_t::operator()` **越界策略**
   - 现状：`%` 绕回，易掩盖 bug
   - 建议：Debug 断言 / 可选严格模式
 
@@ -107,6 +115,8 @@
 
 ---
 
+
+
 ## 建议实施顺序
 
 ```text
@@ -116,6 +126,8 @@ RoPE 正确性 + 黄金测试
             → 大矩阵 GEMM / 有选择的 OpenMP
                 → 离散 CE 任务（若目标是 LM/seq2seq）
 ```
+
+
 
 ## 已完成（勿重复投入）
 
@@ -128,6 +140,8 @@ RoPE 正确性 + 黄金测试
 - [x] `set_lr` 不重置优化器动量（避免每步 `set_updator`）
 - [x] CMake + GoogleTest / Benchmark / examples 分离
 
+
+
 ## 快速自检命令
 
 ```bash
@@ -137,3 +151,4 @@ ctest --test-dir build --output-on-failure
 ./build/benches/bench_jasmine --benchmark_filter=BM_
 ./build/examples/train_transformer
 ```
+

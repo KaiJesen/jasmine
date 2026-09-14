@@ -2,7 +2,8 @@
 #define __MAT_TRANSFORMER_T_HPP__
 
 /* 
- * @brief: 组装transformer编解码器和RoPE的接口，提供一个统一的接口来调用编码器和解码器的前向传播和反向传播，同时提供一个接口来设置优化器的参数，进行训练。这个类的设计目的是为了简化transformer的使用，让用户可以更方便地进行训练和推理。
+ * @brief: 组装transformer编解码器接口。位置编码采用 RoPE，作用在各层 MHA/MHCA 的 Q/K 上
+ *         （经 rope_registry 按 d_head 共享），而不是在进 encoder/decoder 前旋转整段输入。
 */
 
 #include "mat_net_t.hpp"
@@ -15,7 +16,6 @@ namespace jasmine {
 /*
  * transformer的基座，可以在上面增加各种识别层，比如：softmax层用于分类，线性层用于回归，或者其他的层。这个类的设计目的是为了提供一个统一的接口来调用transformer的前向传播和反向传播，同时提供一个接口来设置优化器的参数，进行训练。
  * 这个类的设计原则是：尽量简化接口，让用户可以更方便地进行训练和推理，同时提供足够的灵活性，让用户可以根据自己的需求来定制transformer的结构和参数。
- * 这个类的设计原则是：尽量简化接口，让用户可以更方便地进行训练和推理，同时提供足够的灵活性，让用户可以根据自己的需求来定制transformer的结构和参数。
  * 前层可以套接各种类型的embedding层，甚至是词典也可以，但是要和输出反向递归的一致。
 */
 template <typename input_type, template <typename> class updator_type>
@@ -23,32 +23,38 @@ class transformer_base_t
 {
 public:
     using val_type = typename input_type::ele_type;
-    using RoPE_type = RoPE_net_t<input_type>;
     using kernel_type = transformer_kernel_t<val_type, updator_type>;
 
 private:
     kernel_type m_kernel;
-    RoPE_type m_rope;
+    int m_head_num = 1;
+    int m_d_model = 1;
 
 public:
     transformer_base_t(size_t en_layers = 1, size_t de_layers = 1, size_t head_num = 1, int d_model = 1, int d_ff = 0)
-    : m_kernel(en_layers, de_layers, head_num, d_model, d_ff ? d_ff : d_model * 4), m_rope(d_model)
+    : m_kernel(en_layers, de_layers, head_num, d_model, d_ff ? d_ff : d_model * 4),
+      m_head_num(static_cast<int>(head_num)), m_d_model(d_model)
     {
+        ensure_rope_registry();
     }
 
+    /**
+     * RoPE 作用位置：各注意力头在得到 Q/K 之后、算 score 之前旋转（见 mat_head_gen_t）。
+     * 此处不再对 encoder/decoder 输入做整段 RoPE。
+     */
     void encoder_forward(const mat_t<val_type>& input)
     {
-        m_kernel.encoder_forward(m_rope.forward(input));    // 经过RoPE处理后输入编码器，生成解码器的输入
+        m_kernel.encoder_forward(input);
     }
 
     mat_t<val_type> forward(const mat_t<val_type>& input)
     {
-        return m_kernel.forward(m_rope.forward(input));    // 经过RoPE处理后输入解码器，生成输出
+        return m_kernel.forward(input);
     }
 
     mat_t<val_type> backward(const mat_t<val_type>& delta)
     {
-        return m_rope.backward(m_kernel.backward(delta));    // 先反向传播得到解码器的输入梯度，再经过RoPE的反向传播得到编码器的输入梯度
+        return m_kernel.backward(delta);
     }
 
     template<typename...upr_param_types>
@@ -70,8 +76,26 @@ public:
 
     void set_param(size_t en_layers, size_t de_layers, size_t head_num, int d_model, int d_ff = 0)
     {
+        m_head_num = static_cast<int>(head_num);
+        m_d_model = d_model;
         m_kernel.set_param(en_layers, de_layers, head_num, d_model, d_ff ? d_ff : d_model * 4);
-        m_rope.set_param(d_model);
+        ensure_rope_registry();
+    }
+
+    /** 预热 RoPE 静态/动态缓存到给定最大序列长（按 d_head 注册） */
+    void reserve_rope(int max_seq_len)
+    {
+        const int d_head = m_d_model / m_head_num;
+        if (d_head > 0 && d_head % 2 == 0)
+            rope_registry_t<val_type>::instance().get(d_head, max_seq_len);
+    }
+
+    void set_rope_cache_mode(rope_cache_mode mode)
+    {
+        auto& reg = rope_registry_t<val_type>::instance();
+        reg.set_default_mode(mode);
+        // 已存在的条目也切模式并按需重绑
+        ensure_rope_registry();
     }
 
     void step()
@@ -82,12 +106,22 @@ public:
     std::string net_type(int const& indent = 0) const
     {
         std::stringstream ss;
-        ss << print_indent(indent) << "transformer_base_t = [\n" 
-        << m_kernel.net_type(indent + 2) << " \n" 
-        << m_rope.net_type(indent + 2)
-        << std::endl
-        << print_indent(indent) << "]";
+        const int d_head = (m_head_num > 0) ? (m_d_model / m_head_num) : 0;
+        ss << print_indent(indent) << "transformer_base_t = [\n"
+           << m_kernel.net_type(indent + 2) << "\n"
+           << print_indent(indent + 2) << "rope: Q/K via registry(d_head=" << d_head << ")\n"
+           << print_indent(indent) << "]";
         return ss.str();
+    }
+
+private:
+    void ensure_rope_registry()
+    {
+        if (m_head_num <= 0 || m_d_model % m_head_num != 0)
+            return;
+        const int d_head = m_d_model / m_head_num;
+        if (d_head > 0 && d_head % 2 == 0)
+            rope_registry_t<val_type>::instance().get(d_head);
     }
 
 };
