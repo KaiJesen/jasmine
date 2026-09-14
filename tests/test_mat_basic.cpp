@@ -20,6 +20,21 @@ TEST(MatBasic, ShapeAndTransposeView)
     EXPECT_NEAR(mv(1, 0), 3.2, 1e-12);
 }
 
+TEST(MatBasic, OffsetViewTransposeMatchesHandCalc)
+{
+    // Subview starting at (0,1): columns 1..2 of a 2x3 matrix
+    mat_t<double> m(2, 3);
+    m(0, 0) = 1; m(0, 1) = 2; m(0, 2) = 3;
+    m(1, 0) = 4; m(1, 1) = 5; m(1, 2) = 6;
+    auto v = m.view(0, 1, 2, 2); // [[2,3],[5,6]]
+    auto vt = v.t();             // [[2,5],[3,6]]
+    ExpectShape(vt, 2, 2);
+    EXPECT_NEAR(vt(0, 0), 2.0, 1e-12);
+    EXPECT_NEAR(vt(0, 1), 5.0, 1e-12);
+    EXPECT_NEAR(vt(1, 0), 3.0, 1e-12);
+    EXPECT_NEAR(vt(1, 1), 6.0, 1e-12);
+}
+
 TEST(MatBasic, ExpressionMaterializesToMat)
 {
     mat_t<double> m1{3, 3, {

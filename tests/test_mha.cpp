@@ -20,23 +20,24 @@ static double mse(const mat_t<double>& a, const mat_t<double>& b)
     return s / n;
 }
 
-TEST(Mha, HeadGenCanFitSimpleTarget)
+TEST(Mha, SingleHeadCanFitSimpleTarget)
 {
-    mat_head_gen_t<mat_view_t<mat_t<double>>, adam_t> head(4);
-    head.init_weight<xavier_gaussian_t>();
-    head.set_updator(0.01);
+    // Classic MHA with 1 head ≡ full-dim QKV attention
+    mat_mha_t<mat_t<double>, adam_t> mha(1, 4, false, 2);
+    mha.init_weight<xavier_gaussian_t>();
+    mha.set_updator(0.01);
 
     mat_t<double> input(4, 2, {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8});
     mat_t<double> expected(4, 2, {0.5, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8});
 
-    double loss0 = mse(head.forward(input.view()), expected);
+    double loss0 = mse(mha.forward(input), expected);
     for (int i = 0; i < 2000; ++i)
     {
-        auto output = head.forward(input.view());
-        head.backward((output - expected).clone().view());
-        head.step();
+        auto output = mha.forward(input);
+        mha.backward((output - expected).clone().view());
+        mha.step();
     }
-    double loss1 = mse(head.forward(input.view()), expected);
+    double loss1 = mse(mha.forward(input), expected);
     EXPECT_LT(loss1, loss0);
 }
 
@@ -70,4 +71,22 @@ TEST(Mha, MultiHeadForwardShapeAndTrain)
         mha.step();
     }
     EXPECT_LT(mse(mha.forward(input), label), loss0);
+}
+
+TEST(Mha, ClassicSplitAfterFullQkvShape)
+{
+    // num_heads>1: still d_model in/out; exercises full QKV then vsplit path
+    mat_mha_t<mat_t<float>, nadam_t> mha(2, 4, true, 3);
+    mha.init_weight<xavier_gaussian_t>();
+    mat_t<float> input(4, 3, {
+        0.1f, 0.2f, 0.3f,
+        0.4f, 0.5f, 0.6f,
+        0.7f, 0.8f, 0.9f,
+        1.0f, 1.1f, 1.2f
+    });
+    auto out = mha.forward(input);
+    ExpectShape(out, 4, 3);
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 3; ++j)
+            EXPECT_TRUE(std::isfinite(out(i, j)));
 }

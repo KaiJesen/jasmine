@@ -131,3 +131,20 @@ TEST(RoPE, MhaHeadsShareRegistryRope)
     EXPECT_EQ(rope->get_d(), 2);
     reg.clear();
 }
+
+TEST(RoPE, BackwardIsTransposeRotation)
+{
+    // d=2, seq=2: position m=1 uses φ=1, R = [[c,-s],[s,c]], backward applies R^T
+    RoPE_net_t<mat_t<double>> rope_net(2);
+    mat_t<double> delta(2, 2, 0.0);
+    delta(0, 1) = 1.0; // col1 = [1, 0]^T
+    auto grad = rope_net.backward(delta);
+    const double c = std::cos(1.0);
+    const double s = std::sin(1.0);
+    // col0 m=0: R^T = I
+    EXPECT_NEAR(grad(0, 0), 0.0, 1e-12);
+    EXPECT_NEAR(grad(1, 0), 0.0, 1e-12);
+    // col1: R^T * [1,0]^T = [c, -s]^T
+    EXPECT_NEAR(grad(0, 1), c, 1e-12);
+    EXPECT_NEAR(grad(1, 1), -s, 1e-12);
+}

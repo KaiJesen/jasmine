@@ -22,8 +22,8 @@
   - 决策：不再在 `transformer_base_t` 入口旋转整段输入
   - 验收：文档与实现一致；encoder 侧若可训练 embedding，反向能穿过 RoPE（经 Q/K 路径）
 
-- [ ] **RoPE / 因果注意力黄金测试**
-  - 扩展：`tests/test_rope.cpp`、`tests/test_causal_attention.cpp`
+- [x] **RoPE / 因果注意力黄金测试**
+  - 扩展：`tests/test_rope.cpp`（`BackwardIsTransposeRotation`）、`tests/test_causal_attention.cpp`（mask softmax 手算 + 未来 token 不泄漏）
   - 不只查「有限」，要查数值契约
 
 ---
@@ -32,17 +32,18 @@
 
 ## P1 — 模型结构保真
 
-- [ ] **MHA 改为经典「全维 QKV → 按头拆分」**
+- [x] **MHA 改为经典「全维 QKV → 按头拆分」**
   - 文件：`mat_mha_t.hpp`
-  - 现状：`vsplit` 切特征维，每头只看 `d_head` 切片
+  - 现状：`W_Q/W_K/W_V` 在 `mat_mha_t` 全维投影，再 `vsplit` 到各头 attend；头内不再自带小投影
   - 目标：`W_Q,W_K,W_V ∈ R^{d_model×d_model}`（或等价），再 reshape/split heads，最后 concat + `W_O`
-  - 验收：shape 测试 + 与单头全维注意力在 `num_heads=1` 时一致
+  - 验收：shape 测试 + 与单头全维注意力在 `num_heads=1` 时一致（`Mha.SingleHeadCanFitSimpleTarget`）
 
-- [ ] **（可选）交叉注意力同样走标准多头投影**
+- [x] **（可选）交叉注意力同样走标准多头投影**
   - 与 self-attn 同一套 head 约定，避免两套语义
 
-- [ ] **修正过时注释**
+- [x] **修正过时注释**
   - 例：`mat_mha_t.hpp` 中 encoder 梯度「记得除以层数」——当前实现是累加后一次 `backward`，不应除
+  - 已改为：K/V 全维梯度直接累加到 `encoder_delta`
 
 ---
 

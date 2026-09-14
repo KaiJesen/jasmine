@@ -31,7 +31,8 @@ public:
     {
         if (m_transposed)
         {
-            return m_mat(col + m_col_offset, row + m_row_offset);
+            // 转置后的 (row,col) 对应原视图的 (col,row)
+            return m_mat(m_row_offset + col, m_col_offset + row);
         }
         else
         {
@@ -41,10 +42,9 @@ public:
 
     inline val_type& operator()(int row, int col) noexcept
     {
-        //return m_mat(row + m_row_offset, col + m_col_offset);
         if (m_transposed)
         {
-            return m_mat(col + m_col_offset, row + m_row_offset);
+            return m_mat(m_row_offset + col, m_col_offset + row);
         }
         else
         {
