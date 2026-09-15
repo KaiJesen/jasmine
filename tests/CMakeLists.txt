@@ -11,6 +11,7 @@ add_executable(unit_tests
   test_embedding_ce.cpp
   test_transformer_kernel.cpp
   test_layer_norm.cpp
+  test_gpt2_weights.cpp
 )
 
 target_link_libraries(unit_tests

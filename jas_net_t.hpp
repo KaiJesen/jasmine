@@ -37,6 +37,13 @@ public:
         m_bias.reshape(container[1], 1);
     }
 
+    /** 权重矩阵 [out, in]；供权重加载器直接写入 */
+    mat_t<val_type>& weight() { return m_weight; }
+    mat_t<val_type> const& weight() const { return m_weight; }
+    /** 偏置 [out, 1]；供权重加载器直接写入或置零 */
+    mat_t<val_type>& bias() { return m_bias; }
+    mat_t<val_type> const& bias() const { return m_bias; }
+
     // m_input 持久化供 backward；mat rvalue 在层间移动，表达式只物化一次
     template<typename Src>
     mat_t<val_type> forward(Src&& input)
@@ -204,8 +211,10 @@ public:
 template <typename input_type, template<typename> class updator_type>
 class layer_norm_net_t
 {
-private:
+public:
+    // 公开：complex_net_t 从首个成员取 val_type 推断整链类型（LN 可能位于链首，如 pre-norm 分支）
     using val_type = typename input_type::ele_type;
+private:
     static constexpr val_type eps = static_cast<val_type>(1e-5);
     mat_t<val_type> m_hx;
     mat_t<val_type> m_mean;
@@ -216,6 +225,30 @@ private:
     updator_type<val_type> m_beta_updator;
 public:
     layer_norm_net_t() = default;
+
+    /**
+     * 显式分配 gamma/beta 并置为恒等变换（gamma=1, beta=0）。
+     *
+     * 默认走懒初始化：首次 forward 依据输入行数分配。权重加载器需要在 forward 之前写入
+     * gamma/beta，因此必须先调用本函数完成分配，否则访问到的是未分配的无效矩阵。
+     *
+     * 刻意不叫 reinit：is_reinitable_net 靠 `requires { net.reinit(std::vector<int>()); }`
+     * 判定（见 jas_mat_concepts.hpp），加 reinit 会改变所有含 LayerNorm 的复杂网络的 reinit 语义。
+     */
+    void set_param(int const& d_model)
+    {
+        m_gama.reshape(d_model, 1);
+        m_beta.reshape(d_model, 1);
+        m_gama = val_type(1);
+        m_beta = val_type(0);
+    }
+
+    /** 缩放参数 gamma [d_model, 1]；供加载器写入 */
+    mat_t<val_type>& gama() { return m_gama; }
+    mat_t<val_type> const& gama() const { return m_gama; }
+    /** 平移参数 beta [d_model, 1]；供加载器写入 */
+    mat_t<val_type>& beta() { return m_beta; }
+    mat_t<val_type> const& beta() const { return m_beta; }
 
     template <typename...upr_arg_types>
     void set_updator(upr_arg_types&&... args)

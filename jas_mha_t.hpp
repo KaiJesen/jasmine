@@ -334,6 +334,7 @@ private:
     int m_d_model;
     int m_d_head;
     bool m_mask = false;
+    bool m_use_rope = true;   // false = 绝对位置模型（GPT-2），Q/K 不做 RoPE
 
     // 前向缓存，供 backward 切分梯度
     mat_t<val_type> m_q_full, m_k_full, m_v_full;
@@ -487,11 +488,35 @@ public:
     void bind_rope(int max_seq_len = 0)
     {
         std::shared_ptr<RoPE_net_t<mat_t<val_type>>> rope;
-        if (m_d_head > 0 && m_d_head % 2 == 0)
+        if (m_use_rope && m_d_head > 0 && m_d_head % 2 == 0)
             rope = rope_registry_t<val_type>::instance().get(m_d_head, max_seq_len);
         for (auto& head : m_heads)
             head.set_rope(rope);
     }
+
+    /**
+     * 开关 RoPE。默认 true（jasmine 原有行为）。
+     * 绝对位置模型（如 GPT-2，用 wpe 位置嵌入）必须置 false，否则 Q/K 会被额外旋转，
+     * 与参考实现的 logits 对不上。
+     */
+    void set_use_rope(bool use)
+    {
+        m_use_rope = use;
+        bind_rope();
+    }
+
+    /** W_Q 投影 [d_model, d_model]；供权重加载器写入 */
+    proj_type& q_proj() { return m_q_net; }
+    proj_type const& q_proj() const { return m_q_net; }
+    /** W_K 投影 [d_model, d_model] */
+    proj_type& k_proj() { return m_k_net; }
+    proj_type const& k_proj() const { return m_k_net; }
+    /** W_V 投影 [d_model, d_model] */
+    proj_type& v_proj() { return m_v_net; }
+    proj_type const& v_proj() const { return m_v_net; }
+    /** W_O 输出投影 [d_model, d_model] */
+    proj_type& out_proj() { return m_output_proj; }
+    proj_type const& out_proj() const { return m_output_proj; }
 
     mat_t<val_type> forward(const input_type& input)
     {

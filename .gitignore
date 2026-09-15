@@ -9,6 +9,12 @@ unit_tests
 bench_jasmine
 train_transformer
 train_transformer_ce
+gpt2_generate
+gpt2_chat
+
+# Exported model weights (see tools/export_gpt2.py)
+*_weights.bin
+*_weights.bin.json
 
 # Profiles / IDE
 prof.data
@@ -20,3 +26,4 @@ prof.data
 *~
 *.swp
 .DS_Store
+__pycache__/
