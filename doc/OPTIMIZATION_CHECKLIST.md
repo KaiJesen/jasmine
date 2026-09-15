@@ -4,6 +4,8 @@
 
 状态约定：`[ ]` 未做 · `[~]` 进行中 · `[x]` 完成
 
+复现小规模 decoder-only LM（词表 / Pre-norm / 权重加载等）见 [`SMALL_MODEL_REPRO_CHECKLIST.md`](SMALL_MODEL_REPRO_CHECKLIST.md)。
+
 ---
 
 ## P0 — 正确性（先修）

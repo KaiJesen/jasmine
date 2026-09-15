@@ -245,6 +245,215 @@ public:
 
 };
 
+/**!SECTION
+ * Decoder-only（GPT 式）由多层组成；每层拓扑与 encoder_layer_t 相同（复用该类型），
+ * 但 self-attn 使用因果 mask；无 Encoder、无 cross-attn。输入输出均为矩阵且维度相同。
+ * 推理可用 forward_one + KV cache；训练为整段 forward → next-token loss → backward → step。
+ * 0. res_mha_norm_t: 包含一个残差多头注意力层和一个add&norm层，输入输出维度相同
+ * {
+ *      0. res_mha_t: 包含一个残差多头注意力层，输入输出维度相同
+ *      {
+ *          0. mha_t: 因果多头自注意力（mask=true），输入输出维度相同
+ *      }
+ *      1. layer_norm_net_t: 包含一个层归一化层，输入输出维度相同
+ * }
+ * 1. res_ffn_norm_t: 包含一个残差ffn层和一个add&norm层，输入输出维度相同
+ * {
+ *      0. res_ffn_t: 包含一个残差ffn层，输入输出维度相同
+ *      {
+ *           0. weight_net_t: 包含一个线性层，输入d_model，输出d_ff
+ *           1. relu_net_t: 包含一个ReLU激活层，输入输出维度相同
+ *           2. weight_net_t: 包含一个线性层，输入d_ff，输出d_model
+ *      }
+ *      1. layer_norm_net_t: 包含一个层归一化层，输入输出维度相同
+ * }
+ */
+template<typename val_type_, template<typename> class updator_type>
+class decoder_only_t
+{
+public:
+    using val_type = val_type_;
+    using layer_type = encoder_layer_t<val_type, updator_type>;
+private:
+    std::vector<layer_type> m_layers;
+public:
+    decoder_only_t(int const& n_layers = 1, int const& head_num = 1, int const& d_model = 1, int d_ff = 0, int const& seq_len = 1)
+    {
+        if (d_ff == 0) d_ff = d_model * 4;
+        m_layers.resize(n_layers);
+        for (int i = 0; i < n_layers; ++i)
+        {
+            get_mha(i).set_param(head_num, d_model, true, seq_len);
+            get_ffn_front(i).reinit(std::vector<int>{d_model, d_ff});
+            get_ffn_back(i).reinit(std::vector<int>{d_ff, d_model});
+        }
+    }
+
+    void set_param(int const& n_layers, int const& head_num, int const& d_model, int const& d_ff, int const& seq_len = 1)
+    {
+        m_layers.resize(n_layers);
+        for (size_t i = 0; i < size(); ++i)
+        {
+            get_mha(i).set_param(head_num, d_model, true, seq_len);
+            get_ffn_front(i).reinit(std::vector<int>{d_model, d_ff});
+            get_ffn_back(i).reinit(std::vector<int>{d_ff, d_model});
+        }
+    }
+
+    mat_t<val_type> forward(mat_t<val_type> input)
+    {
+        for (auto& layer : m_layers)
+            input = layer.forward(input);
+        return input;
+    }
+
+    /** 推理单列/增量：各层 self-attn 写 KV cache。调用前 clear_kv_cache()。 */
+    mat_t<val_type> forward_one(const mat_t<val_type>& input)
+    {
+        mat_t<val_type> output = input;
+        for (auto& layer : m_layers)
+            output = layer.forward_one(output);
+        return output;
+    }
+
+    void clear_kv_cache()
+    {
+        for (size_t i = 0; i < size(); ++i)
+            get_mha(i).clear_kv_cache();
+    }
+
+    void reserve_kv_cache(int max_seq)
+    {
+        for (size_t i = 0; i < size(); ++i)
+            get_mha(i).reserve_kv_cache(max_seq);
+    }
+
+    void set_kv_cache_mode(kv_cache_mode mode)
+    {
+        for (size_t i = 0; i < size(); ++i)
+            get_mha(i).set_kv_cache_mode(mode);
+    }
+
+    mat_t<val_type> backward(mat_t<val_type> delta)
+    {
+        for (int i = static_cast<int>(m_layers.size()) - 1; i >= 0; --i)
+            delta = m_layers[i].backward(delta);
+        return delta;
+    }
+
+    auto& get_mha(int const& i)
+    {
+        return m_layers[i].template get<0, 0>().base_net();
+    }
+
+    auto& get_mha_norm(int const& i)
+    {
+        return m_layers[i].template get<0, 1>();
+    }
+
+    auto& get_ffn_front(int const& i)
+    {
+        return m_layers[i].template get<1, 0, 0>();
+    }
+
+    auto& get_ffn_back(int const& i)
+    {
+        return m_layers[i].template get<1, 0, 2>();
+    }
+
+    auto& get_ffn_norm(int const& i)
+    {
+        return m_layers[i].template get<1, 1>();
+    }
+
+    auto& get_mha(int const& i) const
+    {
+        return m_layers[i].template get<0, 0>().base_net();
+    }
+
+    auto& get_mha_norm(int const& i) const
+    {
+        return m_layers[i].template get<0, 1>().base_net();
+    }
+
+    auto& get_ffn_front(int const& i) const
+    {
+        return m_layers[i].template get<1, 0, 0>();
+    }
+
+    auto& get_ffn_back(int const& i) const
+    {
+        return m_layers[i].template get<1, 0, 2>();
+    }
+
+    auto& get_ffn_norm(int const& i) const
+    {
+        return m_layers[i].template get<1, 1>().base_net();
+    }
+
+    size_t size() const
+    {
+        return m_layers.size();
+    }
+
+    template<typename init_type>
+    void init_weight()
+    {
+        for (size_t i = 0; i < size(); ++i)
+        {
+            get_mha(i).template init_weight<init_type>();
+            get_mha_norm(i).template init_weight<init_type>();
+            get_ffn_front(i).template init_weight<init_type>();
+            get_ffn_back(i).template init_weight<init_type>();
+            get_ffn_norm(i).template init_weight<init_type>();
+        }
+    }
+
+    std::string net_type(int const& indent = 0) const
+    {
+        std::stringstream ss;
+        ss << print_indent(indent) << "decoder_only = [";
+        for (size_t i = 0; i < size(); ++i)
+        {
+            ss << "\n" << print_indent(indent + 2) << "Layer " << i << " mha(causal): " << get_mha(i).net_type() << "-->";
+            ss << "ffn: " << get_ffn_front(i).net_type() << "-->" << get_ffn_back(i).net_type();
+        }
+        ss << std::endl << print_indent(indent) << "]";
+        return ss.str();
+    }
+
+    template<typename... upr_arg_types>
+    void set_updator(upr_arg_types&&... args)
+    {
+        for (size_t i = 0; i < size(); ++i)
+        {
+            get_mha(i).template set_updator(std::forward<upr_arg_types>(args)...);
+            get_mha_norm(i).template set_updator(std::forward<upr_arg_types>(args)...);
+            get_ffn_front(i).template set_updator(std::forward<upr_arg_types>(args)...);
+            get_ffn_back(i).template set_updator(std::forward<upr_arg_types>(args)...);
+            get_ffn_norm(i).template set_updator(std::forward<upr_arg_types>(args)...);
+        }
+    }
+
+    void set_lr(val_type lr)
+    {
+        for (size_t i = 0; i < size(); ++i)
+        {
+            get_mha(i).set_lr(lr);
+            get_mha_norm(i).set_lr(lr);
+            get_ffn_front(i).set_lr(lr);
+            get_ffn_back(i).set_lr(lr);
+            get_ffn_norm(i).set_lr(lr);
+        }
+    }
+
+    void step()
+    {
+        for (size_t i = 0; i < size(); ++i)
+            m_layers[i].step();
+    }
+};
+
 /*!SECTION
  * 解码器是由多层解码层组成，每层解码层都包含1个残差多头注意力层，1个add&norm层，1个残差交叉多头注意力层，1个add&norm层，1个残差ffn层，1个add&norm层。解码器的输入是一个矩阵，输出也是一个矩阵，输入输出维度相同。
  * 0. res_mha_norm_t: 包含一个残差多头注意力层和一个add&norm层，输入输出维度相同
