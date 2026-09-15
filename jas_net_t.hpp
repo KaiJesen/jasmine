@@ -646,6 +646,10 @@ private:
     }
 };
 
+/** 输出投影：d_model → vocab logits（weight_net 语义别名） */
+template <typename input_type, template <typename> class updator_type>
+using output_proj_net_t = weight_net_t<input_type, updator_type>;
+
 /*
  * 复杂网络构造器存在意义说明：如果直接构建复杂网络需要一次性输入各层的网络实例，不够灵活，且不够清晰。复杂网络构造器则提供了一套接口，可以逐步构建复杂网络的结构，并且在构建过程中可以清晰地看到每一步的网络结构变化，同时也可以在构建过程中设置每一层的参数，最后一步才生成复杂网络实例。
  * 并且可以不用为每层网络设置val_type参数，复杂网络构造器会自动推断出每层网络的val_type参数，避免了重复输入参数的麻烦。

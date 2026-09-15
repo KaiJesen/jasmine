@@ -1,13 +1,13 @@
 #include <iostream>
-#include "jas_transformer_test.hpp"
-
+#include "examples/transformer_mse_demo.hpp"
 
 using namespace jasmine;
+
 int main()
 {
-    test_transformer_t net;
+    mse_transformer_demo_t net;
     net.init(1e-5);
-    int input_dim = test_transformer_t::input_dim;
+    int input_dim = mse_transformer_demo_t::input_dim;
 
     mat_t<test_val_type> en_input(input_dim, 3, {
         0.5, 0.8, 0.3,
@@ -41,6 +41,7 @@ int main()
     });
 
     int train_times = 100000;
+    std::cout << "MSE demo (continuous + SOS/EOS flags)\n";
     std::cout << "Input train times: ";
     std::cin >> train_times;
 

@@ -8,6 +8,7 @@ add_executable(unit_tests
   test_mha.cpp
   test_kv_cache.cpp
   test_net.cpp
+  test_embedding_ce.cpp
   test_transformer_kernel.cpp
   test_layer_norm.cpp
 )

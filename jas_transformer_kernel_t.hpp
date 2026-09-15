@@ -282,6 +282,7 @@ public:
 private:
     mat_t<val_type> m_encoder_output;   // 用于保存编码器的输出，以便交叉注意力机制使用
     mat_t<val_type> m_encoder_delta;    // 用于保存编码器的梯度，以便交叉注意力机制使用
+    mat_t<val_type> m_encoder_input_delta; // encoder.backward 对输入的梯度（供 embedding 等）
     encoder_t<val_type, updator_type>* m_encoder;   
     std::vector<decoder_layer_t<val_type, updator_type>> m_layers;
 public:
@@ -372,7 +373,7 @@ public:
         }
         if (m_encoder)
         {
-            m_encoder->backward(m_encoder_delta);
+            m_encoder_input_delta = m_encoder->backward(m_encoder_delta);
         }
         return grad;
     }
@@ -380,6 +381,11 @@ public:
     mat_t<val_type> get_encoder_delta() const
     {
         return m_encoder_delta;
+    }
+
+    mat_t<val_type> const& get_encoder_input_delta() const
+    {
+        return m_encoder_input_delta;
     }
 
     void set_encoder(encoder_t<val_type, updator_type>& encoder)
@@ -600,6 +606,12 @@ public:
     mat_t<val_type> backward(const mat_t<val_type>& delta)
     {
         return m_decoder.backward(delta);
+    }
+
+    /** decoder.backward 后：编码器输入（embedding 输出）上的梯度 */
+    mat_t<val_type> const& encoder_input_delta() const
+    {
+        return m_decoder.get_encoder_input_delta();
     }
 
     #if 0 

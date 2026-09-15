@@ -52,7 +52,7 @@
 ## P2 — 推理与训练效率
 
 - [x] **Decoder self-attn KV cache**
-  - 场景：`predict` 逐步生成（`jas_transformer_test.hpp`）
+  - 场景：`predict` 逐步生成（`examples/transformer_mse_demo.hpp` / CE 见 `transformer_ce_demo.hpp`）
   - 实现：`jas_kv_cache_t.hpp` + `mat_mha_t::forward_one` / `decoder_t::forward_one`；cache 存 RoPE 后的 K/V
   - 验收：`tests/test_kv_cache.cpp` 逐步输出与无 cache 全量 forward 一致；`predict` 走 `complex_net_t::infer`（`skip_on_infer` 层被跳过）
 
@@ -89,14 +89,20 @@
 
 ## P3 — 任务与损失（从玩具走向可用）
 
-- [ ] **离散 token + embedding + 输出投影**
-  - 替代「连续向量 + 特征维 SOS/EOS」
+- [x] **离散 token + embedding + 输出投影**
+  - `jas_embedding_t.hpp`：`embedding_net_t` 查表 `E ∈ R^{d_model×V}`，输入 `1×T` id → `d_model×T`
+  - 输出投影：`output_proj_net_t` = `weight_net_t`（`d_model → V` logits）
+  - 验收：`tests/test_embedding_ce.cpp`（gather / scatter / pipeline）
 
-- [ ] **Cross-entropy / NLL loss**
-  - 新增 `ce_loss_t`（或等价）；保留 `mse_loss_t` 作回归 demo
+- [x] **Cross-entropy / NLL loss**
+  - `ce_loss_t`：fused 稳定 softmax + NLL；`forward` 透传 logits；`skip_on_infer`
+  - `backward(target_ids)` → `(softmax(z) - onehot) / N`；保留 `mse_loss_t`
+  - 验收：`CeLoss.SoftmaxGradMatchesOneHot`；`TokenPipeline.*`
 
-- [ ] **掩码：padding / 未来位置与 loss 对齐**
-  - loss 不计入 pad；EOS 用类别而非连续维阈值
+- [x] **掩码：padding / 未来位置与 loss 对齐**
+  - `set_ignore_index(pad_id)`：pad 不计入 loss/梯度；EOS 为普通类别 id
+  - `set_position_mask(1×T)`：可屏蔽未来位等；与 ignore_index 同时生效
+  - 验收：`CeLoss.IgnoreIndexSkipsPad` / `CeLoss.PositionMaskSkipsFuture`
 
 - [ ] **（可选）dropout / 权重衰减等训练配方**
   - 非必须；有真实数据过拟合时再加
@@ -160,5 +166,6 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ./build/benches/bench_jasmine --benchmark_filter=BM_
 ./build/examples/train_transformer
+./build/examples/train_transformer_ce
 ```
 

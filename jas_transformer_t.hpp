@@ -81,6 +81,12 @@ public:
         return m_kernel.backward(delta);
     }
 
+    /** 供外层 embedding：encoder 输入上的梯度（需先完成 decoder backward） */
+    mat_t<val_type> const& encoder_input_delta() const
+    {
+        return m_kernel.encoder_input_delta();
+    }
+
     template<typename...upr_param_types>
     void set_updator(upr_param_types&&... params)
     {

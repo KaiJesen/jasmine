@@ -8,6 +8,7 @@ matrix_test
 unit_tests
 bench_jasmine
 train_transformer
+train_transformer_ce
 
 # Profiles / IDE
 prof.data

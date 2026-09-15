@@ -1,5 +1,5 @@
-#ifndef __JAS_TRANSFORMER_TEST_HPP__
-#define __JAS_TRANSFORMER_TEST_HPP__
+#ifndef __JAS_TRANSFORMER_MSE_DEMO_HPP__
+#define __JAS_TRANSFORMER_MSE_DEMO_HPP__
 
 #include "jas_mat_t.hpp"
 #include "jas_mat_view_t.hpp"
@@ -11,12 +11,9 @@
 namespace jasmine {
 
 /*!SECTION
- * 测试场景：
- * 1. 定义一个给输入数据增加SOS和EOS标签的工具类，即在输入数据的末尾增加2个标志位，分别表示SOS和EOS标签；
- * 2. 构造编码器和解码器的测试数据，并且定义transformer结构，设置参数；
- * 3. 将测试数据通过标签增加工具增加标签作为训练的数据对transformer进行训练；
- * 4. 编码器输入测试数据，解码器输入SOS标签，观察输出结果是否正确。
-*/
+ * MSE 回归 demo harness（连续向量 + 特征维 SOS/EOS）。
+ * 与 examples/transformer_ce_demo.hpp（离散 token + embedding + CE）并列。
+ */
 using test_val_type = double;
 
 mat_t<test_val_type> sos(int const& input_row_num)
@@ -92,7 +89,7 @@ inline void print_tui_display(int current, int total, double lr, double loss)
     std::cout.flush();
 }
 
-class test_transformer_t
+class mse_transformer_demo_t
 {
 
 template<typename test_val_type>

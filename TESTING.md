@@ -1,6 +1,6 @@
 # Testing & Benchmarking
 
-Library headers contain **only** library code. Checks live under:
+Library headers contain **only** library code. Checks and demos live under:
 
 | Dir | Tool | Purpose |
 |-----|------|---------|
@@ -20,9 +20,13 @@ cmake --build build -j
 ```bash
 ctest --test-dir build --output-on-failure
 ./build/benches/bench_jasmine --benchmark_filter=BM_MhaForward
-./build/examples/train_transformer
+./build/examples/train_transformer      # MSE：连续向量 + 特征维 SOS/EOS
+./build/examples/train_transformer_ce   # CE：离散 token + embedding + CE
 ./build/examples/train_tf_base
 ./build/examples/train_tf_kernel
 ```
 
-`jas_transformer_test.hpp` keeps the training harness helpers (`test_transformer_t`, SOS/EOS utilities), not executable `test_*` entrypoints.
+Demo harnesses（非 GoogleTest）：
+
+- `examples/transformer_mse_demo.hpp` — `mse_transformer_demo_t`
+- `examples/transformer_ce_demo.hpp` — `ce_transformer_demo_t`
