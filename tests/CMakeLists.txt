@@ -3,6 +3,7 @@ add_executable(unit_tests
   test_causal_attention.cpp
   test_mat_basic.cpp
   test_mat_init.cpp
+  test_gemm.cpp
   test_rope.cpp
   test_mha.cpp
   test_kv_cache.cpp

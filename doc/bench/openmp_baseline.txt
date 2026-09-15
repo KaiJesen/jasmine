@@ -1,0 +1,33 @@
+2026-09-15T16:31:07+08:00
+Running /data/01_github/jasmine/build/benches/bench_jasmine
+Run on (20 X 5100 MHz CPU s)
+CPU Caches:
+  L1 Data 48 KiB (x10)
+  L1 Instruction 32 KiB (x10)
+  L2 Unified 2048 KiB (x10)
+  L3 Unified 24576 KiB (x1)
+Load Average: 0.83, 0.68, 0.64
+***WARNING*** CPU scaling is enabled, the benchmark real time measurements may be noisy and will incur extra overhead.
+---------------------------------------------------------------------------------------
+Benchmark                             Time             CPU   Iterations UserCounters...
+---------------------------------------------------------------------------------------
+BM_MatDot/256_mean              4389989 ns      4389667 ns            3 items_per_second=3.822G/s
+BM_MatDot/256_median            4387242 ns      4387078 ns            3 items_per_second=3.82423G/s
+BM_MatDot/256_stddev              12173 ns        11963 ns            3 items_per_second=10.4068M/s
+BM_MatDot/256_cv                   0.28 %          0.27 %             3 items_per_second=0.27%
+BM_MatDot/512_mean             33917266 ns     33916597 ns            3 items_per_second=3.95729G/s
+BM_MatDot/512_median           33923863 ns     33922415 ns            3 items_per_second=3.95661G/s
+BM_MatDot/512_stddev              12116 ns        11753 ns            3 items_per_second=1.37152M/s
+BM_MatDot/512_cv                   0.04 %          0.03 %             3 items_per_second=0.03%
+BM_MhaForward/2/32/8_mean        114409 ns       114408 ns            3
+BM_MhaForward/2/32/8_median      114402 ns       114401 ns            3
+BM_MhaForward/2/32/8_stddev        19.3 ns         17.6 ns            3
+BM_MhaForward/2/32/8_cv            0.02 %          0.02 %             3
+BM_MhaForward/4/64/16_mean       783871 ns       783830 ns            3
+BM_MhaForward/4/64/16_median     784068 ns       784008 ns            3
+BM_MhaForward/4/64/16_stddev        385 ns          359 ns            3
+BM_MhaForward/4/64/16_cv           0.05 %          0.05 %             3
+BM_MhaForward/4/64/32_mean      1743838 ns      1743755 ns            3
+BM_MhaForward/4/64/32_median    1743857 ns      1743809 ns            3
+BM_MhaForward/4/64/32_stddev        383 ns          343 ns            3
+BM_MhaForward/4/64/32_cv           0.02 %          0.02 %             3

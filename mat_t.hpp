@@ -256,7 +256,22 @@ public:
     bool is_scalar() const noexcept
     {
         return m_scalar;
-    }   
+    }
+
+    bool row_first() const noexcept
+    {
+        return m_row_first;
+    }
+
+    val_type* data() noexcept
+    {
+        return m_data;
+    }
+
+    const val_type* data() const noexcept
+    {
+        return m_data;
+    }
 
     int row_num() const noexcept
     {

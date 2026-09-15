@@ -1,0 +1,29 @@
+2026-09-15T16:23:30+08:00
+Running /data/01_github/jasmine/build/benches/bench_jasmine
+Run on (20 X 5100 MHz CPU s)
+CPU Caches:
+  L1 Data 48 KiB (x10)
+  L1 Instruction 32 KiB (x10)
+  L2 Unified 2048 KiB (x10)
+  L3 Unified 24576 KiB (x1)
+Load Average: 1.19, 0.80, 0.62
+***WARNING*** CPU scaling is enabled, the benchmark real time measurements may be noisy and will incur extra overhead.
+---------------------------------------------------------------------------------------
+Benchmark                             Time             CPU   Iterations UserCounters...
+---------------------------------------------------------------------------------------
+BM_MatDot/256_mean              4378338 ns      4378016 ns            3 items_per_second=3.83215G/s
+BM_MatDot/256_median            4377358 ns      4377021 ns            3 items_per_second=3.83302G/s
+BM_MatDot/256_stddev               3049 ns         3119 ns            3 items_per_second=2.72948M/s
+BM_MatDot/256_cv                   0.07 %          0.07 %             3 items_per_second=0.07%
+BM_MatDot/512_mean             33870544 ns     33866998 ns            3 items_per_second=3.96308G/s
+BM_MatDot/512_median           33866695 ns     33863719 ns            3 items_per_second=3.96347G/s
+BM_MatDot/512_stddev              11824 ns        11237 ns            3 items_per_second=1.31477M/s
+BM_MatDot/512_cv                   0.03 %          0.03 %             3 items_per_second=0.03%
+BM_MhaForward/2/32/8_mean        114366 ns       114347 ns            3
+BM_MhaForward/2/32/8_median      114347 ns       114336 ns            3
+BM_MhaForward/2/32/8_stddev        34.8 ns         22.0 ns            3
+BM_MhaForward/2/32/8_cv            0.03 %          0.02 %             3
+BM_MhaForward/4/64/16_mean       783505 ns       783402 ns            3
+BM_MhaForward/4/64/16_median     783160 ns       783138 ns            3
+BM_MhaForward/4/64/16_stddev        731 ns          628 ns            3
+BM_MhaForward/4/64/16_cv           0.09 %          0.08 %             3

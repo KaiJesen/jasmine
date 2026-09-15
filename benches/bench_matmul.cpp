@@ -25,7 +25,7 @@ static void BM_MatDot(benchmark::State& state)
     }
     state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(n) * n * n);
 }
-BENCHMARK(BM_MatDot)->Arg(32)->Arg(64);
+BENCHMARK(BM_MatDot)->Arg(32)->Arg(64)->Arg(128)->Arg(256)->Arg(512);
 
 static void BM_MatElementwise(benchmark::State& state)
 {

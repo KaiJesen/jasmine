@@ -10,6 +10,7 @@
 
 #include "mat_concepts.hpp"
 #include "mat_view_t.hpp"
+#include "mat_gemm.hpp"
 
 namespace jasmine {
 
@@ -768,6 +769,8 @@ public:
     mat_t<ele_type> clone() const
     {
         mat_t<ele_type> m(row_num(), col_num());
+        if (detail::try_fast_gemm(m_lval, m_rval, m))
+            return m;
         for (int i = 0; i < row_num(); ++i)
         {
             for (int j = 0; j < col_num(); ++j)

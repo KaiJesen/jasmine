@@ -1,0 +1,34 @@
+2026-09-15T16:02:25+08:00
+Running /data/01_github/jasmine/build/benches/bench_jasmine
+Run on (20 X 5100 MHz CPU s)
+CPU Caches:
+  L1 Data 48 KiB (x10)
+  L1 Instruction 32 KiB (x10)
+  L2 Unified 2048 KiB (x10)
+  L3 Unified 24576 KiB (x1)
+Load Average: 1.11, 0.64, 0.60
+***WARNING*** CPU scaling is enabled, the benchmark real time measurements may be noisy and will incur extra overhead.
+***WARNING*** Library was built as DEBUG. Timings may be affected.
+-------------------------------------------------------------------------------
+Benchmark                     Time             CPU   Iterations UserCounters...
+-------------------------------------------------------------------------------
+BM_MatDot/32_mean        283892 ns       283895 ns            3 items_per_second=115.424M/s
+BM_MatDot/32_median      283905 ns       283907 ns            3 items_per_second=115.418M/s
+BM_MatDot/32_stddev         855 ns          855 ns            3 items_per_second=347.788k/s
+BM_MatDot/32_cv            0.30 %          0.30 %             3 items_per_second=0.30%
+BM_MatDot/64_mean       2243203 ns      2243206 ns            3 items_per_second=116.862M/s
+BM_MatDot/64_median     2246158 ns      2246184 ns            3 items_per_second=116.706M/s
+BM_MatDot/64_stddev        5571 ns         5602 ns            3 items_per_second=292.238k/s
+BM_MatDot/64_cv            0.25 %          0.25 %             3 items_per_second=0.25%
+BM_MatDot/128_mean     17631696 ns     17631734 ns            3 items_per_second=118.942M/s
+BM_MatDot/128_median   17624703 ns     17624912 ns            3 items_per_second=118.988M/s
+BM_MatDot/128_stddev      45071 ns        45170 ns            3 items_per_second=304.541k/s
+BM_MatDot/128_cv           0.26 %          0.26 %             3 items_per_second=0.26%
+BM_MatDot/256_mean    140351971 ns    140352605 ns            3 items_per_second=119.539M/s
+BM_MatDot/256_median  140668358 ns    140668237 ns            3 items_per_second=119.268M/s
+BM_MatDot/256_stddev     765864 ns       764975 ns            3 items_per_second=653.361k/s
+BM_MatDot/256_cv           0.55 %          0.55 %             3 items_per_second=0.55%
+BM_MatDot/512_mean   1102206225 ns   1101161564 ns            3 items_per_second=121.89M/s
+BM_MatDot/512_median 1103744902 ns   1103601715 ns            3 items_per_second=121.618M/s
+BM_MatDot/512_stddev    7336236 ns      6096994 ns            3 items_per_second=676.781k/s
+BM_MatDot/512_cv           0.67 %          0.55 %             3 items_per_second=0.56%

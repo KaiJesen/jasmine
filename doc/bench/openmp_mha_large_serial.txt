@@ -1,0 +1,21 @@
+2026-09-15T16:34:01+08:00
+Running /data/01_github/jasmine/build/benches/bench_jasmine
+Run on (20 X 5100 MHz CPU s)
+CPU Caches:
+  L1 Data 48 KiB (x10)
+  L1 Instruction 32 KiB (x10)
+  L2 Unified 2048 KiB (x10)
+  L3 Unified 24576 KiB (x1)
+Load Average: 1.61, 0.97, 0.74
+***WARNING*** CPU scaling is enabled, the benchmark real time measurements may be noisy and will incur extra overhead.
+------------------------------------------------------------------------
+Benchmark                              Time             CPU   Iterations
+------------------------------------------------------------------------
+BM_MhaForward/8/128/64_mean     13372496 ns     13371950 ns            3
+BM_MhaForward/8/128/64_median   13373535 ns     13372800 ns            3
+BM_MhaForward/8/128/64_stddev       8290 ns         8095 ns            3
+BM_MhaForward/8/128/64_cv           0.06 %          0.06 %             3
+BM_MhaForward/8/256/64_mean     45896709 ns     45894638 ns            3
+BM_MhaForward/8/256/64_median   45893422 ns     45892679 ns            3
+BM_MhaForward/8/256/64_stddev      14306 ns        13070 ns            3
+BM_MhaForward/8/256/64_cv           0.03 %          0.03 %             3

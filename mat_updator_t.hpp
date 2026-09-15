@@ -162,7 +162,9 @@ public:
         mat_t<val_type> m_hat = m_m / (1 - m_beta1_t);
         mat_t<val_type> v_hat = m_v / (1 - m_beta2_t);
 
-        auto mtv_n = (m_learning_rate * (m_beta1 * m_hat / (1 - m_beta1_t * m_beta1) + (1 - m_beta1) / (1 - m_beta1_t) * grad)).clone();
+        mat_t<val_type> mtv_n = m_learning_rate *
+            (m_beta1 * m_hat / (1 - m_beta1_t * m_beta1) +
+             (1 - m_beta1) / (1 - m_beta1_t) * grad);
         mat = mat - mtv_n / (sqrt(v_hat) + m_epsilon);
     }
 

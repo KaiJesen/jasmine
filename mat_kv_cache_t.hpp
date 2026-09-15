@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <stdexcept>
 
+#include "mat_concepts.hpp"
 #include "mat_t.hpp"
 #include "mat_view_t.hpp"
 
@@ -98,7 +99,9 @@ public:
     /**
      * 追加一段 K/V（d × n_new）。调用方保证已做 RoPE（K）且 d 与 cache 一致。
      */
-    void append(const mat_t<val_type>& k, const mat_t<val_type>& v)
+    template<typename K, typename V>
+    requires is_matrix<K> && is_matrix<V>
+    void append(const K& k, const V& v)
     {
         if (k.row_num() != v.row_num() || k.col_num() != v.col_num())
             throw std::runtime_error("kv_cache append: K/V shape mismatch");

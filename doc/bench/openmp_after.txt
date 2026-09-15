@@ -1,0 +1,41 @@
+2026-09-15T16:33:25+08:00
+Running /data/01_github/jasmine/build/benches/bench_jasmine
+Run on (20 X 5100 MHz CPU s)
+CPU Caches:
+  L1 Data 48 KiB (x10)
+  L1 Instruction 32 KiB (x10)
+  L2 Unified 2048 KiB (x10)
+  L3 Unified 24576 KiB (x1)
+Load Average: 1.11, 0.75, 0.66
+***WARNING*** CPU scaling is enabled, the benchmark real time measurements may be noisy and will incur extra overhead.
+----------------------------------------------------------------------------------------
+Benchmark                              Time             CPU   Iterations UserCounters...
+----------------------------------------------------------------------------------------
+BM_MatDot/256_mean                951168 ns       644466 ns            3 items_per_second=26.0853G/s
+BM_MatDot/256_median              952329 ns       625536 ns            3 items_per_second=26.8206G/s
+BM_MatDot/256_stddev                4823 ns        36009 ns            3 items_per_second=1.4125G/s
+BM_MatDot/256_cv                    0.51 %          5.59 %             3 items_per_second=5.41%
+BM_MatDot/512_mean               7409496 ns      5149478 ns            3 items_per_second=26.0822G/s
+BM_MatDot/512_median             7428862 ns      5132399 ns            3 items_per_second=26.1511G/s
+BM_MatDot/512_stddev              108403 ns       165609 ns            3 items_per_second=835.107M/s
+BM_MatDot/512_cv                    1.46 %          3.22 %             3 items_per_second=3.20%
+BM_MhaForward/2/32/8_mean         114825 ns       114794 ns            3
+BM_MhaForward/2/32/8_median       114748 ns       114701 ns            3
+BM_MhaForward/2/32/8_stddev          173 ns          179 ns            3
+BM_MhaForward/2/32/8_cv             0.15 %          0.16 %             3
+BM_MhaForward/4/64/16_mean        783881 ns       783788 ns            3
+BM_MhaForward/4/64/16_median      783777 ns       783715 ns            3
+BM_MhaForward/4/64/16_stddev         313 ns          397 ns            3
+BM_MhaForward/4/64/16_cv            0.04 %          0.05 %             3
+BM_MhaForward/4/64/32_mean       1747377 ns      1747303 ns            3
+BM_MhaForward/4/64/32_median     1748149 ns      1748137 ns            3
+BM_MhaForward/4/64/32_stddev        1788 ns         1760 ns            3
+BM_MhaForward/4/64/32_cv            0.10 %          0.10 %             3
+BM_MhaForward/8/128/64_mean      5880929 ns      5610166 ns            3
+BM_MhaForward/8/128/64_median    5873323 ns      5620236 ns            3
+BM_MhaForward/8/128/64_stddev      68065 ns        36625 ns            3
+BM_MhaForward/8/128/64_cv           1.16 %          0.65 %             3
+BM_MhaForward/8/256/64_mean     22280868 ns     21371696 ns            3
+BM_MhaForward/8/256/64_median   22500393 ns     21458842 ns            3
+BM_MhaForward/8/256/64_stddev     706986 ns       258361 ns            3
+BM_MhaForward/8/256/64_cv           3.17 %          1.21 %             3

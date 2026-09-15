@@ -6,6 +6,7 @@
 
 #include "mat_concepts.hpp"
 #include "mat_express_t.hpp"
+#include "mat_storage.hpp"
 
 namespace jasmine {
 
@@ -21,15 +22,17 @@ public:
 
     mat_t<val_type> m_input;
 
-    mat_t<val_type> forward(const input_type& input)
+    template<typename Src>
+    mat_t<val_type> forward(Src&& input)
     {
-        m_input = input.clone();
+        detail::store_for_backward(m_input, std::forward<Src>(input));
         return m_input;
     }
 
-    mat_t<val_type> forward_one(const input_type& input)
+    template<typename Src>
+    mat_t<val_type> forward_one(Src&& input)
     {
-        return forward(input);
+        return forward(std::forward<Src>(input));
     }
 };
 

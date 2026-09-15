@@ -6,6 +6,7 @@
 
 #include "mat_t.hpp"
 #include "mat_express_t.hpp"
+#include "mat_storage.hpp"
 
 #include "mat_updator_t.hpp"
 
@@ -36,19 +37,19 @@ public:
         m_bias.reshape(container[1], 1);
     }
 
-    // 返回类型是一个表达式模板类的对象，与相关参数进行了引用绑定，可以惰性地获得指定位置的值（调用时进行计算）
-    mat_t<val_type> forward(const input_type& input) 
+    // m_input 持久化供 backward；mat rvalue 在层间移动，表达式只物化一次
+    template<typename Src>
+    mat_t<val_type> forward(Src&& input)
     {
-        m_input = input.clone();
-        auto ret = (m_weight.dot(m_input) + m_bias).clone();  // 这里用m_input避免重复计算，同时必须在这里全量计算，否则被引用的临时变量会失效
-        //std::cout << "Weight forward: input \n" << input << " \noutput \n" << ret << std::endl;
-        return ret;
+        detail::store_for_backward(m_input, std::forward<Src>(input));
+        return m_weight.dot(m_input) + m_bias;
     }
 
     /** 无状态层：单列输入与整段 forward 相同 */
-    mat_t<val_type> forward_one(const input_type& input)
+    template<typename Src>
+    mat_t<val_type> forward_one(Src&& input)
     {
-        return forward(input);
+        return forward(std::forward<Src>(input));
     }
 
     template <typename init_type>
@@ -74,9 +75,9 @@ public:
     template <typename other_type>
     mat_t<val_type> backward(const other_type& delta)
     {
-        auto delta_weight = delta.dot(m_input.t()).clone();
+        mat_t<val_type> delta_weight = delta.dot(m_input.t());
         auto delta_bias = hsum(delta);
-        mat_t<val_type> ret = m_weight.t().dot(delta).clone();
+        mat_t<val_type> ret = m_weight.t().dot(delta);
         // 更新权重和偏置
         m_weight_updator.update(delta_weight, m_weight);
         m_bias_updator.update(delta_bias, m_bias);
@@ -107,16 +108,17 @@ private:
 public:
     sigmoid_net_t() = default;
 
-    mat_t<val_type> forward(const input_type& input)
+    template<typename Src>
+    mat_t<val_type> forward(Src&& input)
     {
-        m_output = sigmoid(input).clone();
-        //std::cout << "Sigmoid forward: input \n" << input << " \noutput \n" << ret << std::endl;
+        m_output = sigmoid(std::forward<Src>(input));
         return m_output;
     }
 
-    mat_t<val_type> forward_one(const input_type& input)
+    template<typename Src>
+    mat_t<val_type> forward_one(Src&& input)
     {
-        return forward(input);
+        return forward(std::forward<Src>(input));
     }
 
     auto backward(const mat_t<val_type>& delta)
@@ -125,7 +127,7 @@ public:
         {
             throw std::runtime_error("delta size does not match input size");
         }
-        return (delta * (1 - m_output) * m_output).clone();
+        return mat_t<val_type>(delta * (static_cast<val_type>(1) - m_output) * m_output);
     }
 
     std::string net_type(int const& indent = 0) const
@@ -156,18 +158,17 @@ private:
 public:
     relu_net_t() = default;
 
-    mat_t<val_type> forward(const input_type& input)
+    template<typename Src>
+    mat_t<val_type> forward(Src&& input)
     {
-        m_input = input.clone();
-        //return relu(m_input).clone();
-        //auto ret = (m_input > 0) * m_input;     // 直接用表达式模板计算，避免中间变量
-        //std::cout << "ReLu forward: input \n" << input << " \noutput \n" << ret << std::endl;
-        return ((m_input > 0) * m_input).clone();
+        detail::store_for_backward(m_input, std::forward<Src>(input));
+        return (m_input > 0) * m_input;
     }
 
-    mat_t<val_type> forward_one(const input_type& input)
+    template<typename Src>
+    mat_t<val_type> forward_one(Src&& input)
     {
-        return forward(input);
+        return forward(std::forward<Src>(input));
     }
 
     template <typename other_type>
@@ -177,9 +178,7 @@ public:
         {
             throw std::runtime_error("delta size does not match input size");
         }
-        //auto delta_relu = delta.clone() * (m_input > 0);
-        //return delta_relu.clone();
-        return (delta * (m_input > 0)).clone();     // 直接用表达式模板计算，避免中间变量，表达式模板不应该被保存为中间变量，因为会导致引用失效
+        return mat_t<val_type>(delta * (m_input > 0));
     }
 
     std::string net_type(int const& indent = 0) const
@@ -231,12 +230,12 @@ public:
         m_beta_updator.set_lr(lr);
     }
 
-    mat_t<val_type> forward(const input_type& input)
+    template<typename Src>
+    mat_t<val_type> forward(Src&& input)
     {
         // 对每一列在 row（特征）维上标准化
         m_mean = vmean(input);
         mat_t<val_type> centered = (input - m_mean).clone();
-        // var = mean(x^2), std = sqrt(var + eps)；先 clone 再 sqrt，避免表达式模板无法物化
         mat_t<val_type> var = (vmean(pow(centered, 2.0)) + eps).clone();
         m_std = sqrt(var);
         m_hx = (centered / m_std).clone();
@@ -250,9 +249,10 @@ public:
         return (m_gama * m_hx + m_beta).clone();
     }
 
-    mat_t<val_type> forward_one(const input_type& input)
+    template<typename Src>
+    mat_t<val_type> forward_one(Src&& input)
     {
-        return forward(input);
+        return forward(std::forward<Src>(input));
     }
 
     template <typename other_type>
@@ -267,7 +267,8 @@ public:
         auto dx_norm = delta * m_gama;
         auto sum_dx_norm = vsum(dx_norm);
         auto sum_dx_norm_x_hx = vsum(dx_norm * m_hx);
-        auto L_input = ((dx_norm * m - sum_dx_norm - m_hx * sum_dx_norm_x_hx) / m / m_std).clone();
+        mat_t<val_type> L_input =
+            ((dx_norm * m - sum_dx_norm - m_hx * sum_dx_norm_x_hx) / m / m_std).clone();
 
         m_gama_updator.update(L_gama, m_gama);
         m_beta_updator.update(L_beta, m_beta);
@@ -301,18 +302,16 @@ public:
     using val_type = typename input_type::ele_type;
     mat_t<val_type> m_output;
 
-    mat_t<val_type> forward(const input_type& input)
+    template<typename Src>
+    mat_t<val_type> forward(Src&& input)
     {
-        //m_input = input.clone();
-        //return hsoftmax(m_input);
-        m_output = hsoftmax(input).clone();
+        m_output = hsoftmax(std::forward<Src>(input));
         return m_output;
     }
 
     mat_t<val_type> backward(const mat_t<val_type>& delta)
     {
-        auto grad = (m_output * (delta - hsum(m_output * delta))).clone();
-        return grad;
+        return mat_t<val_type>(m_output * (delta - hsum(m_output * delta)));
     }
 
     std::string net_type(int const& indent = 0) const
@@ -354,20 +353,24 @@ public:
         return m_net;
     }
 
-    mat_t<val_type> forward(const mat_t<val_type>& input)
+    template<typename Src>
+    mat_t<val_type> forward(Src&& input)
     {
-        return (m_net.forward(input) + input).clone();
+        mat_t<val_type> skip(std::forward<Src>(input));
+        return m_net.forward(skip) + skip;
     }
 
-    mat_t<val_type> forward_one(const mat_t<val_type>& input)
+    template<typename Src>
+    mat_t<val_type> forward_one(Src&& input)
     {
-        return (m_net.forward_one(input) + input).clone();
+        mat_t<val_type> skip(std::forward<Src>(input));
+        return m_net.forward_one(skip) + skip;
     }
 
     template <typename other_type>
-    auto backward(const other_type& delta)
+    mat_t<val_type> backward(const other_type& delta)
     {
-        return (m_net.backward(delta) + delta).clone();
+        return mat_t<val_type>(m_net.backward(delta) + delta);
     }
     std::string net_type(int const& indent = 0) const
     {
@@ -421,9 +424,11 @@ public:
     using val_type = typename std::tuple_element_t<0, std::tuple<net_types...>>::val_type;
 
     template <typename input_type>
-    auto forward(const input_type& input)
+    auto forward(input_type&& input)
     {
-        return std::apply([&input](auto&&... nets) {return net_forward(input, nets...); }, m_nets);
+        return std::apply([&input](auto&&... nets) {
+            return net_forward(std::forward<input_type>(input), nets...);
+        }, m_nets);
     }
 
     /**
@@ -431,9 +436,9 @@ public:
      * 输入原样继续后续层。各层走 forward_one（有 KV 的层可增量，其余默认 ≡ forward）。
      */
     template <typename input_type>
-    auto infer(const input_type& input)
+    auto infer(input_type&& input)
     {
-        return infer_chain<0>(input);
+        return infer_chain<0>(std::forward<input_type>(input));
     }
 
     /** 新序列推理前：递归清除子网中的 KV cache（若存在） */
@@ -450,9 +455,11 @@ public:
 
     /** decoder 等无 loss 尾的子网：整链 forward_one；含 loss 尾时请用 infer() */
     template <typename input_type>
-    auto forward_one(const input_type& input)
+    auto forward_one(input_type&& input)
     {
-        return std::apply([&input](auto&&... nets) { return net_forward_one(input, nets...); }, m_nets);
+        return std::apply([&input](auto&&... nets) {
+            return net_forward_one(std::forward<input_type>(input), nets...);
+        }, m_nets);
     }
 
     template <typename input_type>
@@ -584,19 +591,19 @@ public:
 
 private:
     template <size_t I, typename Input>
-    auto infer_chain(const Input& input)
+    auto infer_chain(Input&& input)
     {
         if constexpr (I >= sizeof...(net_types))
-            return input;
+            return std::forward<Input>(input);
         else
         {
             using net_type_at_i = std::tuple_element_t<I, std::tuple<net_types...>>;
             if constexpr (is_infer_skipped_net<net_type_at_i>::value)
-                return infer_chain<I + 1>(input);  // 跳过本层，原样继续
+                return infer_chain<I + 1>(std::forward<Input>(input));
             else
             {
                 auto& net = std::get<I>(m_nets);
-                return infer_chain<I + 1>(net.forward_one(input));
+                return infer_chain<I + 1>(net.forward_one(std::forward<Input>(input)));
             }
         }
     }

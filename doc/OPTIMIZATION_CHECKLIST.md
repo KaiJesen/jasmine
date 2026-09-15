@@ -66,19 +66,22 @@
 - [x] **Teacher forcing 路径不强制走 cache API**
   - 整段一次前向保持简单；cache 仅 inference / AR 使用（`forward` 训练 vs `infer` 推理，结构同一 `net_type`）
 
-- [ ] **评估 OpenMP 落点（有收益再开）**
-  - CMake 已 `JASMINE_USE_OPENMP`，源码无 `#pragma omp`
-  - 候选：大矩阵 `dot` 外积循环、多 head 并行、batch 维
-  - **不要**在 `d_model≈10`、短序列的 `clone`/小 gemm 上硬并行
-  - 验收：`benches/` 上相对 baseline 有稳定加速
+- [x] **评估 OpenMP 落点（有收益再开）**
+  - `mat_gemm.hpp`：大 GEMM（`MNK≥64³`）对单线程 BLAS 按行分片并行；blocked fallback 外层并行
+  - `mat_mha_t.hpp`：大 shape 下 QKV 三投影 `sections` 并行；多 head attend `parallel for`（阈值：`heads·seq·d_head≥4·32·32`）
+  - **小矩阵 / 短序列不并行**（`if` 阈值）
+  - 验收：`doc/bench/openmp_*.txt`；小 shape 不回归，大 shape 有加速
 
-- [ ] **大矩阵走 BLAS / 优化 GEMM（可选）**
-  - 替换朴素三重循环 `mat_dot_t`
-  - 验收：`BM_*` 在 `n≥256` 量级有数量级提升
+- [x] **大矩阵走 BLAS / 优化 GEMM（可选）**
+  - `mat_gemm.hpp`：大矩阵 `mat_dot_t::clone` 走 cache-blocked GEMM；若找到 `libblas`/`openblas` 则 `cblas_sgemm/dgemm`（`JASMINE_USE_BLAS`）
+  - 验收：`tests/test_gemm.cpp`；`doc/bench/matmul_*.txt` 中 `BM_MatDot` 在 `n≥256` 有数量级加速
+  - 基线（Release，优化前）→ 优化后对比见 `doc/bench/`
 
-- [ ] **削减不必要的** `.clone()`
-  - 层边界保留物化；纯中间表达式在生命周期安全时延迟物化
-  - 验收：相同数值 + bench 分配/耗时下降
+- [x] **削减不必要的** `.clone()`
+  - `mat_storage.hpp::store_for_backward` + 层间 `net_forward` 完美转发（mat rvalue 移动）
+  - 推理 KV：attend 直接读 cache view，不再每步 clone 全量 K/V
+  - 层 forward/backward 去掉与 `operator mat_t()` 重复的 `.clone()`；`fill_kv_cache` 视图直 append
+  - 验收：`tests/` 全绿；`doc/bench/clone_reduction_*.txt` 对比
 
 ---
 
@@ -152,7 +155,7 @@ RoPE 正确性 + 黄金测试
 ## 快速自检命令
 
 ```bash
-cmake -S . -B build -DJASMINE_USE_OPENMP=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DJASMINE_USE_OPENMP=ON -DJASMINE_USE_BLAS=ON
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ./build/benches/bench_jasmine --benchmark_filter=BM_
