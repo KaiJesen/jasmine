@@ -27,6 +27,19 @@ auto net_forward(input_type const& input, net_types&&... nets)
     return (input >> ... >> nets);
 }
 
+/** 与 net_forward 对称：单列/增量推理链；无 KV 的层默认 forward_one ≡ forward */
+template<typename input_type, typename net_type>
+auto net_forward_one(input_type const& input, net_type& net)
+{
+    return net.forward_one(input);
+}
+
+template<typename input_type, typename head_net_type, typename... tail_net_types>
+auto net_forward_one(input_type const& input, head_net_type& head, tail_net_types&... tail)
+{
+    return net_forward_one(head.forward_one(input), tail...);
+}
+
 template<typename net_type, typename input_type>
 requires is_backwardable<net_type, input_type>
 auto operator<<(net_type& net, input_type const& input)

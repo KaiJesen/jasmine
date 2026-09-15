@@ -58,6 +58,14 @@ concept is_updatable_net =
 template<typename net_type>
 concept is_unupdatable_net = !is_updatable_net<net_type>;
 
+/** 推理时跳过该层（通常为 loss）：不调用本层，输入原样传给后续层 */
+template<typename T, typename = void>
+struct is_infer_skipped_net : std::false_type {};
+
+template<typename T>
+struct is_infer_skipped_net<T, std::void_t<decltype(T::skip_on_infer)>>
+    : std::bool_constant<(T::skip_on_infer)> {};
+
 
 } // namespace jasmine
 #endif

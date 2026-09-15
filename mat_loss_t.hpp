@@ -15,6 +15,8 @@ class mat_loss_t
 { 
 public:
     using val_type = typename input_type::ele_type;
+    /** complex_net::infer 跳过本层，输入原样传给后续层（训练仍走 forward 透传） */
+    static constexpr bool skip_on_infer = true;
     mat_loss_t() = default;
 
     mat_t<val_type> m_input;
@@ -23,6 +25,11 @@ public:
     {
         m_input = input.clone();
         return m_input;
+    }
+
+    mat_t<val_type> forward_one(const input_type& input)
+    {
+        return forward(input);
     }
 };
 

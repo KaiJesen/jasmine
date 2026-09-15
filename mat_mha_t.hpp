@@ -11,6 +11,7 @@
 #include "mat_net_t.hpp"
 #include "mat_express_t.hpp"
 #include "mat_RoPE_t.hpp"
+#include "mat_kv_cache_t.hpp"
 
 namespace jasmine {
 
@@ -77,13 +78,24 @@ public:
     template <typename q_t, typename k_t, typename v_t>
     mat_t<val_type> forward(const q_t& q, const k_t& k, const v_t& v)
     {
+        return forward_at(q, k, v, 0, 0);
+    }
+
+    /**
+     * Q 列 j 用绝对位置 q_pos+j，K 列 j 用 k_pos+j 做 RoPE。
+     * 训练默认 (0,0)；cross-attn decode 时 Q 用解码绝对位置，K 仍从 0。
+     */
+    template <typename q_t, typename k_t, typename v_t>
+    mat_t<val_type> forward_at(const q_t& q, const k_t& k, const v_t& v,
+                               int q_pos, int k_pos)
+    {
         m_q = q.clone();
         m_k = k.clone();
         m_v = v.clone();
         if (m_rope)
         {
-            m_q = m_rope->forward(m_q);
-            m_k = m_rope->forward(m_k);
+            m_q = m_rope->forward_at(m_q, q_pos);
+            m_k = m_rope->forward_at(m_k, k_pos);
         }
 
         auto attn_scores = (m_q.t().dot(m_k) / std::sqrt(static_cast<val_type>(m_q.row_num()))).clone();
@@ -105,6 +117,82 @@ public:
         auto output = m_v.dot(attn_weights.t()).clone();
 
         return output;
+    }
+
+    /**
+     * 推理单步 / 增量：q/k/v 为新 token（可多列 prefill），pos 为第一列的绝对位置。
+     * 写入 RoPE 后的 K/V 到 cache，再对 cache 全长做 attention。
+     * q_len==1 时无需再填 causal mask（只有一个 query）。
+     */
+    template <typename q_t, typename k_t, typename v_t>
+    mat_t<val_type> forward_one_at(const q_t& q, const k_t& k, const v_t& v,
+                                   int pos, kv_cache_t<val_type>& cache)
+    {
+        mat_t<val_type> q_new = q.clone();
+        mat_t<val_type> k_new = k.clone();
+        mat_t<val_type> v_new = v.clone();
+        if (m_rope)
+        {
+            q_new = m_rope->forward_at(q_new, pos);
+            k_new = m_rope->forward_at(k_new, pos);
+        }
+        cache.append(k_new, v_new);
+
+        // 缓存供本步数值检查；decode 路径不走 backward
+        m_q = q_new;
+        m_k = cache.keys().clone();
+        m_v = cache.values().clone();
+
+        auto attn_scores = (m_q.t().dot(m_k) / std::sqrt(static_cast<val_type>(m_q.row_num()))).clone();
+        /*!ANCHOR forward_one 掩码
+         * scores 行 = 本步 query（绝对位置 pos..pos+q_len-1），列 = cache 中全部 key（0..len-1）。
+         * 多列 prefill 时仍需屏蔽「未来 key」：对 query 行 i，绝对位置 p=pos+i，屏蔽 j > p。
+         * 单列时 q_len=1 且 cache 已含当前 key，自然无未来列，可不 mask。
+         */
+        if (m_mask && attn_scores.row_num() > 1)
+        {
+            for (int i = 0; i < attn_scores.row_num(); ++i)
+            {
+                const int abs_pos = pos + i;
+                for (int j = abs_pos + 1; j < attn_scores.col_num(); ++j)
+                    attn_scores(i, j) = -std::numeric_limits<val_type>::infinity();
+            }
+        }
+        auto attn_weights = m_softmax.forward(attn_scores);
+        return m_v.dot(attn_weights.t()).clone();
+    }
+
+    /**
+     * cross-attn 推理：Q 为新 token，K/V 已在 cache 中（encode 时写入，不再 append）。
+     * q 列 j 使用绝对位置 pos+j 做 RoPE；K 侧 RoPE 已在写入 cache 时完成。
+     */
+    template <typename q_t>
+    mat_t<val_type> attend_cached(const q_t& q, int pos, kv_cache_t<val_type>& cache)
+    {
+        if (cache.length() == 0)
+            throw std::runtime_error("attend_cached: empty KV cache");
+
+        mat_t<val_type> q_new = q.clone();
+        if (m_rope)
+            q_new = m_rope->forward_at(q_new, pos);
+
+        m_q = std::move(q_new);
+        m_k = cache.keys().clone();
+        m_v = cache.values().clone();
+
+        auto attn_scores = (m_q.t().dot(m_k) / std::sqrt(static_cast<val_type>(m_q.row_num()))).clone();
+        // cross-attn 通常 m_mask=false；若误开 mask，多列时按绝对位置屏蔽未来 key
+        if (m_mask && attn_scores.row_num() > 1)
+        {
+            for (int i = 0; i < attn_scores.row_num(); ++i)
+            {
+                const int abs_pos = pos + i;
+                for (int j = abs_pos + 1; j < attn_scores.col_num(); ++j)
+                    attn_scores(i, j) = -std::numeric_limits<val_type>::infinity();
+            }
+        }
+        auto attn_weights = m_softmax.forward(attn_scores);
+        return m_v.dot(attn_weights.t()).clone();
     }
 
     bwd_pack_t backward(const mat_view_t<mat_t<val_type>>& delta)
@@ -247,6 +335,15 @@ private:
     // 前向缓存，供 backward 切分梯度
     mat_t<val_type> m_q_full, m_k_full, m_v_full;
 
+    // decoder self-attn 推理用：每头一份 KV（投影+RoPE 后）
+    std::vector<kv_cache_t<val_type>> m_kv_caches;
+
+    void ensure_kv_caches()
+    {
+        if (static_cast<int>(m_kv_caches.size()) != m_num_heads)
+            m_kv_caches.resize(m_num_heads);
+    }
+
 public:
     mat_mha_t(int num_heads = 1, int d_model = 1, bool mask = false, int seq_len = 1)
         : m_q_net(d_model, d_model), m_k_net(d_model, d_model), m_v_net(d_model, d_model),
@@ -259,6 +356,9 @@ public:
 
         for (int i = 0; i < num_heads; ++i)
             m_heads.emplace_back(m_d_head, mask, seq_len);
+        ensure_kv_caches();
+        if (seq_len > 0)
+            reserve_kv_cache(seq_len);
         bind_rope();
     }
 
@@ -280,7 +380,95 @@ public:
         m_heads.resize(num_heads);
         for (int i = 0; i < num_heads; ++i)
             m_heads[i].set_param(m_d_head, mask, seq_len);
+        ensure_kv_caches();
+        if (seq_len > 0)
+            reserve_kv_cache(seq_len);
+        clear_kv_cache();
         bind_rope();
+    }
+
+    void set_kv_cache_mode(kv_cache_mode mode)
+    {
+        ensure_kv_caches();
+        for (auto& c : m_kv_caches)
+            c.set_mode(mode);
+    }
+
+    void reserve_kv_cache(int max_seq)
+    {
+        ensure_kv_caches();
+        for (auto& c : m_kv_caches)
+            c.reserve(m_d_head, max_seq);
+    }
+
+    void clear_kv_cache()
+    {
+        for (auto& c : m_kv_caches)
+            c.clear();
+    }
+
+    int kv_cache_length() const
+    {
+        return m_kv_caches.empty() ? 0 : m_kv_caches.front().length();
+    }
+
+    /**
+     * 用整段 K/V（已按头拼接的 d_model×seq）填满各头 cache。
+     * K 在写入前按 k_start_pos 做 RoPE；V 不旋转。
+     * 供 cross-attn：encode 后一次性写入，之后 decode 只读。
+     */
+    void fill_kv_cache(mat_t<val_type> k_full, mat_t<val_type> v_full, int k_start_pos = 0)
+    {
+        if (k_full.row_num() != m_d_model || v_full.row_num() != m_d_model)
+            throw std::runtime_error("fill_kv_cache: row dim must be d_model");
+        if (k_full.col_num() != v_full.col_num())
+            throw std::runtime_error("fill_kv_cache: K/V seq length mismatch");
+
+        ensure_kv_caches();
+        const int seq = k_full.col_num();
+        for (auto& c : m_kv_caches)
+            c.reserve(m_d_head, std::max(1, seq));
+        clear_kv_cache();
+
+        auto k_splits = vsplit(k_full, m_num_heads);
+        auto v_splits = vsplit(v_full, m_num_heads);
+        for (int i = 0; i < m_num_heads; ++i)
+        {
+            mat_t<val_type> k_h = k_splits[i].clone();
+            mat_t<val_type> v_h = v_splits[i].clone();
+            if (auto rope = m_heads[i].rope())
+                k_h = rope->forward_at(k_h, k_start_pos);
+            m_kv_caches[i].append(k_h, v_h);
+        }
+    }
+
+    /** 对固定 memory 做 W_K/W_V 投影后写入 KV cache（cross-attn prepare） */
+    void cache_kv_from_memory(const input_type& memory, int k_start_pos = 0)
+    {
+        if (memory.row_num() != m_d_model)
+            throw std::runtime_error("cache_kv_from_memory: row dim must match d_model");
+        fill_kv_cache(m_k_net.forward(memory), m_v_net.forward(memory), k_start_pos);
+    }
+
+    /**
+     * 推理：只用 Q 投影，对已填充的 KV cache 做 attention（不 append）。
+     * cross-attn 在 prepare / cache_kv_from_memory 之后调用。
+     */
+    mat_t<val_type> forward_one_cached_kv(const input_type& input, int q_pos)
+    {
+        if (input.row_num() != m_d_model)
+            throw std::runtime_error("Input row dimension must match d_model");
+        if (kv_cache_length() == 0)
+            throw std::runtime_error("forward_one_cached_kv: KV cache empty; call cache_kv_from_memory first");
+
+        m_q_full = m_q_net.forward(input);
+        auto q_splits = vsplit(m_q_full, m_num_heads);
+
+        std::vector<mat_t<val_type>> head_outputs(m_num_heads);
+        for (int i = 0; i < m_num_heads; ++i)
+            head_outputs[i] = m_heads[i].attend_cached(q_splits[i], q_pos, m_kv_caches[i]);
+
+        return m_output_proj.forward(vconcat(head_outputs));
     }
 
     /** 显式绑定/刷新各头的 RoPE（同 d_head 共享注册中心条目） */
@@ -321,7 +509,44 @@ public:
         return final_output;
     }
 
+    /**
+     * 推理 forward_one（decoder self-attn）：只投影本步 token，追加 KV cache，attend 历史。
+     * 输入通常为 d_model×1；也支持多列 prefill（pos = 当前 cache.length()）。
+     * 训练 / teacher forcing 仍用 forward()，不触碰 cache。
+     */
+    mat_t<val_type> forward_one(const input_type& input)
+    {
+        if (input.row_num() != m_d_model)
+            throw std::runtime_error("Input row dimension must match d_model");
+        ensure_kv_caches();
+
+        const int pos = kv_cache_length();
+        m_q_full = m_q_net.forward(input);
+        m_k_full = m_k_net.forward(input);
+        m_v_full = m_v_net.forward(input);
+
+        auto q_splits = vsplit(m_q_full, m_num_heads);
+        auto k_splits = vsplit(m_k_full, m_num_heads);
+        auto v_splits = vsplit(m_v_full, m_num_heads);
+
+        std::vector<mat_t<val_type>> head_outputs(m_num_heads);
+        for (int i = 0; i < m_num_heads; ++i)
+            head_outputs[i] = m_heads[i].forward_one_at(
+                q_splits[i], k_splits[i], v_splits[i], pos, m_kv_caches[i]);
+
+        mat_t<val_type> concatenated_output = vconcat(head_outputs);
+        return m_output_proj.forward(concatenated_output);
+    }
+
     mat_t<val_type> forward(const input_type& input, const input_type& encoder_input)
+    {
+        return forward_at(input, encoder_input, 0);
+    }
+
+    /**
+     * 交叉注意力；q_pos 为 decoder 侧 Q 的 RoPE 起点（训练为 0，decode 为绝对时间步）。
+     */
+    mat_t<val_type> forward_at(const input_type& input, const input_type& encoder_input, int q_pos)
     {
         // Step 1: 检查输入维度是否合法
         if (input.row_num() != m_d_model)
@@ -339,10 +564,11 @@ public:
         auto k_splits = vsplit(m_k_full, m_num_heads);
         auto v_splits = vsplit(m_v_full, m_num_heads);
 
-        // Step 4: 每个头独立进行正向传播
+        // Step 4: 每个头独立进行正向传播（Q 用 q_pos，K 从 0）
         std::vector<mat_t<val_type>> head_outputs(m_num_heads);
         for (int i = 0; i < m_num_heads; ++i)
-            head_outputs[i] = m_heads[i].forward(q_splits[i], k_splits[i], v_splits[i]);
+            head_outputs[i] = m_heads[i].forward_at(
+                q_splits[i], k_splits[i], v_splits[i], q_pos, 0);
 
         // Step 5: 拼接所有头的输出，再经输出映射网络得到最终结果
         mat_t<val_type> concatenated_output = vconcat(head_outputs);
@@ -473,6 +699,8 @@ public:
 private:
     mat_t<val_type>* m_encoder_output;
     mat_t<val_type>* m_encoder_delta;
+    // decode 时 Q 的 RoPE 绝对位置（与同层 self-attn 时间步对齐）；clear 时归零
+    int m_q_rope_pos = 0;
 public:
     mat_mhca_t(int num_heads = 1, int d_model = 1, bool mask = false, int seq_len = 1)
         : base_type(num_heads, d_model, mask, seq_len)
@@ -487,12 +715,44 @@ public:
         m_encoder_delta = &encoder_delta;
     }
 
+    void reset_cross_q_pos()
+    {
+        m_q_rope_pos = 0;
+    }
+
+    /**
+     * encode 之后调用：把 encoder memory 投影为 K/V（RoPE 后）写入 cache。
+     * 之后 forward_one 只算 Q，复用这份 K/V。
+     */
+    void prepare_cross_kv()
+    {
+        if (m_encoder_output == nullptr)
+            throw std::runtime_error("Encoder output not set for cross attention");
+        this->cache_kv_from_memory(*m_encoder_output, 0);
+        m_q_rope_pos = 0;
+    }
+
     mat_t<val_type> forward(const input_type& input)
     {
         if (m_encoder_output == nullptr)
             throw std::runtime_error("Encoder output not set for cross attention");
 
         return base_type::forward(input, *m_encoder_output);
+    }
+
+    /**
+     * cross-attn 推理：K/V 来自 prepare_cross_kv 的 cache；本步只投影 Q。
+     */
+    mat_t<val_type> forward_one(const input_type& input)
+    {
+        if (m_encoder_output == nullptr)
+            throw std::runtime_error("Encoder output not set for cross attention");
+        if (this->kv_cache_length() == 0)
+            prepare_cross_kv();
+
+        auto out = this->forward_one_cached_kv(input, m_q_rope_pos);
+        m_q_rope_pos += input.col_num();
+        return out;
     }
 
     mat_t<val_type> backward(const input_type& delta)

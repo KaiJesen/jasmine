@@ -255,6 +255,7 @@ public:
     {
         auto en_input_expand = expand_encoder_input(en_input);
         tf_base().encoder_forward(en_input_expand);
+        m_net.infer_prepare(16);
 
         mat_t<test_val_type> pred_input(input_dim, 1023);
         auto pred_input_sos = add_sos(pred_input);
@@ -262,8 +263,9 @@ public:
         int len = 1;
         while (true)
         {
-            auto cur_input = pred_input_sos.view(0, 0, d_model, len);
-            auto output = m_net.forward(cur_input);
+            // 只喂最新一列；self-attn 经 KV cache 复用历史 K/V
+            auto token = pred_input_sos.view(0, len - 1, d_model, 1).clone();
+            auto output = m_net.infer(token);
             pred_input_sos.col(len).assign(output.back_col());
             pred_input_sos(sos_row, len) = 0; // 生成步不应带 SOS
             ++len;

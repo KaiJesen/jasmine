@@ -330,22 +330,34 @@ public:
 
     mat_t<val_type> forward(input_type const& x)
     {
-        // 正向传播，逆时针旋转输入token中的向量
+        // 默认：列下标即绝对位置 0..seq_len-1
+        return forward_at(x, 0);
+    }
+
+    /**
+     * 从绝对位置 start_pos 起旋转：列 j 使用位置 start_pos + j。
+     * forward_one / KV cache 路径需要：单列新 token 的位置 = cache.length()。
+     */
+    mat_t<val_type> forward_at(input_type const& x, int start_pos)
+    {
         int seq_len = x.col_num();
         int d_model = x.row_num();
         if (d_model != m_rope.get_d())
         {
             throw std::runtime_error("Input dimension does not match RoPE dimension");
         }
-        // 获得一个与输入同等大小的矩阵，这个矩阵作为输出矩阵，用于存储RoPE计算后的结果
+        if (start_pos < 0)
+            throw std::invalid_argument("RoPE forward_at start_pos must be >= 0");
+
         mat_t<val_type> ret(d_model, seq_len);
-        // 2层循环，外层遍历序列中的每个位置m，内层遍历每个位置中的每组特征（2个特征1组，组索引i），取出缓存位置的2x2的矩阵，与输入的2x1的矩阵进行点积，得到输出矩阵的2x1的矩阵。从原理上解释，缓存矩阵的每2列2行使用相同的旋转角度，属于1组旋转。实际缓存矩阵存储的就是这样一组一组的2x2小旋转矩阵
-        for (int m = 0; m < seq_len; ++m)
+        // 外层：序列位置；内层：特征二维对。缓存每 2×2 块共用 θ = m / 10000^(2i/d)
+        for (int j = 0; j < seq_len; ++j)
         {
+            const int m = start_pos + j;
             for (int i = 0; i < d_model / 2; ++i)
             {
-                auto ret_view = ret.view(i * 2, m, 2, 1);
-                auto input_view = x.view(i * 2, m, 2, 1);
+                auto ret_view = ret.view(i * 2, j, 2, 1);
+                auto input_view = x.view(i * 2, j, 2, 1);
                 auto rope_mat = m_rope.forward_unite(i, m);
                 ret_view.assign(rope_mat.dot(input_view));
             }

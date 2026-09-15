@@ -51,16 +51,20 @@
 
 ## P2 — 推理与训练效率
 
-- [ ] **Decoder self-attn KV cache**
+- [x] **Decoder self-attn KV cache**
   - 场景：`predict` 逐步生成（`transformer_test.hpp`）
-  - 目标：历史 K/V 只算一次；每步只算新 token 的 Q（及对应 K/V）并拼接
-  - 验收：与无 cache 的全量重算数值一致；长序列 wall time 明显下降
+  - 实现：`mat_kv_cache_t.hpp` + `mat_mha_t::forward_one` / `decoder_t::forward_one`；cache 存 RoPE 后的 K/V
+  - 验收：`tests/test_kv_cache.cpp` 逐步输出与无 cache 全量 forward 一致；`predict` 走 `complex_net_t::infer`（`skip_on_infer` 层被跳过）
 
-- [ ] **Encoder memory / cross-attn K/V cache**
-  - encode 一次后，decode 多步复用 encoder 侧投影（若单独投影）或至少复用 encoder 输出
+- [x] **Encoder memory 复用**
+  - `encoder_forward` 一次写入 `m_encoder_output`；decode 多步只读，不重跑 encoder
 
-- [ ] **Teacher forcing 路径不强制走 cache API**
-  - 整段一次前向保持简单；cache 仅 inference / AR 使用
+- [x] **Cross-attn K/V cache**
+  - `set_encoder_output` → 各层 `prepare_cross_kv`：投影 memory 为 K/V（RoPE 后）写入 cache
+  - `mat_mhca_t::forward_one` 只算 Q，经 `attend_cached` 读 cache
+  - 验收：`DecoderKvCache.*` / `MhcaKvCache.PrepareThenDecodeMatchesFull`
+- [x] **Teacher forcing 路径不强制走 cache API**
+  - 整段一次前向保持简单；cache 仅 inference / AR 使用（`forward` 训练 vs `infer` 推理，结构同一 `net_type`）
 
 - [ ] **评估 OpenMP 落点（有收益再开）**
   - CMake 已 `JASMINE_USE_OPENMP`，源码无 `#pragma omp`
@@ -100,9 +104,10 @@
 
 ## P4 — 工程卫生
 
-- [ ] `mat_t::operator()` **越界策略**
-  - 现状：`%` 绕回，易掩盖 bug
-  - 建议：Debug 断言 / 可选严格模式
+- [x] **`mat_t::operator()` 的 `%` 折回（保留，作为底层默认语义）**
+  - 设计原则：**底层默认放开，不在索引层做严格越界禁止**；形状合法性由上层逻辑保证
+  - 用途：express 对位广播（标量 / 行向量 / 列向量）、以及大矩阵对小矩阵的周期/折回访问（例如 CNN 卷积核在输入上滑动时的下标映射）
+  - 决策：保持 `%`；仅在确有需要的上层路径再显式约束，不把「禁止」下沉到 `mat_t`
 
 - [ ] **数值梯度检查（抽几层）**
   - weight / LayerNorm / MHA 对输入的有限差分 vs `backward`
@@ -140,6 +145,7 @@ RoPE 正确性 + 黄金测试
 - [x] 训练：每步重算 encoder；decoder TF = `SOS+label`；scheduled sampling；EOS 损失加权
 - [x] `set_lr` 不重置优化器动量（避免每步 `set_updator`）
 - [x] CMake + GoogleTest / Benchmark / examples 分离
+- [x] `mat_t::operator()` 用 `%` 折回（底层默认放开；广播/卷积等通用机制，越界由上层约束）
 
 
 

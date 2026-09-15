@@ -52,6 +52,30 @@ public:
         return m_kernel.forward(input);
     }
 
+    /**
+     * 推理单列/增量：decoder self-attn 使用 KV cache。
+     * 入口在 transformer 子模块，不经过 complex_net 顶层的 loss 头。
+     */
+    mat_t<val_type> forward_one(const mat_t<val_type>& input)
+    {
+        return m_kernel.forward_one(input);
+    }
+
+    void clear_kv_cache()
+    {
+        m_kernel.clear_kv_cache();
+    }
+
+    void reserve_kv_cache(int max_seq)
+    {
+        m_kernel.reserve_kv_cache(max_seq);
+    }
+
+    void set_kv_cache_mode(kv_cache_mode mode)
+    {
+        m_kernel.set_kv_cache_mode(mode);
+    }
+
     mat_t<val_type> backward(const mat_t<val_type>& delta)
     {
         return m_kernel.backward(delta);

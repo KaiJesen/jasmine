@@ -322,6 +322,39 @@ public:
         return output;
     }
 
+    /**
+     * 推理单列/增量：各层 self-attn 写 KV cache。
+     * 调用前 clear_kv_cache()；teacher forcing 仍用 forward()。
+     */
+    mat_t<val_type> forward_one(const mat_t<val_type>& input)
+    {
+        mat_t<val_type> output = input;
+        for (auto& layer : m_layers)
+            output = layer.forward_one(output);
+        return output;
+    }
+
+    void clear_kv_cache()
+    {
+        for (size_t i = 0; i < size(); ++i)
+        {
+            get_mha(i).clear_kv_cache();
+            get_mhca(i).reset_cross_q_pos();
+        }
+    }
+
+    void reserve_kv_cache(int max_seq)
+    {
+        for (size_t i = 0; i < size(); ++i)
+            get_mha(i).reserve_kv_cache(max_seq);
+    }
+
+    void set_kv_cache_mode(kv_cache_mode mode)
+    {
+        for (size_t i = 0; i < size(); ++i)
+            get_mha(i).set_kv_cache_mode(mode);
+    }
+
     mat_t<val_type> backward(const mat_t<val_type>& input)
     {
         if (m_encoder_delta.row_num() != m_encoder_output.row_num()
@@ -362,6 +395,9 @@ public:
     {
         m_encoder_output = encoder_output;
         m_encoder_delta.reshape(encoder_output.row_num(), encoder_output.col_num());
+        // encode 后预热各层 cross-attn 的 K/V cache（投影 + RoPE）
+        for (size_t i = 0; i < size(); ++i)
+            get_mhca(i).prepare_cross_kv();
     }
 
     mat_t<val_type> get_encoder_output() const
@@ -538,6 +574,27 @@ public:
     mat_t<val_type> forward(const mat_t<val_type>& input)
     {
         return m_decoder.forward(input);
+    }
+
+    /** 推理增量：self-attn 走 KV cache；需先 encoder_forward + clear_kv_cache */
+    mat_t<val_type> forward_one(const mat_t<val_type>& input)
+    {
+        return m_decoder.forward_one(input);
+    }
+
+    void clear_kv_cache()
+    {
+        m_decoder.clear_kv_cache();
+    }
+
+    void reserve_kv_cache(int max_seq)
+    {
+        m_decoder.reserve_kv_cache(max_seq);
+    }
+
+    void set_kv_cache_mode(kv_cache_mode mode)
+    {
+        m_decoder.set_kv_cache_mode(mode);
     }
 
     mat_t<val_type> backward(const mat_t<val_type>& delta)

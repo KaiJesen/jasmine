@@ -43,11 +43,12 @@ public:
         auto ret = (m_weight.dot(m_input) + m_bias).clone();  // 这里用m_input避免重复计算，同时必须在这里全量计算，否则被引用的临时变量会失效
         //std::cout << "Weight forward: input \n" << input << " \noutput \n" << ret << std::endl;
         return ret;
-        /*
-        auto a = m_weight.dot(m_input);     // 输出结果a引用了m_input和m_weight
-        auto b = a + m_bias;            // 输出结果b引用了a和m_bias
-        return b.clone();             // 返回b，引用链条为b->a->m_input/m_weight/m_bias，返回后a失效，因此b失效，因此必须在这个时候计算所有的值，否则失效
-        */
+    }
+
+    /** 无状态层：单列输入与整段 forward 相同 */
+    mat_t<val_type> forward_one(const input_type& input)
+    {
+        return forward(input);
     }
 
     template <typename init_type>
@@ -113,6 +114,11 @@ public:
         return m_output;
     }
 
+    mat_t<val_type> forward_one(const input_type& input)
+    {
+        return forward(input);
+    }
+
     auto backward(const mat_t<val_type>& delta)
     {
         if (delta.row_num() != m_output.row_num() || delta.col_num() != m_output.col_num())
@@ -157,6 +163,11 @@ public:
         //auto ret = (m_input > 0) * m_input;     // 直接用表达式模板计算，避免中间变量
         //std::cout << "ReLu forward: input \n" << input << " \noutput \n" << ret << std::endl;
         return ((m_input > 0) * m_input).clone();
+    }
+
+    mat_t<val_type> forward_one(const input_type& input)
+    {
+        return forward(input);
     }
 
     template <typename other_type>
@@ -237,6 +248,11 @@ public:
             m_beta = val_type(0);
         }
         return (m_gama * m_hx + m_beta).clone();
+    }
+
+    mat_t<val_type> forward_one(const input_type& input)
+    {
+        return forward(input);
     }
 
     template <typename other_type>
@@ -343,6 +359,11 @@ public:
         return (m_net.forward(input) + input).clone();
     }
 
+    mat_t<val_type> forward_one(const mat_t<val_type>& input)
+    {
+        return (m_net.forward_one(input) + input).clone();
+    }
+
     template <typename other_type>
     auto backward(const other_type& delta)
     {
@@ -403,6 +424,35 @@ public:
     auto forward(const input_type& input)
     {
         return std::apply([&input](auto&&... nets) {return net_forward(input, nets...); }, m_nets);
+    }
+
+    /**
+     * 推理前向：与 forward 同一套 net 顺序；对 skip_on_infer 层（通常为 loss）跳过不调用，
+     * 输入原样继续后续层。各层走 forward_one（有 KV 的层可增量，其余默认 ≡ forward）。
+     */
+    template <typename input_type>
+    auto infer(const input_type& input)
+    {
+        return infer_chain<0>(input);
+    }
+
+    /** 新序列推理前：递归清除子网中的 KV cache（若存在） */
+    void infer_reset()
+    {
+        infer_reset_chain<0>();
+    }
+
+    /** 可选：为含 reserve_kv_cache 的子网预分配容量 */
+    void infer_prepare(int max_kv_seq = 0)
+    {
+        infer_prepare_chain<0>(max_kv_seq);
+    }
+
+    /** decoder 等无 loss 尾的子网：整链 forward_one；含 loss 尾时请用 infer() */
+    template <typename input_type>
+    auto forward_one(const input_type& input)
+    {
+        return std::apply([&input](auto&&... nets) { return net_forward_one(input, nets...); }, m_nets);
     }
 
     template <typename input_type>
@@ -529,6 +579,62 @@ public:
         else
         {
             return std::get<N>(m_nets).template get<nums...>();
+        }
+    }
+
+private:
+    template <size_t I, typename Input>
+    auto infer_chain(const Input& input)
+    {
+        if constexpr (I >= sizeof...(net_types))
+            return input;
+        else
+        {
+            using net_type_at_i = std::tuple_element_t<I, std::tuple<net_types...>>;
+            if constexpr (is_infer_skipped_net<net_type_at_i>::value)
+                return infer_chain<I + 1>(input);  // 跳过本层，原样继续
+            else
+            {
+                auto& net = std::get<I>(m_nets);
+                return infer_chain<I + 1>(net.forward_one(input));
+            }
+        }
+    }
+
+    template <size_t I>
+    void infer_reset_chain()
+    {
+        if constexpr (I >= sizeof...(net_types))
+            return;
+        else
+        {
+            auto& net = std::get<I>(m_nets);
+            if constexpr (requires { net.infer_reset(); })
+                net.infer_reset();
+            else if constexpr (requires { net.clear_kv_cache(); })
+                net.clear_kv_cache();
+            infer_reset_chain<I + 1>();
+        }
+    }
+
+    template <size_t I>
+    void infer_prepare_chain(int max_kv_seq)
+    {
+        if constexpr (I >= sizeof...(net_types))
+            return;
+        else
+        {
+            auto& net = std::get<I>(m_nets);
+            if constexpr (requires { net.infer_prepare(max_kv_seq); })
+                net.infer_prepare(max_kv_seq);
+            else if constexpr (requires { net.clear_kv_cache(); })
+                net.clear_kv_cache();
+            if constexpr (requires { net.reserve_kv_cache(max_kv_seq); })
+            {
+                if (max_kv_seq > 0)
+                    net.reserve_kv_cache(max_kv_seq);
+            }
+            infer_prepare_chain<I + 1>(max_kv_seq);
         }
     }
 };
