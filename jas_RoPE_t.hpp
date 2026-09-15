@@ -1,12 +1,12 @@
-#ifndef __MAT_ROPE_HPP__
-#define __MAT_ROPE_HPP__
+#ifndef __JAS_ROPE_HPP__
+#define __JAS_ROPE_HPP__
 
 #include <cmath>
 #include <memory>
 #include <stdexcept>
 #include <unordered_map>
-#include "mat_view_t.hpp"
-#include "mat_express_t.hpp"
+#include "jas_mat_view_t.hpp"
+#include "jas_mat_express_t.hpp"
 
 namespace jasmine {
 

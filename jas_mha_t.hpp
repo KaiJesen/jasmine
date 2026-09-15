@@ -1,5 +1,5 @@
-#ifndef __MAT_MHA_T_HPP__
-#define __MAT_MHA_T_HPP__
+#ifndef __JAS_MHA_T_HPP__
+#define __JAS_MHA_T_HPP__
 
 #include <algorithm>
 #include <cmath>
@@ -7,14 +7,14 @@
 #include <memory>
 #include <tuple>
 
-#include "mat_t.hpp"
-#include "mat_view_t.hpp"
-#include "mat_net_t.hpp"
-#include "mat_express_t.hpp"
-#include "mat_RoPE_t.hpp"
-#include "mat_kv_cache_t.hpp"
-#include "mat_storage.hpp"
-#include "mat_gemm.hpp"
+#include "jas_mat_t.hpp"
+#include "jas_mat_view_t.hpp"
+#include "jas_net_t.hpp"
+#include "jas_mat_express_t.hpp"
+#include "jas_RoPE_t.hpp"
+#include "jas_kv_cache_t.hpp"
+#include "jas_mat_storage.hpp"
+#include "jas_mat_gemm.hpp"
 
 namespace jasmine {
 

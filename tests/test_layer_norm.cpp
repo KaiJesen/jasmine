@@ -1,7 +1,7 @@
 #include <cmath>
 #include <gtest/gtest.h>
-#include "mat_net_t.hpp"
-#include "mat_updator_t.hpp"
+#include "jas_net_t.hpp"
+#include "jas_updator_t.hpp"
 #include "test_helpers.hpp"
 
 

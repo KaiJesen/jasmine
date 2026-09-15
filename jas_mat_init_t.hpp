@@ -1,9 +1,9 @@
-#ifndef __MAT_INIT_T_HPP__
-#define __MAT_INIT_T_HPP__
+#ifndef __JAS_MAT_INIT_T_HPP__
+#define __JAS_MAT_INIT_T_HPP__
 #include <random>
 
-#include "mat_concepts.hpp"
-#include "mat_t.hpp"
+#include "jas_mat_concepts.hpp"
+#include "jas_mat_t.hpp"
 
 namespace jasmine {
 

@@ -1,9 +1,9 @@
 #include <gtest/gtest.h>
 
-#include "mat_kv_cache_t.hpp"
-#include "mat_mha_t.hpp"
-#include "mat_init_t.hpp"
-#include "mat_transformer_kernel_t.hpp"
+#include "jas_kv_cache_t.hpp"
+#include "jas_mha_t.hpp"
+#include "jas_mat_init_t.hpp"
+#include "jas_transformer_kernel_t.hpp"
 #include "test_helpers.hpp"
 
 using namespace jasmine;

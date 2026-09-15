@@ -1,6 +1,6 @@
 # BM_MatDot Release comparison
 
-Environment: Release build, same machine; before = naive `mat_dot_t::clone`, after = BLAS `cblas_sgemm` via `mat_gemm.hpp`.
+Environment: Release build, same machine; before = naive `mat_dot_t::clone`, after = BLAS `cblas_sgemm` via `jas_mat_gemm.hpp`.
 
 | n | before (ns, median CPU) | after (ns) | speedup | before items/s | after items/s |
 |---|-------------------------|------------|---------|----------------|---------------|

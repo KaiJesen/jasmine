@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
-#include "mat_net_t.hpp"
-#include "mat_init_t.hpp"
-#include "mat_loss_t.hpp"
+#include "jas_net_t.hpp"
+#include "jas_mat_init_t.hpp"
+#include "jas_loss_t.hpp"
 #include "test_helpers.hpp"
 
 

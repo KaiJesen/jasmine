@@ -1,12 +1,12 @@
-#ifndef __MAT_KV_CACHE_T_HPP__
-#define __MAT_KV_CACHE_T_HPP__
+#ifndef __JAS_KV_CACHE_T_HPP__
+#define __JAS_KV_CACHE_T_HPP__
 
 #include <algorithm>
 #include <stdexcept>
 
-#include "mat_concepts.hpp"
-#include "mat_t.hpp"
-#include "mat_view_t.hpp"
+#include "jas_mat_concepts.hpp"
+#include "jas_mat_t.hpp"
+#include "jas_mat_view_t.hpp"
 
 namespace jasmine {
 

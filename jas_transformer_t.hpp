@@ -1,15 +1,15 @@
-#ifndef __MAT_TRANSFORMER_T_HPP__
-#define __MAT_TRANSFORMER_T_HPP__
+#ifndef __JAS_TRANSFORMER_T_HPP__
+#define __JAS_TRANSFORMER_T_HPP__
 
 /* 
  * @brief: 组装transformer编解码器接口。位置编码采用 RoPE，作用在各层 MHA/MHCA 的 Q/K 上
  *         （经 rope_registry 按 d_head 共享），而不是在进 encoder/decoder 前旋转整段输入。
 */
 
-#include "mat_net_t.hpp"
-#include "mat_transformer_kernel_t.hpp"
-#include "mat_RoPE_t.hpp"
-#include "mat_loss_t.hpp"
+#include "jas_net_t.hpp"
+#include "jas_transformer_kernel_t.hpp"
+#include "jas_RoPE_t.hpp"
+#include "jas_loss_t.hpp"
 
 namespace jasmine {
 

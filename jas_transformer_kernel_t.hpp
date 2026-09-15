@@ -1,8 +1,8 @@
-#ifndef __MAT_TRANSFORMER_KERNEL_T_HPP__
-#define __MAT_TRANSFORMER_KERNEL_T_HPP__
+#ifndef __JAS_TRANSFORMER_KERNEL_T_HPP__
+#define __JAS_TRANSFORMER_KERNEL_T_HPP__
 
-#include "mat_net_t.hpp"
-#include "mat_mha_t.hpp"
+#include "jas_net_t.hpp"
+#include "jas_mha_t.hpp"
 
 namespace jasmine {
 

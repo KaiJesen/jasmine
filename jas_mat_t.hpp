@@ -1,5 +1,5 @@
-#ifndef _MAT_T_HPP_
-#define _MAT_T_HPP_
+#ifndef _JAS_MAT_T_HPP_
+#define _JAS_MAT_T_HPP_
 #include <cstring>
 #include <tuple>
 #include <string>
@@ -7,7 +7,7 @@
 
 #include <iostream>
 
-#include "mat_utility.hpp"
+#include "jas_mat_utility.hpp"
 
 namespace jasmine {
 

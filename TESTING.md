@@ -25,4 +25,4 @@ ctest --test-dir build --output-on-failure
 ./build/examples/train_tf_kernel
 ```
 
-`transformer_test.hpp` keeps the training harness helpers (`test_transformer_t`, SOS/EOS utilities), not executable `test_*` entrypoints.
+`jas_transformer_test.hpp` keeps the training harness helpers (`test_transformer_t`, SOS/EOS utilities), not executable `test_*` entrypoints.

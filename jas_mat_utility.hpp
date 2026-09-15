@@ -1,8 +1,8 @@
-#ifndef __MAT_UTILITY_HPP__
-#define __MAT_UTILITY_HPP__
+#ifndef __JAS_MAT_UTILITY_HPP__
+#define __JAS_MAT_UTILITY_HPP__
 #include <math.h>
 
-#include "mat_concepts.hpp"
+#include "jas_mat_concepts.hpp"
 
 namespace jasmine {
 

@@ -1,5 +1,5 @@
-#ifndef __MAT_EXPRESS_T_HPP__
-#define __MAT_EXPRESS_T_HPP__
+#ifndef __JAS_MAT_EXPRESS_T_HPP__
+#define __JAS_MAT_EXPRESS_T_HPP__
 #include <cassert>
 #include <cmath>
 #include <sstream>
@@ -8,9 +8,9 @@
 #include <vector>
 #include <numeric>
 
-#include "mat_concepts.hpp"
-#include "mat_view_t.hpp"
-#include "mat_gemm.hpp"
+#include "jas_mat_concepts.hpp"
+#include "jas_mat_view_t.hpp"
+#include "jas_mat_gemm.hpp"
 
 namespace jasmine {
 

@@ -1,11 +1,11 @@
-#ifndef __TRANSFORMER_TEST_HPP__
-#define __TRANSFORMER_TEST_HPP__
+#ifndef __JAS_TRANSFORMER_TEST_HPP__
+#define __JAS_TRANSFORMER_TEST_HPP__
 
-#include "mat_t.hpp"
-#include "mat_view_t.hpp"
-#include "mat_transformer_t.hpp"
-#include "mat_transformer_kernel_t.hpp"
-#include "mat_net_t.hpp"
+#include "jas_mat_t.hpp"
+#include "jas_mat_view_t.hpp"
+#include "jas_transformer_t.hpp"
+#include "jas_transformer_kernel_t.hpp"
+#include "jas_net_t.hpp"
 #include <iomanip>
 
 namespace jasmine {

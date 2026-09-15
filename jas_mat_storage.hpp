@@ -1,7 +1,7 @@
-#ifndef _MAT_STORAGE_HPP_
-#define _MAT_STORAGE_HPP_
+#ifndef _JAS_MAT_STORAGE_HPP_
+#define _JAS_MAT_STORAGE_HPP_
 
-#include "mat_t.hpp"
+#include "jas_mat_t.hpp"
 
 namespace jasmine {
 namespace detail {

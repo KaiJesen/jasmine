@@ -1,11 +1,11 @@
-#ifndef _MAT_GEMM_HPP_
-#define _MAT_GEMM_HPP_
+#ifndef _JAS_MAT_GEMM_HPP_
+#define _JAS_MAT_GEMM_HPP_
 
 #include <algorithm>
 #include <cstddef>
 #include <type_traits>
 
-#include "mat_t.hpp"
+#include "jas_mat_t.hpp"
 
 #ifdef JASMINE_USE_OPENMP
 #include <omp.h>

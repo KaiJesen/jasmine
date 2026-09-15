@@ -1,14 +1,14 @@
-#ifndef __MAT_NET_T_HPP__
-#define __MAT_NET_T_HPP__
+#ifndef __JAS_NET_T_HPP__
+#define __JAS_NET_T_HPP__
 
 #include <string>
 #include <sstream>
 
-#include "mat_t.hpp"
-#include "mat_express_t.hpp"
-#include "mat_storage.hpp"
+#include "jas_mat_t.hpp"
+#include "jas_mat_express_t.hpp"
+#include "jas_mat_storage.hpp"
 
-#include "mat_updator_t.hpp"
+#include "jas_updator_t.hpp"
 
 namespace jasmine {
 

@@ -9,7 +9,7 @@
 ## P0 — 正确性（先修）
 
 - [x] **RoPE 2×2 共用同一 θ**
-  - 文件：`mat_RoPE_t.hpp`
+  - 文件：`jas_RoPE_t.hpp`
   - 问题：同一旋转块的 cos / −sin 使用了不同的角度索引，不是正交 2×2
   - 验收：单元测试对比已知角度的旋转结果（黄金值）
 
@@ -33,7 +33,7 @@
 ## P1 — 模型结构保真
 
 - [x] **MHA 改为经典「全维 QKV → 按头拆分」**
-  - 文件：`mat_mha_t.hpp`
+  - 文件：`jas_mha_t.hpp`
   - 现状：`W_Q/W_K/W_V` 在 `mat_mha_t` 全维投影，再 `vsplit` 到各头 attend；头内不再自带小投影
   - 目标：`W_Q,W_K,W_V ∈ R^{d_model×d_model}`（或等价），再 reshape/split heads，最后 concat + `W_O`
   - 验收：shape 测试 + 与单头全维注意力在 `num_heads=1` 时一致（`Mha.SingleHeadCanFitSimpleTarget`）
@@ -42,7 +42,7 @@
   - 与 self-attn 同一套 head 约定，避免两套语义
 
 - [x] **修正过时注释**
-  - 例：`mat_mha_t.hpp` 中 encoder 梯度「记得除以层数」——当前实现是累加后一次 `backward`，不应除
+  - 例：`jas_mha_t.hpp` 中 encoder 梯度「记得除以层数」——当前实现是累加后一次 `backward`，不应除
   - 已改为：K/V 全维梯度直接累加到 `encoder_delta`
 
 ---
@@ -52,8 +52,8 @@
 ## P2 — 推理与训练效率
 
 - [x] **Decoder self-attn KV cache**
-  - 场景：`predict` 逐步生成（`transformer_test.hpp`）
-  - 实现：`mat_kv_cache_t.hpp` + `mat_mha_t::forward_one` / `decoder_t::forward_one`；cache 存 RoPE 后的 K/V
+  - 场景：`predict` 逐步生成（`jas_transformer_test.hpp`）
+  - 实现：`jas_kv_cache_t.hpp` + `mat_mha_t::forward_one` / `decoder_t::forward_one`；cache 存 RoPE 后的 K/V
   - 验收：`tests/test_kv_cache.cpp` 逐步输出与无 cache 全量 forward 一致；`predict` 走 `complex_net_t::infer`（`skip_on_infer` 层被跳过）
 
 - [x] **Encoder memory 复用**
@@ -67,18 +67,18 @@
   - 整段一次前向保持简单；cache 仅 inference / AR 使用（`forward` 训练 vs `infer` 推理，结构同一 `net_type`）
 
 - [x] **评估 OpenMP 落点（有收益再开）**
-  - `mat_gemm.hpp`：大 GEMM（`MNK≥64³`）对单线程 BLAS 按行分片并行；blocked fallback 外层并行
-  - `mat_mha_t.hpp`：大 shape 下 QKV 三投影 `sections` 并行；多 head attend `parallel for`（阈值：`heads·seq·d_head≥4·32·32`）
+  - `jas_mat_gemm.hpp`：大 GEMM（`MNK≥64³`）对单线程 BLAS 按行分片并行；blocked fallback 外层并行
+  - `jas_mha_t.hpp`：大 shape 下 QKV 三投影 `sections` 并行；多 head attend `parallel for`（阈值：`heads·seq·d_head≥4·32·32`）
   - **小矩阵 / 短序列不并行**（`if` 阈值）
   - 验收：`doc/bench/openmp_*.txt`；小 shape 不回归，大 shape 有加速
 
 - [x] **大矩阵走 BLAS / 优化 GEMM（可选）**
-  - `mat_gemm.hpp`：大矩阵 `mat_dot_t::clone` 走 cache-blocked GEMM；若找到 `libblas`/`openblas` 则 `cblas_sgemm/dgemm`（`JASMINE_USE_BLAS`）
+  - `jas_mat_gemm.hpp`：大矩阵 `mat_dot_t::clone` 走 cache-blocked GEMM；若找到 `libblas`/`openblas` 则 `cblas_sgemm/dgemm`（`JASMINE_USE_BLAS`）
   - 验收：`tests/test_gemm.cpp`；`doc/bench/matmul_*.txt` 中 `BM_MatDot` 在 `n≥256` 有数量级加速
   - 基线（Release，优化前）→ 优化后对比见 `doc/bench/`
 
 - [x] **削减不必要的** `.clone()`
-  - `mat_storage.hpp::store_for_backward` + 层间 `net_forward` 完美转发（mat rvalue 移动）
+  - `jas_mat_storage.hpp::store_for_backward` + 层间 `net_forward` 完美转发（mat rvalue 移动）
   - 推理 KV：attend 直接读 cache view，不再每步 clone 全量 K/V
   - 层 forward/backward 去掉与 `operator mat_t()` 重复的 `.clone()`；`fill_kv_cache` 视图直 append
   - 验收：`tests/` 全绿；`doc/bench/clone_reduction_*.txt` 对比

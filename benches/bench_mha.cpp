@@ -1,6 +1,6 @@
 #include <benchmark/benchmark.h>
-#include "mat_mha_t.hpp"
-#include "mat_init_t.hpp"
+#include "jas_mha_t.hpp"
+#include "jas_mat_init_t.hpp"
 
 
 using namespace jasmine;

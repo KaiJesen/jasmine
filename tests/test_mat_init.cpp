@@ -1,7 +1,7 @@
 #include <cmath>
 #include <gtest/gtest.h>
-#include "mat_t.hpp"
-#include "mat_init_t.hpp"
+#include "jas_mat_t.hpp"
+#include "jas_mat_init_t.hpp"
 
 
 using namespace jasmine;

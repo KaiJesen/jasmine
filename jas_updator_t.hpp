@@ -1,10 +1,10 @@
-#ifndef __MAT_UPDATOR_T_HPP__
-#define __MAT_UPDATOR_T_HPP__
+#ifndef __JAS_UPDATOR_T_HPP__
+#define __JAS_UPDATOR_T_HPP__
 
-#include "mat_t.hpp"
-#include "mat_express_t.hpp"
-#include "mat_net_t.hpp"
-#include "mat_init_t.hpp"
+#include "jas_mat_t.hpp"
+#include "jas_mat_express_t.hpp"
+#include "jas_net_t.hpp"
+#include "jas_mat_init_t.hpp"
 
 namespace jasmine {
 

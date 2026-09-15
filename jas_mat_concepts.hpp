@@ -1,5 +1,5 @@
-#ifndef __MAT_CONCEPTS_HPP__
-#define __MAT_CONCEPTS_HPP__
+#ifndef __JAS_MAT_CONCEPTS_HPP__
+#define __JAS_MAT_CONCEPTS_HPP__
 #include <vector>
 #include <type_traits>
 

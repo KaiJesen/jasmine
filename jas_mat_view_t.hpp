@@ -1,8 +1,8 @@
-#ifndef __MAT_VIEW_T_HPP__
-#define __MAT_VIEW_T_HPP__ 
-#include "mat_concepts.hpp"
-#include "mat_t.hpp"
-#include "mat_utility.hpp"
+#ifndef __JAS_MAT_VIEW_T_HPP__
+#define __JAS_MAT_VIEW_T_HPP__ 
+#include "jas_mat_concepts.hpp"
+#include "jas_mat_t.hpp"
+#include "jas_mat_utility.hpp"
 
 namespace jasmine {
 
@@ -105,7 +105,7 @@ public:
 
     template<typename other_type>
     requires is_matrix<other_type>
-    auto dot(const other_type& m) const;    // 实现放到mat_express_t.hpp中，因为此时还没有定义全局的dot函数
+    auto dot(const other_type& m) const;    // 实现放到jas_mat_express_t.hpp中，因为此时还没有定义全局的dot函数
 
     operator agent_type() const
     {

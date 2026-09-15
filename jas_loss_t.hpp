@@ -1,12 +1,12 @@
-#ifndef __MAT_LOSS_T_HPP__
-#define __MAT_LOSS_T_HPP__
+#ifndef __JAS_LOSS_T_HPP__
+#define __JAS_LOSS_T_HPP__
 
 #include <sstream>
 #include <string>
 
-#include "mat_concepts.hpp"
-#include "mat_express_t.hpp"
-#include "mat_storage.hpp"
+#include "jas_mat_concepts.hpp"
+#include "jas_mat_express_t.hpp"
+#include "jas_mat_storage.hpp"
 
 namespace jasmine {
 

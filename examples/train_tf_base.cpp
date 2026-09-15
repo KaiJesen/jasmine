@@ -1,7 +1,7 @@
 #include <iostream>
-#include "mat_transformer_t.hpp"
-#include "mat_init_t.hpp"
-#include "mat_loss_t.hpp"
+#include "jas_transformer_t.hpp"
+#include "jas_mat_init_t.hpp"
+#include "jas_loss_t.hpp"
 
 
 using namespace jasmine;
