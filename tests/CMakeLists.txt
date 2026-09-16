@@ -34,6 +34,7 @@ gtest_discover_tests(unit_tests)
 if(JASMINE_USE_CUDA)
   add_executable(cuda_tests
     test_cuda_fused.cu
+    test_cuda_reduce.cu
   )
 
   target_link_libraries(cuda_tests

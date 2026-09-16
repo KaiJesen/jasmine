@@ -604,28 +604,50 @@ ASAN_OPTIONS=detect_leaks=0 ./build-asan/tests/unit_tests --gtest_filter='-Llama
 
 ### 设备扩展（CUDA 分支新增）
 
-同一套存储策略被 CUDA 后端原样复用，只加了两样东西：
+同一套存储策略被 CUDA 后端原样复用，只加了三样东西：
 
 1. **标量存储从 `mat_t` 换成 `scalar_leaf_t`**。原来是「包成 1×1 的 `mat_t`」，但 `mat_t`
    用 `new[]` 拿内存、`m_data` 指向**主机地址** —— 表达式一旦上设备，设备端解引用它必崩。
    换成只含一个值的 POD 之后主机设备语义一致，也省掉了每次的分配与 `%` 取模。
-2. **`operand_owned_by_value` 定制点**，让设备叶子即使以具名左值出现也按值拥有。
-   设备端不存在"主机对象的地址"，所以引用在那里毫无意义，必须拷贝薄壳。
+2. **「按值拥有」的判据从「设备叶子」放宽到「设备可求值」**。最初只给 `dev_mat_t` 开了
+   `operand_owned_by_value`，结果漏掉一个隐蔽的坑：接口形如 `softmax_rows(Expr const& x)` 时，
+   传进来的具名表达式节点是**左值**，会被按引用借进派生出的子树；树能编译、能拷贝、
+   `is_trivially_copyable` 也为真，但 kernel 参数是按值搬到设备上的，搬过去的是**主机栈地址**，
+   设备端一解引用就是 `cudaErrorIllegalAddress`。现在判据是
+
+   ```cpp
+   operand_owned_by_value<raw_type> || is_device_evaluable_v<raw_type>
+   ```
+
+   因为 `device_evaluable` 沿类型树递归传播，等价于**凡是设备树就全程自持**。
+   主机树不受影响（`mat_t` 不是设备可求值），零拷贝的卖点仍然成立。
+3. **`is_self_contained_v` 编译期哨兵**：拿「拷贝赋值是否可用」当「树里没有引用成员」的代理指标
+   （含引用成员的类，隐式拷贝赋值会被删除），把上面那个运行期段错误扭成构建失败。
+   注意 `is_trivially_copyable` **拦不住**这类错误 —— 它只保证没有非平凡的特殊成员函数，
+   与引用指向哪里完全无关。
 
 `JAS_HD`（CUDA 下展开为 `__host__ __device__`，否则为空）只加在 `row_num` / `col_num` /
-`operator()` / `work()` 上；`std::exp` / `std::max` 在设备端不可用这类差异都在
-`jas_cuda_compat.hpp` 里收口（`device_exp` / `device_max`）。
+`operator()` / `work()` 上；`std::exp` / `std::max` / `std::sqrt` 在设备端不可用这类差异都在
+`jas_cuda_compat.hpp` 里收口（`device_exp` / `device_max` / `device_sqrt`）。
+归约 kernel 用到的 `__syncthreads` / `warpSize` 是设备独有，故另有 `JAS_DEV`（仅 `__device__`）。
 `device_evaluable` 沿类型树递归传播，启动 kernel 前 `static_assert` 拦下主机表达式。
 
-`tests/test_cuda_fused.cu` 覆盖这些契约（编译期断言 + 运行期对拍）。细节见 `CUDA.md`。
+设备端的归约入口刻意**不叫**主机端的 `hsum` / `vsum` / `hsoftmax`，而叫
+`row_sum` / `col_sum` / `softmax_rows`：设备叶子与主机表达式同住 `jasmine` 命名空间，
+同名会让 ADL 把主机重载静默拉进候选集，产生极难定位的错误。
+
+`tests/test_cuda_fused.cu` 覆盖逐元素/GEMM 契约，`tests/test_cuda_reduce.cu` 覆盖归约、
+softmax、归一化层与注意力端到端（编译期断言 + 与主机逐元素对拍）。细节见 `CUDA.md`。
 
 ### 相关文件
 
 | 文件 | 作用 |
 |------|------|
-| `jas_mat_express_t.hpp` | `storage_of` / `storage_type` 存储策略；`scalar_leaf_t`；各表达式节点与运算符；`mat_dot_t` |
+| `jas_mat_express_t.hpp` | `storage_of` / `storage_type` 存储策略；`scalar_leaf_t`；`is_self_contained_v`；各表达式节点与运算符；`mat_dot_t` |
 | `jas_mat_concepts.hpp` | `is_caculable`（判标量前 `remove_cvref`） |
 | `jas_mat_t.hpp` / `jas_mat_view_t.hpp` | `.dot()` 的 ref-qualified 声明；访问器的 `JAS_HD` 标注 |
-| `jas_cuda_compat.hpp` | `JAS_HD`、设备安全数学、`device_evaluable` 探测 |
+| `jas_cuda_compat.hpp` | `JAS_HD` / `JAS_DEV`、设备安全数学、`device_evaluable` 探测 |
+| `jas_cuda_reduce.hpp` | 广播叶子、`dev_colvec_t`/`dev_rowvec_t`、归约 kernel、`softmax_rows` / `layer_norm` / `rms_norm` |
 | `tests/test_expression_lifetime.cpp` | `ExpressionLifetime.*`：值类别契约 + 生命周期回归 |
 | `tests/test_cuda_fused.cu` | `CudaEnvironment.*` / `CudaDeviceTest.*`：设备契约 + 融合/GEMM 对拍 |
+| `tests/test_cuda_reduce.cu` | `CudaReduceContract.*` / `CudaReduceTest.*`：归约、softmax、归一化、注意力端到端 |

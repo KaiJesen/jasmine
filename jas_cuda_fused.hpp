@@ -53,7 +53,7 @@ __global__ void fused_elementwise_kernel(Expr expr,
     out[idx] = static_cast<typename Expr::ele_type>(expr(i, j));
 }
 
-/** 编译期把「能不能上设备」和「能不能当 kernel 参数」两个条件一次问清楚。 */
+/** 编译期把「能不能上设备」和「能不能当 kernel 参数」三个条件一次问清楚。 */
 template <typename Expr>
 constexpr void assert_device_ready()
 {
@@ -61,9 +61,13 @@ constexpr void assert_device_ready()
                   "这个表达式含有无法在设备上求值的操作数（例如 mat_t / mat_view_t）。"
                   "设备表达式必须由 dev_mat_t 叶子构成；dot / softmax 也不能逐元素融合，"
                   "它们需要专用 kernel 或 cuBLAS。");
+    static_assert(is_self_contained_v<Expr>,
+                  "表达式树里有引用成员，不能作为 kernel 参数。kernel 参数是【按值】搬到设备上的，"
+                  "引用成员搬过去的是主机地址，设备端一解引用就是 cudaErrorIllegalAddress。"
+                  "凡 device_evaluable 的操作数都应当被按值拥有 —— 若这里失败，"
+                  "检查 storage_of 的 owned_by_value 是否覆盖了该操作数类型。");
     static_assert(std::is_trivially_copyable_v<Expr>,
-                  "kernel 参数必须平凡可拷贝。表达式树本应如此 —— 若这里失败，"
-                  "说明某个操作数被按引用持有了（见 operand_owned_by_value）。");
+                  "kernel 参数必须平凡可拷贝。设备叶子与节点都是 POD，本应如此。");
 }
 
 } // namespace detail

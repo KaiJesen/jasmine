@@ -21,9 +21,17 @@
  */
 #define JAS_HD __host__ __device__
 #define JAS_INLINE_HD __host__ __device__ inline
+/**
+ * 只能由设备调用的函数。
+ *
+ * 块内归约用到的 `__syncthreads()` 和 `warpSize` 都是设备独有的，
+ * 标成 `__host__ __device__` 会被 nvcc 直接拒绝。
+ */
+#define JAS_DEV __device__
 #else
 #define JAS_HD
 #define JAS_INLINE_HD inline
+#define JAS_DEV
 #endif
 
 namespace jasmine {
@@ -64,6 +72,25 @@ template <typename T>
 JAS_INLINE_HD T device_max(T a, T b)
 {
     return a > b ? a : b;
+}
+
+/** 标量开方。同 device_exp：设备端必须用全局命名空间的 `::sqrt` / `::sqrtf`。 */
+JAS_INLINE_HD double device_sqrt(double x)
+{
+#if defined(__CUDA_ARCH__)
+    return ::sqrt(x);
+#else
+    return std::sqrt(x);
+#endif
+}
+
+JAS_INLINE_HD float device_sqrt(float x)
+{
+#if defined(__CUDA_ARCH__)
+    return ::sqrtf(x);
+#else
+    return std::sqrt(x);
+#endif
 }
 
 } // namespace detail

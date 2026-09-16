@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -19,7 +20,10 @@
 #include "jas_cuda_gemm.hpp"
 #include "jas_cuda_leaf.hpp"
 #include "jas_cuda_matrix.hpp"
+#include "jas_cuda_reduce.hpp"
 #include "jas_mat_t.hpp"
+#include "jas_net_t.hpp"
+#include "jas_updator_t.hpp"
 
 using namespace jasmine;
 
@@ -192,6 +196,71 @@ int main(int argc, char** argv)
     std::printf("  Q: %d×%d，K: %d×%d → S: %d×%d\n", seq, dim, seq, dim, s_dev.row_num(),
                 s_dev.col_num());
     print_diff(s_dev, s_host);
+
+    // ---------------------------------------------------------------------
+    // 归约：逐行 softmax（把 mask 直接加进表达式）
+    // ---------------------------------------------------------------------
+    std::printf("\n=== 逐行 softmax（因果掩码 + 数值稳定）===\n");
+    const int t = 128;
+    auto hs = make_host(t, t, 0.05);
+    cuda::dev_matrix_t<double> dscores(t, t, hs);
+
+    // 掩码做成叶子：0 或 -inf，于是「缩放 + 掩码」在融合途中一次完成
+    mat_t<double> mask_h(t, t);
+    mask_h = 0.0;
+    for (int i = 0; i < t; ++i)
+        for (int j = i + 1; j < t; ++j)
+            mask_h(i, j) = -std::numeric_limits<double>::infinity();
+    cuda::dev_matrix_t<double> dmask(t, t, mask_h);
+
+    auto w_dev = cuda::softmax_rows(dscores.leaf() * 0.125 + dmask.leaf()).download();
+
+    auto masked_h = (hs * 0.125).clone();
+    for (int i = 0; i < t; ++i)
+        for (int j = i + 1; j < t; ++j)
+            masked_h(i, j) = -std::numeric_limits<double>::infinity();
+    auto w_host = hsoftmax(masked_h);
+
+    print_diff(w_dev, w_host);
+    double worst_row_sum_err = 0.0;
+    for (int i = 0; i < t; ++i)
+    {
+        double s = 0.0;
+        for (int j = 0; j <= i; ++j)
+            s += w_dev(i, j);
+        worst_row_sum_err = std::max(worst_row_sum_err, std::abs(s - 1.0));
+    }
+    std::printf("  每行概率和与 1 的最大偏差: %.3e\n", worst_row_sum_err);
+
+    // ---------------------------------------------------------------------
+    // 归一化层：RMSNorm / LayerNorm
+    // ---------------------------------------------------------------------
+    std::printf("\n=== 归一化层（统计量沿行方向算，对齐 jas_net_t.hpp）===\n");
+    const int d_model = 256, seq2 = 16;
+    auto hx = make_host(d_model, seq2, 0.2);
+    cuda::dev_matrix_t<double> dx(d_model, seq2, hx);
+
+    // gamma 是 (d_model × 1) 的列向量，沿列广播 —— 与主机端 m_gama 的形状一致
+    cuda::dev_colvec_t<double> gamma(d_model);
+    rms_norm_net_t<mat_t<double>, nadam_t> rn;
+    rn.set_param(d_model);
+    gamma.buffer().upload(rn.gama().data(), d_model);
+
+    auto rms_dev = cuda::rms_norm(dx.leaf(), gamma, rn.eps()).download();
+    auto rms_host = rn.forward(hx);
+    std::printf("  RMSNorm（%d×%d）\n", d_model, seq2);
+    print_diff(rms_dev, rms_host);
+
+    cuda::dev_colvec_t<double> ln_gamma(d_model), ln_beta(d_model);
+    layer_norm_net_t<mat_t<double>, nadam_t> ln;
+    ln.set_param(d_model);
+    ln_gamma.buffer().upload(ln.gama().data(), d_model);
+    ln_beta.buffer().upload(ln.beta().data(), d_model);
+
+    auto ln_dev = cuda::layer_norm(dx.leaf(), ln_gamma, ln_beta).download();
+    auto ln_host = ln.forward(hx);
+    std::printf("  LayerNorm（%d×%d）\n", d_model, seq2);
+    print_diff(ln_dev, ln_host);
 
     print_temperature();
     return 0;

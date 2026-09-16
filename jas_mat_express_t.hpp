@@ -85,11 +85,40 @@ template <typename T>
 struct storage_of<T, false>
 {
     using raw_type = std::remove_cvref_t<T>;
-    // 左值：借引用（零拷贝）；右值：按值拥有；设备叶子：即使左值也按值拥有（见 operand_owned_by_value）
+
+    /**
+     * 该操作数是否必须按值拥有。
+     *
+     *  - `operand_owned_by_value`：设备叶子（`dev_mat_t` 等）即使作为左值也必须拷进树里。
+     *  - `is_device_evaluable_v`：设备**表达式节点**同理，这条是后补的、也是必需的。
+     *
+     * 后者曾经被漏掉，导致一个只在设备上才暴露的 bug：`softmax_rows(x)` 这类接口形参是
+     * `Expr const&`，于是 `x` 是【左值】，被按引用借进派生出的子树里。树本身能编译、能拷贝、
+     * `is_trivially_copyable` 也为真（含引用成员的类是平凡可拷贝的！），
+     * 但 kernel 参数是**按值搬到设备上**的 —— 搬过去的是那个【主机栈地址】，
+     * 设备端一解引用就 cudaErrorIllegalAddress。
+     *
+     * 主机端没有这个问题，因为求值和数据在同一块栈上。所以规则是分层的：
+     * 主机树可以放心借引用（零拷贝，这正是表达式模板省下临时量的关键），
+     * 设备树必须自持。而「整棵树是否要上设备」正好由 `device_evaluable` 逐层传播给出。
+     */
+    static constexpr bool owned_by_value =
+        operand_owned_by_value<raw_type> || is_device_evaluable_v<raw_type>;
+
+    // 左值且无需按值拥有 → 借引用（零拷贝）；否则按值拥有
     using type = std::conditional_t<
-        std::is_lvalue_reference_v<T> && !operand_owned_by_value<raw_type>,
-        raw_type const&, raw_type>;
+        std::is_lvalue_reference_v<T> && !owned_by_value, raw_type const&, raw_type>;
 };
+
+/**
+ * 表达式树是否「自持」：所有操作数都按值拥有，树里不含任何引用成员。
+ *
+ * 这是设备求值的硬性前提（原因见上面 `owned_by_value` 的说明）。用一个代理指标探测：
+ * 含引用成员（或 const 成员）的类，隐式拷贝赋值会被删除。
+ * 对本项目的表达式节点足够精确 —— 它们的成员只有操作数存储。
+ */
+template <typename T>
+inline constexpr bool is_self_contained_v = std::is_copy_assignable_v<T>;
 
 template <typename T>
 using storage_type = typename storage_of<
