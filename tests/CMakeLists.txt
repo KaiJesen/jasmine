@@ -39,6 +39,8 @@ if(JASMINE_USE_CUDA)
     test_cuda_kv_cache.cu
     test_cuda_rope.cu
     test_cuda_backward.cu
+    test_cuda_attention.cu
+    test_cuda_precision.cu
     test_cuda_mha.cu
     test_cuda_llama.cu
   )

@@ -39,12 +39,24 @@
  * 所以最大偏移落在缓冲区实长之内。即「按 cap 分配、只暴露前 len 列」多出来的
  * 那段空间永远不会被 GEMM 碰到 —— 这正是子视图能零拷贝的直接原因。
  *
- * ## 精度：默认不用 TF32
+ * ## 精度：默认不用 TF32，降精度一律 fp32 累加
  *
  * Ampere 及以后单精度 GEMM 可以走 TF32 张量核（尾数只剩 10 位），而开不开取决于
  * math mode 与环境变量 —— 于是「同一份代码在不同机器上数值不同」。
  * 本项目整套测试的基准就是「与主机参考逐元素对齐」，所以默认钉死 `gemm_math::precise`
  * （`CUBLAS_PEDANTIC_MATH`），要 TF32 得显式 `set_gemm_math(gemm_math::tf32)`。
+ *
+ * `bf16` / `fp16` 操作数走另一条路：`cublasGemmEx` + **写死的 `CUBLAS_COMPUTE_32F`**。
+ * 注意这是"策略"而不是"默认值"—— 累加类型刻意**不**跟着操作数走，也刻意不跟着
+ * `gemm_math` 开关走：
+ *
+ *  - 跟着操作数走（`COMPUTE_16F`）的话，`K` 项用 8~11 位有效数字累加，
+ *    误差到 `K · u` 量级，等于白算（见 jas_cuda_precision.hpp 的误差模型）；
+ *  - 跟着 math mode 走的话，同一份代码在有的机器上走 TF32、有的走纯 fp32，
+ *    而这里恰恰是"要一个确定的累加精度"才成立。
+ *
+ * 于是降精度路径的性质是**可以说清楚的**：乘积精确（`bf16`/`fp16` 的尾数之积塞得下
+ * `fp32`），误差只来自操作数量化与 fp32 累加两项，各有闭式上界。
  */
 
 #include <cstddef>
@@ -58,6 +70,7 @@
 #include "jas_cuda_fused.hpp"
 #include "jas_cuda_leaf.hpp"
 #include "jas_cuda_matrix.hpp"
+#include "jas_cuda_precision.hpp"
 
 namespace jasmine {
 namespace cuda {
@@ -171,20 +184,12 @@ inline void set_gemm_math(gemm_math mode)
     detail::gemm_math_mode_ref() = mode;
 }
 
-/**
- * 行优先矩阵乘：`C = alpha * opA(A) * opB(B) + beta * C`。
- *
- * 转置由叶子的转置视图表达（`A.t()`），不需要额外参数：
- *   - `gemm(A, B, C)`           → C = A·B
- *   - `gemm(A.t(), B, C)`       → C = Aᵀ·B
- *   - `gemm(Q, K.t(), S)`       → S = Q·Kᵀ，正是注意力打分那一步
- *
- * 输出 `C` 必须已经指向一块够大的设备内存（用 dev_matrix_t 分配）。
- * 叶子本身只是薄壳，是否写它由 beta/使用方式决定。
- */
-template <typename T>
-void gemm(const dev_mat_t<T>& A, const dev_mat_t<T>& B, const dev_mat_t<T>& C,
-          T alpha = T(1), T beta = T(0))
+namespace detail {
+
+/** 三种类型组合共用的形状检查；`who` 用于把报错指回具体那个入口。 */
+template <typename TA, typename TB, typename TC>
+void check_gemm_shapes(const dev_mat_t<TA>& A, const dev_mat_t<TB>& B, const dev_mat_t<TC>& C,
+                       const char* who)
 {
     // opA(A) 是 M×K，opB(B) 是 K×N（row_num/col_num 已经把转置考虑进去了）
     const int M = A.row_num();
@@ -193,14 +198,33 @@ void gemm(const dev_mat_t<T>& A, const dev_mat_t<T>& B, const dev_mat_t<T>& C,
 
     if (B.row_num() != K)
         throw std::invalid_argument(
-            "gemm: 内维不匹配 —— opA(A) 的列数 " + std::to_string(K)
+            std::string(who) + ": 内维不匹配 —— opA(A) 的列数 " + std::to_string(K)
             + " != opB(B) 的行数 " + std::to_string(B.row_num()));
     if (C.row_num() != M || C.col_num() != N)
         throw std::invalid_argument(
-            "gemm: 输出形状不对，应为 " + std::to_string(M) + "×" + std::to_string(N)
-            + "，实际 " + std::to_string(C.row_num()) + "×" + std::to_string(C.col_num()));
+            std::string(who) + ": 输出形状不对，应为 " + std::to_string(M) + "×"
+            + std::to_string(N) + "，实际 " + std::to_string(C.row_num()) + "×"
+            + std::to_string(C.col_num()));
     if (!A.valid() || !B.valid() || !C.valid())
-        throw std::invalid_argument("gemm: 有操作数还是空叶子");
+        throw std::invalid_argument(std::string(who) + ": 有操作数还是空叶子");
+}
+
+/**
+ * `cublasGemmEx` 的公共实现。**累加类型在这里写死**，见文件头的说明。
+ *
+ * `cublasGemmEx` 的 `alpha`/`beta` 必须按**累加类型**给指针类型（`COMPUTE_32F` 就是
+ * `const float*`），所以这里收 `double` 再按累加类型转一次 —— 顺手把"输出类型是
+ * 降精度、`alpha` 只能有 8 位有效数字"这件事也明确下来了。
+ */
+template <typename TA, typename TB, typename TC>
+void gemm_ex(const dev_mat_t<TA>& A, const dev_mat_t<TB>& B, const dev_mat_t<TC>& C, double alpha,
+             double beta, const char* who)
+{
+    check_gemm_shapes(A, B, C, who);
+
+    const int M = A.row_num();
+    const int K = A.col_num();
+    const int N = B.col_num();
 
     // 前导维必须用未转置解释的存储步长
     const int lda = A.leading_dim();
@@ -211,22 +235,102 @@ void gemm(const dev_mat_t<T>& A, const dev_mat_t<T>& B, const dev_mat_t<T>& C,
     const cublasOperation_t opA = A.transposed() ? CUBLAS_OP_T : CUBLAS_OP_N;
     const cublasOperation_t opB = B.transposed() ? CUBLAS_OP_T : CUBLAS_OP_N;
 
-    if constexpr (std::is_same_v<T, float>)
+    // 累加类型：输入里只要有降精度，就一律 fp32（不能是 fp64 —— cuBLAS 不接受
+    // "输入 16 位、累加 64 位"这种精度倒挂的组合）。全是 double 才走 64 位。
+    constexpr bool wide = std::is_same_v<TA, double> && std::is_same_v<TB, double>
+                          && std::is_same_v<TC, double>;
+    const cublasComputeType_t compute = wide ? CUBLAS_COMPUTE_64F : CUBLAS_COMPUTE_32F;
+
+    // 注意实参顺序：列优先下算的是 Cᵀ = Bᵀ·Aᵀ，所以 B 在前、A 在后，N 在前、M 在后
+    if constexpr (wide)
     {
-        // 注意实参顺序：列优先下算的是 Cᵀ = Bᵀ·Aᵀ，所以 B 在前、A 在后，N 在前、M 在后
-        JAS_CUBLAS_CHECK(cublasSgemm(cublas_handle(), opB, opA, N, M, K, &alpha,
-                                     B.m_data, ldb, A.m_data, lda, &beta, C.m_data, ldc));
-    }
-    else if constexpr (std::is_same_v<T, double>)
-    {
-        JAS_CUBLAS_CHECK(cublasDgemm(cublas_handle(), opB, opA, N, M, K, &alpha,
-                                     B.m_data, ldb, A.m_data, lda, &beta, C.m_data, ldc));
+        JAS_CUBLAS_CHECK(cublasGemmEx(cublas_handle(), opB, opA, N, M, K, &alpha, B.m_data,
+                                      cublas_data_type_of<TB>(), ldb, A.m_data,
+                                      cublas_data_type_of<TA>(), lda, &beta, C.m_data,
+                                      cublas_data_type_of<TC>(), ldc, compute,
+                                      CUBLAS_GEMM_DEFAULT));
     }
     else
     {
-        static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>,
-                      "gemm 只支持 float / double");
+        const float a32 = static_cast<float>(alpha);
+        const float b32 = static_cast<float>(beta);
+        JAS_CUBLAS_CHECK(cublasGemmEx(cublas_handle(), opB, opA, N, M, K, &a32, B.m_data,
+                                      cublas_data_type_of<TB>(), ldb, A.m_data,
+                                      cublas_data_type_of<TA>(), lda, &b32, C.m_data,
+                                      cublas_data_type_of<TC>(), ldc, compute,
+                                      CUBLAS_GEMM_DEFAULT));
     }
+}
+
+} // namespace detail
+
+/**
+ * 行优先矩阵乘：`C = alpha * opA(A) * opB(B) + beta * C`。
+ *
+ * 转置由叶子的转置视图表达（`A.t()`），不需要额外参数：
+ *   - `gemm(A, B, C)`           → C = A·B
+ *   - `gemm(A.t(), B, C)`       → C = Aᵀ·B
+ *   - `gemm(Q, K.t(), S)`       → C = Q·Kᵀ，正是注意力打分那一步
+ *
+ * 输出 `C` 必须已经指向一块够大的设备内存（用 dev_matrix_t 分配）。
+ * 叶子本身只是薄壳，是否写它由 beta/使用方式决定。
+ *
+ * 三个操作数类型相同：`float` / `double` 走 `Sgemm`/`Dgemm`（受 math mode 控制），
+ * `bf16` / `fp16` 走 `GemmEx` + fp32 累加。
+ */
+template <typename T>
+void gemm(const dev_mat_t<T>& A, const dev_mat_t<T>& B, const dev_mat_t<T>& C,
+          T alpha = T(1), T beta = T(0))
+{
+    if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>)
+    {
+        detail::check_gemm_shapes(A, B, C, "gemm");
+
+        const int M = A.row_num();
+        const int K = A.col_num();
+        const int N = B.col_num();
+        const int lda = A.leading_dim();
+        const int ldb = B.leading_dim();
+        const int ldc = C.leading_dim();
+        const cublasOperation_t opA = A.transposed() ? CUBLAS_OP_T : CUBLAS_OP_N;
+        const cublasOperation_t opB = B.transposed() ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+        if constexpr (std::is_same_v<T, float>)
+            JAS_CUBLAS_CHECK(cublasSgemm(cublas_handle(), opB, opA, N, M, K, &alpha, B.m_data, ldb,
+                                         A.m_data, lda, &beta, C.m_data, ldc));
+        else
+            JAS_CUBLAS_CHECK(cublasDgemm(cublas_handle(), opB, opA, N, M, K, &alpha, B.m_data, ldb,
+                                         A.m_data, lda, &beta, C.m_data, ldc));
+    }
+    else if constexpr (is_reduced_precision_v<T>)
+    {
+        // 输出也是降精度：结果会被**再舍入一次**（`u_op` 量级的额外误差，与操作数的
+        // 量化同源）。要避免这一层，用下面那个"输出 fp32"的重载。
+        detail::gemm_ex(A, B, C, static_cast<double>(alpha), static_cast<double>(beta), "gemm");
+    }
+    else
+    {
+        static_assert(std::is_same_v<T, T>,
+                      "gemm 支持 float / double / bf16 / fp16 的元素类型");
+    }
+}
+
+/**
+ * 降精度操作数 + **fp32 输出**：`C(f32) = alpha · opA(A) · opB(B) + beta · C`。
+ *
+ * 为什么值得单独一个重载：输出保持 fp32 时，整条 GEMM 链路只剩两处误差 ——
+ * 操作数量化（各一次 `u_op`）与 fp32 累加（`K · u_acc`），而**结果那一次舍入没有了**。
+ * 于是"乘积精确、累加是 fp32"这条论断可以被直接验证（拿 `accumulation_error_bound`
+ * 当容差去比"先舍入再用 double 算"的参考，两边应当一致到 `K · u_acc`）。
+ *
+ * 这也正是实践里最常用的配置：权重存降精度、激活与输出保持 fp32。
+ */
+template <typename TA, typename TC>
+requires(is_reduced_precision_v<TA> && std::is_same_v<TC, float>)
+void gemm(const dev_mat_t<TA>& A, const dev_mat_t<TA>& B, const dev_mat_t<TC>& C, TC alpha = TC(1),
+          TC beta = TC(0))
+{
+    detail::gemm_ex(A, B, C, static_cast<double>(alpha), static_cast<double>(beta), "gemm");
 }
 
 /** 分配好输出、算完、拷回主机。方便和 CPU 结果对拍。 */
@@ -245,6 +349,18 @@ template <typename T>
 struct is_dev_matrix_t : std::false_type {};
 template <typename T>
 struct is_dev_matrix_t<dev_matrix_t<T>> : std::true_type {};
+
+/**
+ * 累加精度是不是 fp32 —— 降精度路径的**策略声明**，写在这里让测例能直接断言它。
+ *
+ * 它不是"顺手返回个常量"：把它做成可查询的，测试才能不依赖"读代码"来判断
+ * 降精度到底是不是 fp32 累加（读代码这件事本身没法回归测试）。
+ */
+template <typename T>
+constexpr bool gemm_accumulates_in_fp32()
+{
+    return is_reduced_precision_v<T>;
+}
 
 /**
  * 把任意操作数规约成一个 GEMM 能吃的薄壳叶子。

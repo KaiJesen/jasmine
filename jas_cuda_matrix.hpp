@@ -25,6 +25,24 @@
 namespace jasmine {
 namespace cuda {
 
+/**
+ * 这个元素类型有没有对应的主机矩阵类型。
+ *
+ * `mat_t` 的约束是算术类型，而降精度类型（`bf16` / `fp16`）不是 —— 它们既没有
+ * 主机侧的算术（`mat_t` 的成员里到处在用），也没有必要有：降精度的用法是
+ * 「在主机上产生、在设备上算、算完取回参考」，走原始字节就够了。
+ *
+ * 所以这里把它做成一个显式开关，而不是让 `mat_t<bf16>` 硬生生编译过去：
+ * 后者会把"主机矩阵"这个概念稀释掉，而且 `mat_t` 里任何一个用到算术的成员
+ * 都会在某个没人预料到的地方炸开。降精度的搬运接口见
+ * `jas_cuda_precision.hpp` 的 `to_host_double` / `from_host_double`。
+ *
+ * 之所以做成模板参数上的约束（而不是把这几个成员删掉），是因为
+ * `dev_matrix_t<bf16>` 这个类本身必须能实例化 —— 成员是模板时，只有被调用才会实例化。
+ */
+template <typename T>
+inline constexpr bool has_host_matrix_v = std::is_arithmetic_v<T>;
+
 template <typename T>
 class dev_matrix_t
 {
@@ -38,8 +56,17 @@ public:
         allocate(rows, cols);
     }
 
-    /** 分配并上传一份主机矩阵。 */
-    dev_matrix_t(int rows, int cols, const mat_t<T>& host)
+    /**
+     * 分配并上传一份主机矩阵。
+     *
+     * 参数写成 `std::type_identity_t<...>` 是**刻意**的：`U` 必须落在非推导语境里，
+     * 否则模板推导会要求实参恰好是 `mat_t<U>`，而 `mat_view_t`（`t()` 的返回类型）
+     * 转成 `mat_t` 是用户定义转换、推导阶段不考虑 —— 于是 `dev_matrix_t(r, c, m.t())`
+     * 会突然编不过。非推导语境下 `U` 取默认值 `T`，参数类型仍是 `mat_t<T>`，转换照旧生效。
+     */
+    template <typename U = T>
+    requires has_host_matrix_v<U>
+    dev_matrix_t(int rows, int cols, const std::type_identity_t<mat_t<U>>& host)
     {
         allocate(rows, cols);
         upload(host);
@@ -53,7 +80,9 @@ public:
     }
 
     /** 把主机矩阵拷上来；形状必须已经一致（用 allocate 定形状）。 */
-    void upload(const mat_t<T>& host)
+    template <typename U = T>
+    requires has_host_matrix_v<U>
+    void upload(const std::type_identity_t<mat_t<U>>& host)
     {
         if (host.row_num() != m_rows || host.col_num() != m_cols)
             throw std::invalid_argument("dev_matrix_t::upload: 形状不匹配");
@@ -61,9 +90,11 @@ public:
     }
 
     /** 拷回主机，形状按当前设备矩阵。 */
-    mat_t<T> download() const
+    template <typename U = T>
+    requires has_host_matrix_v<U>
+    mat_t<U> download() const
     {
-        mat_t<T> host(m_rows, m_cols);
+        mat_t<U> host(m_rows, m_cols);
         if (!m_buf.empty())
             m_buf.download(host.data(), m_buf.size());
         return host;

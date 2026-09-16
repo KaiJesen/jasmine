@@ -29,8 +29,10 @@
 | 设备端 KV cache（零拷贝视图、GQA 多 KV 头、decode 与 prefill） | ✅ 已实现（第 7 节） |
 | 设备端 RoPE（两种配对约定、逐头、`start_pos` 偏移） | ✅ 已实现（第 8 节） |
 | 设备端 MHA 层 `dev_mha_t`（前向 + 反向，含 GQA 梯度归并、decode 路径） | ✅ 已实现（9.7） |
+| 融合注意力（Flash Attention 式：概率矩阵不物化，只留 `logsumexp`） | ✅ 已实现（9.10） |
 | 设备端 Embedding 层 `dev_embedding_t`（gather + 按 id 原子累加） | ✅ 已实现（9.8） |
 | **整个 LLaMA 模型 `dev_llama_t`**（参数搬运 + 整段前向 / 增量解码 / 反向 / 训练） | ✅ 已实现（9.9） |
+| 混精度（`bf16` / `fp16` 存储 + `fp32` 累加、误差模型、`cast` / 主机搬运原语） | ✅ 已实现（6.4） |
 | GPT-2 模型上设备 | ❌ 尚未实现（结构同 9.9，缺的是「按 `gpt2_model_t` 的层序再拼一遍」） |
 
 ---
@@ -344,7 +346,7 @@ inline constexpr bool is_self_contained_v = std::is_copy_assignable_v<T>;
 
 超出共享内存上限时回退而不是硬启动：`(cols + 32) * sizeof(T)` 超过设备允许的动态共享内存就直接走三趟，P4 上这个分界是 6112 个 `double` / 12256 个 `float`。恰好用满预算的那一行仍走单趟，`cudaFuncSetAttribute` 的 opt-in 在启动器里按需调用。
 
-> 这里**没有**用 online-softmax。它的卖点是把三趟读降到两趟，但单趟版已经是**一趟**读；只有在「整行放不进共享内存」时 online 才有意义，而那时三趟回退已经够用、且没有 online 的数值重标定风险。online-softmax 真正不可替代的场合是 **fused attention**（softmax 与 `V` 的乘不物化中间概率矩阵），那需要绕过 cuBLAS 自己写注意力 kernel，属于另一个量级的改动 —— 见第 14 节第 6 条。
+> 这里**没有**用 online-softmax。它的卖点是把三趟读降到两趟，但单趟版已经是**一趟**读；只有在「整行放不进共享内存」时 online 才有意义，而那时三趟回退已经够用、且没有 online 的数值重标定风险。online-softmax 真正不可替代的场合是 **fused attention**（softmax 与 `V` 的乘不物化中间概率矩阵），那需要绕过 cuBLAS 自己写注意力 kernel，属于另一个量级的改动 —— 已经做了，见 9.10。
 
 **一个必须显式检查的点**：优化的典型失败方式不是算错，而是**压根没生效**（阈值算错、分支写反），此时结果照样正确、测例照样全绿。所以启动器维护了一个 `softmax_shared_launch_count()` 计数器，测例断言「该走快路径时确实走了」；同时提供了 `softmax_max_cols_override()` 把快路径阈值压到 0，让**同一份输入**能两边各跑一遍再对拍 —— 否则快路径一上线，回退路径就再也没人测了。
 
@@ -399,6 +401,43 @@ auto out    = v.leaf().dot(prob.leaf().t());
 `dev_mat_t::m_data` 是 `T*`（因为 GEMM 的输出要写它），所以从 `const dev_matrix_t` 里取不出 `dev_mat_t<T>`。为此 `dev_matrix_t` 提供了一个 `const_leaf()`，里面是一次显式 `const_cast`。
 
 它只在**语义上只读**的地方用（`gemm` 的 A/B 形参本就是 `const dev_mat_t<T>&`，只读 `m_data`，从不写），拿到它只应传给 GEMM 这类只读接口；要写仍然必须用非 const 的 `leaf()`。这比让所有 `.dot()` 都要求非 const 接收者要好 —— 后者会把「读操作」的 const 正确性代价转嫁给每个调用方。
+
+### 6.4 降精度 GEMM：`bf16` / `fp16` 存储 + `fp32` 累加
+
+`jas_cuda_precision.hpp` 把降精度当成一件**要给出一份误差模型**的事来做，而不是「把类型换成 16 位」。
+理由很实际：降精度最容易滑向的动作是"把容差放宽到 1e-2"，那样转置写反、漏加一项都会被一起放过去。
+所以先承认误差只有三个来源，再让每一个都能被单独验证：
+
+| 来源 | 量级 | 为什么是这个量级 |
+| --- | --- | --- |
+| 操作数量化 | `u_op = 2^-(m+1)` | 两个操作数各舍入一次；`fp16`（m=10）4.9e-4、`bf16`（m=7）3.9e-3 |
+| 乘积 | **0** | `bf16 × bf16` 只要 16 位尾数、`fp16 × fp16` 只要 22 位，而 `fp32` 有 24 位 —— 乘积一个比特都不丢 |
+| 累加 | `K · u_fp32`（≈6e-8 × K） | 累加留在 `fp32`：`K` 项相加，量级 1e-6，比量化项小两三个数量级 |
+
+第三行是**策略而不是默认值**：累加类型要是跟着操作数一起降，1000 项的相对误差就会到
+`1000 × 4e-3` 的量级，等于白算。于是降精度的 `gemm` 只有一种正确写法，而真正的选择点在
+**输出**，所以做成两个重载：
+
+```cpp
+gemm(a<bf16>, b<bf16>, c<float>);   // 输出留 fp32：误差只有量化 + 累加
+gemm(a<bf16>, b<bf16>, c<bf16>);    // 输出再舍入一次：多一项 u_out
+```
+
+实现走 `cublasGemmEx` + 固定的 `CUBLAS_COMPUTE_32F`。一个不写下来就会踩的坑：
+`GemmEx` 的 `alpha` / `beta` 是 `const void*`、**按累加类型**解释的，降精度路径上必须是 `float` ——
+传成 `T*` 编译器不报错，只会在运行期给你一个含糊的 status 或者静默错值（用例
+`ReducedGemmHonoursAlphaBeta` 专门盯这一条）。
+
+**`matmul` 不允许隐式混精度**：`matmul(a<float>, b<bf16>)` 编译不过，要混就得显式
+`cast<bf16_t>(a)`。理由与第 4 节同源 —— 隐式提升会在表达式树里四处发生，而
+「哪一步降了精度、舍入发生了几次」必须留在源码里看得见。
+
+还有一处**能力上的取舍**值得记：`dev_matrix_t<T>` 的 `upload` / `download` / 构造函数都建立在
+`mat_t<T>` 上，而 `mat_t` 的约束是算术类型，降精度类型不是。与其把 `mat_t` 的约束撬开
+（它内部到处在做算术，撬开一个口子会在别处炸），不如显式承认「降精度矩阵没有主机矩阵对应物」，
+用 `has_host_matrix_v` 把那三个成员关掉，搬运改走 `to_host_double` / `from_host_double` ——
+取回主机时一律提升到 `double`，而 `bf16` / `fp16` 的每个值都能被 `double` **精确**表示，
+所以这一步不引入误差。这正是它敢当参考值用的前提。
 
 ---
 
@@ -556,6 +595,10 @@ dx = w ⊙ (dy − row_sum(w ⊙ dy))
 
 顺带一个易错点已经在前向踩过、反向照旧：设备端函数的命名是 `row_sum` / `col_sum`
 而不是 `hsum` / `vsum`，`softmax_backward` 同理不叫 `hsoftmax_backward`（ADL 的坑见 5.1）。
+
+**一个例外值得点明**：这里说的"必须留着"是**通用 softmax 层**的性质。注意力场合的 `w` 有闭式表达
+（分母只需一个 `logsumexp`），所以那条路可以连矩阵一起省掉 —— 这正是 9.10 的全部立足点。
+换言之 `softmax_backward` 本身仍然需要 `w`，是**注意力的反向**改成了"现算 `w` 再调它"。
 
 ### 9.3 RoPE 与 SiLU 的反向
 
@@ -725,6 +768,69 @@ id 的越界检查放在**主机侧、上传之前**：一个越界的 id 在 ke
 `forward_one` 只返回**最后一个位置**的 logits（与主机同义），靠 `col_slice` 零拷贝取尾列，
 不必先拷一份紧凑副本。
 
+### 9.10 融合注意力：把概率矩阵从显存里丢掉
+
+9.7 的注意力是 `GEMM → 掩码 → softmax → GEMM`，每一步都落一个完整的中间结果，其中
+softmax 的输出 —— `(q_len × len)` 的**概率矩阵** —— 是逐行归一化的唯一产物，而且反向要用它，
+所以它必须进显存。
+
+`jas_cuda_attention.hpp` 把这一项消掉（Flash Attention 那一类做法），立足点有两条：
+
+- **反向其实不需要概率矩阵，只需要 `logsumexp`**（每行一个标量）。有了它，`w_ij = exp(s_ij − L_i)`
+  随时能**重算**出来 —— 存 `len` 个数还是存 1 个数，差的就是 `len` 倍。
+- 于是 softmax 与 `·V` 的乘可以融进**同一趟**：K/V 分块流过共享内存，每块进来就算打分、
+  就地归一化、累加进结果，中间那个分块永远只活在片上。
+
+**online softmax** 在这里是必需件，不是优化。分块意味着"整行的最大值/指数和"在读到最后一列
+之前是未知的，所以每处理一块就要用新的最大值去**重标定**已有的累加结果：
+
+```
+m_new = max(m_old, max_j s_j)          // 新的基线
+corr  = exp(m_old - m_new)             // 旧累加结果的缩放因子，恒 ≤ 1
+acc   = acc * corr + Σ_j exp(s_j - m_new) · v_j
+l     = l   * corr + Σ_j exp(s_j - m_new)      // 归一化分母同步缩放
+```
+
+`exp(s_j - m_new)` 恒 ≤ 1，这一路**不会溢出** —— 数值稳定是这么来的，不是靠事后加一道保险。
+归一化只在最后做一次（`out = acc / l`），中间结果不归一化。前向留下 `logsumexp = m + log(l)`，
+反向就能把概率重算出来（`w` 的下标映射也一并重算，所以它连掩码都不必存）。
+
+几处实现细节，都是踩过或差一点踩到的：
+
+- **共享内存的行步长取 `d + 1`**：同一列的读取因此落到不同 bank，省下的是一个访存瓶颈，
+  而不是"看起来整齐"。
+- **`dK` / `dV` 用 `atomicAdd` 累加到全局显存。** 这是当前实现最明显的代价，写明比藏起来好：
+  没有 Q 分块，同一块 K/V 会被多个 Q 块（同一 kernel 内的不同 block）同时写，只能原子加。
+  它是**确定的代价**（同一地址上串行化），不是"可能有竞态"。
+- **不做 warp 级流水**：分块循环是「载入 → 同步 → 算 → 同步」的直白写法，
+  现阶段的优先级是正确与可对拍，不是榨访存。
+- **`bc`（K/V 分块列数）由共享内存预算算出**（`choose_block_cols`），
+  测试可以用 `flash_attention_block_cols_override()` 硬压。结果**必须与 `bc` 无关**。
+
+边界与契约：
+
+- **引擎在前向时决定并记下来。** `dev_head_gen_t` 有 `plain` / `fused` 两条路径，
+  `set_fused_attention()` 只是设开关；真正生效的那条在前向里记进 `m_engine`，反向按记录走。
+  于是**前向后改开关不会影响反向**，而前向没跑过就反向会明确报错 —— 两条都有用例盯着
+  （`EngineIsRecordedAtForwardTime`）。这类"两个实现配错对"的错误不会崩、只会静默给出
+  另一套梯度，所以必须由测试而不是由注释来保证。
+- **decode 路径显式关掉融合**：单 token 的概率矩阵只有 `1 × len`，融合省不到东西，
+  反而要绕开 cuBLAS 自己算 —— 收益为负的地方就该走回原来的路（`attend_cached` 里一行注释加
+  一行 `m_use_fused = false`）。
+- **融合路径下 `m_weights` 是空的、`m_lse` 有值**，用例直接断言这一条，并用 `weights_bytes()`
+  把收益算出来：单层 32 头 × 2048 上下文是 `1024 MiB → 0.5 MiB`，比值**恰好等于 `len`**。
+
+有一条 bug 值得留档，因为它是"只有分块才会现形"的那一类。前向里旧累加和的缩放写成了
+
+```cpp
+T local_sum = s_l[warp] * corr;    // ← 每个 lane 都这么写
+```
+
+被 warp 内归约求和后，等于把 `s_l[warp]` 加了 32 次（`kAttnWarp` 倍）。`bc >= len`（单块）时
+`s_l` 恒为 0，所以**单块用例全绿**；只有分块时才错，而且错得像是"精度问题"。
+`BlockSizeDoesNotChangeResult` 这条用例（把 `bc` 压到 1、压到 `len`、留自动值，三档结果必须一致）
+就是为这一类 bug 准备的。
+
 ---
 
 ## 10. 行优先 ↔ 列优先
@@ -810,9 +916,13 @@ enum class gemm_math
 
 用例 `CudaKvCacheTest.GemmMathModeDefaultsToPrecise` 在 Pascal 上断言"请求 TF32 必须抛异常"，在 Ampere 上则断言切换生效 —— 同一份测试覆盖两种机器。
 
+顺带说清它与 6.4 的分工：TF32 是**隐式**降精度（换台机器、换个环境变量就变），
+`bf16` / `fp16` 是**显式**降精度（类型写在源码里、累加精度写死成 `fp32`）。
+要速度就用后者 —— 跨机器可复现，而且省下的显存是实打实的。
+
 ### 10.4 后续 GPU 选型的含义
 
-目标机是 Ampere 及以后，于是：显存不再是 8 GB，**量化/分页 KV cache 的紧迫性下降**（当前实现是 `reserve` + 翻倍扩容，够用）；而 TF32 / bf16 / fp16 的混精度路径是真实可选项 —— 设备叶子是模板、`gemm` 目前只特化 `float`/`double`，混精度要动的是那里。
+目标机是 Ampere 及以后，于是：显存不再是 8 GB，**量化/分页 KV cache 的紧迫性下降**（当前实现是 `reserve` + 翻倍扩容，够用）；而 TF32 / bf16 / fp16 的混精度路径是真实可选项 —— 设备叶子是模板，`gemm` 的降精度特化与误差模型已经就位（6.4），缺的只是"把模型本身也降下来"这个决定。
 
 ### 10.5 Pascal 的算力特性（测试机）
 
@@ -862,6 +972,8 @@ JASMINE_CUDA_STRESS=1 ./build-cuda/tests/cuda_tests   # 含算力型用例
      所以这一条是唯一的裁判。差分**覆盖每一个参数矩阵**（2 层 × 9 个 + `wte` + `ln_f` + `lm_head`），
      而不是只钉头/中/尾三处（理由见 9.7 那条 GQA 归并）；
   4. 训练收敛自检：同批数据跑 60 步，损失 0.69 → 3e-5。
+- **融合注意力**（`test_cuda_attention.cu`）：融合前向与**非融合实现**和**主机算式**三方对拍（含因果掩码、两种 RoPE 约定）；因果性有一条不依赖参考实现的行为检查（改动第 t 个 token 之后的内容，前 t 个位置必须一字不变）；反向同时与"非融合反向"和有限差分对拍；`bc` 压在 `1` / `len` / 自动三档必须给出同一个结果；引擎在前向时被记录（前向后改开关不改反向行为，前向没跑过必须报错）；**`m_weights` 必须为空、`m_lse` 必须有值**（"不物化"不是口号），并用 `weights_bytes()` 把收益算出来（32 头 × 2048 上下文：1024 MiB → 0.5 MiB，比值恰好 `len`）。另有 `dev_mha_t` 层面的 MHA/GQA/MQA 端到端对拍。
+- **混精度**（`test_cuda_precision.cu`）：先拿实测最大舍入误差校准 `u`（实测占模型上界 99.6%），再逐条验误差的每一个来源 —— 与"先把操作数舍入、再用 double 算"的参考比只该看到 `K·u_fp32`（**若累加不是 fp32，这条会以量级之差失败**）、与不舍入的参考比必须**明显大于** `K·u_fp32`（否则量化压根没生效）、输出降精度那一档与"同一个 gemm 但输出留 fp32"比出来的正是那一次舍入；`cast` 必须与主机 `narrow` **逐位一致**；`matmul` 拒绝隐式混精度（编译期断言）；`alpha`/`beta` 按累加类型传入；`bf16` 的实测误差是 `fp16` 的 8 倍（尾数差 3 位）且显存减半。
 - **压力**（默认跳过）：4096² 融合、256³ GEMM。
 
 数值对拍一律用**相对容差**，原因见 5.4。
@@ -875,15 +987,17 @@ JASMINE_CUDA_STRESS=1 ./build-cuda/tests/cuda_tests   # 含算力型用例
 | `jas_cuda_compat.hpp` | `JAS_HD` / `JAS_DEV` 宏、设备安全数学（`device_exp` / `device_max` / `device_sqrt`）、`device_evaluable` 探测。**不依赖 CUDA 运行时**，纯 CPU 构建也能 include |
 | `jas_cuda_leaf.hpp` | 设备叶子 `dev_mat_t`（薄壳、转置视图、**独立前导维 + `view()` 零拷贝子视图**、**`row_slice()` 行子块**）、按值拥有定制点、`is_dev_leaf` 判别、`.dot()` 的声明。同样不依赖运行时 |
 | `jas_cuda_buffer.hpp` | 运行时基础设施：错误检查、设备查询、`dev_buf_t`、`pinned_buf_t`、`sync()`、**动态共享内存上限查询** |
-| `jas_cuda_matrix.hpp` | `dev_matrix_t`：把「管内存的 buf」和「薄壳 leaf」绑成所有者；`const_leaf()` |
+| `jas_cuda_matrix.hpp` | `dev_matrix_t`：把「管内存的 buf」和「薄壳 leaf」绑成所有者；`const_leaf()`；**降精度元素类型上不提供基于 `mat_t` 的搬运**（`has_host_matrix_v`，理由见 6.4） |
 | `jas_cuda_fused.hpp` | 融合逐元素 kernel 与启动器（含「不可上设备」的编译期断言） |
-| `jas_cuda_gemm.hpp` | cuBLAS GEMM、`matmul` 三入口、`.dot()` 的定义（含行优先映射与转置组合）、**精度的 math mode 控制（`gemm_math` / `set_gemm_math`）** |
+| `jas_cuda_gemm.hpp` | cuBLAS GEMM、`matmul` 三入口、`.dot()` 的定义（含行优先映射与转置组合）、**精度的 math mode 控制（`gemm_math` / `set_gemm_math`）**、**降精度特化（`cublasGemmEx` + `CUBLAS_COMPUTE_32F`，见 6.4）** |
 | `jas_cuda_reduce.hpp` | 广播叶子、`dev_colvec_t`/`dev_rowvec_t`（含**不广播的 `flat_leaf()`**，更新器要用）、归约 kernel、`softmax_rows`（**单趟共享内存 + 三趟回退**）/ `softmax_backward` / `layer_norm` / `layer_norm_backward` / `rms_norm` / `rms_norm_backward`、**反向所需的缓存结构 `layer_norm_cache_t` / `rms_norm_cache_t`** |
 | `jas_cuda_kv_cache.hpp` | `dev_kv_cache_t`（单头，零拷贝视图 + 翻倍扩容）、`dev_kv_caches_t`（多 KV 头 + GQA 映射，`append_all` 是唯一写入入口）、`attend_cached` |
 | `jas_cuda_rope.hpp` | `dev_rope_t`：cos/sin 表上设备、两种配对约定（`rope_pair_layout`）、`start_pos` 偏移、表达式输入融合、原地旋转、**反向（同一个 kernel 的 `Inverse` 分支）** |
 | `jas_cuda_updator.hpp` | 设备端优化器：`dev_sgd_t` / `dev_adam_t` / `dev_nadam_t` / `dev_cache_updator_t`。参数更新走**原地** kernel（不是 `eval_fused`），一趟算完动量、偏差修正与写入 |
 | `jas_cuda_net.hpp` | 设备端层库：`dev_linear_t` / `dev_layer_norm_t` / `dev_rms_norm_t` / `dev_silu_t` / `dev_gated_t` / `dev_residual_t` / `dev_chain_t` / `dev_mse_loss_t`，全部 forward + backward，协议与主机同形；`detail::materialize_input` 统一吸收「主机 `mat_t` / 设备叶子 / 拥有者 / 表达式」四种输入 |
-| `jas_cuda_mha.hpp` | 设备端注意力：`dev_head_gen_t`（单头，含 RoPE、就地掩码、`attend_cached`）与 `dev_mha_t`（多头外壳，GQA 梯度归并、`forward` / `forward_one` / `backward`） |
+| `jas_cuda_mha.hpp` | 设备端注意力：`dev_head_gen_t`（单头，含 RoPE、就地掩码、`attend_cached`）与 `dev_mha_t`（多头外壳，GQA 梯度归并、`forward` / `forward_one` / `backward`）。**两条引擎（`plain` / `fused`）在前向时选定并记录、一个开关切换、可逐元素对拍** |
+| `jas_cuda_attention.hpp` | 融合注意力：online softmax + 共享内存 K/V 分块，前向/反向全程不物化概率矩阵。`choose_block_cols` 按共享内存预算定分块，`attention_cache_t`（`out` + `logsumexp`）/ `attention_grad_t`，以及启动计数器与分块覆写两个测试钩子 |
+| `jas_cuda_precision.hpp` | 混精度：`bf16_t` / `fp16_t` 与误差模型（`precision_traits`、量化 / 累加 / 总上界）、`narrow` / `widen` / `quantize`、`cast` 与 `to_host_double` / `from_host_double`、`reduced_precision_is_native()`。全部原语都不依赖 cuBLAS 之外的运行时 |
 | `jas_cuda_embedding.hpp` | `dev_embedding_t`：离散 gather + 按 id `atomicAdd` 的稠密梯度缓冲（跨步复用，`gradient_bytes()` 供调用方估算显存代价） |
 | `jas_cuda_llama.hpp` | `dev_llama_t` / `dev_llama_block_t`：整模型的设备端实现（`forward` / `forward_stages` / `forward_one` / `prefill` / `backward`），权重经 `upload_from(host)` 从主机搬运 |
 
@@ -898,11 +1012,14 @@ JASMINE_CUDA_STRESS=1 ./build-cuda/tests/cuda_tests   # 含算力型用例
 3. ~~设备端 KV cache（零拷贝视图 + GQA + decode/prefill）~~ ✅ 已完成（第 7 节）。
 4. ~~设备端 RoPE~~ ✅ 已完成（第 8 节）：cos/sin 表上设备、两种配对约定（`interleaved` / `half_split`）、逐头行子块旋转、表达式输入融合、原地旋转。**「设备端自包含的多轮 decode」到这一轮才闭环** —— `test_cuda_rope.cu` 里有一条 RoPE + KV cache + attention 串起来的端到端对拍。
 5. ~~softmax 专用 kernel（性能）~~ ✅ 已完成（5.6）：单趟共享内存路径把「读 3 遍 + `exp` 2 次」降到「读 1 遍 + `exp` 1 次」，整行放不进共享内存时回退三趟。这里刻意**没有**用 online-softmax，理由见 5.6。
-6. **fused attention（Flash Attention 那一类）**：attention 现在仍是 `GEMM → softmax（物化概率矩阵）→ GEMM` 三步，中间那个 `(q_len × len)` 概率矩阵要落一遍显存。5.6 里解释过 online-softmax 真正不可替代的场合正是这里 —— 把 softmax 与 `V` 的乘融进一趟，中间矩阵根本不物化。代价是要绕过 cuBLAS 自己写注意力 kernel，并处理分块与在线重标定，属于另一个量级的改动；长上下文收益最大。
+6. ~~fused attention（Flash Attention 那一类）~~ ✅ 已完成（9.10）：`jas_cuda_attention.hpp` 把 softmax 与 `·V` 融进同一趟，概率矩阵不再物化（只留 `logsumexp`），两条引擎可切换、可逐元素对拍。收益是 `len` 倍（单层 32 头 × 2048 上下文：1024 MiB → 0.5 MiB）。**仍未做的**：没有 Q 分块，所以 `dK` / `dV` 靠 `atomicAdd`；也没有 warp 级流水 —— 先要正确与可对拍，性能优化留到有目标机可量的时候。
 7. ~~反向传播的设备路径~~ ✅ 已完成（第 9 节）：`softmax` / `layer_norm` / `rms_norm` / `RoPE` 的反向，加上设备端层库（`jas_cuda_net.hpp`）与优化器（`jas_cuda_updator.hpp`）。归约的反向不需要新算子 —— `hsum` 的反向就是广播，`dev_colvec_t::leaf()` 那个广播叶子已经在做这件事。**「能在 GPU 上训练」到这一轮才闭环**：`test_cuda_backward.cu` 里有一条 `LayerNorm → Linear → SiLU → Linear → MSE` 整栈训练 6 步、逐步与主机同构栈对拍的端到端用例。
 8. ~~把模型类真正搬上设备~~ ✅ 已完成（9.7–9.9）：`dev_mha_t` / `dev_embedding_t` / `dev_llama_t`，
    含 GQA 梯度归并、decode 路径、参数搬运（`upload_from`）与整栈反向。加载器仍留在主机端 ——
    设备端只搬数值，这样不必维护第二份权重解析逻辑。
    **仍未做的**：`gpt2_model_t` 的设备端对应物（结构同 9.9，工作量在「按 GPT-2 的层序再拼一遍」，
    `dev_embedding_t` 可直接复用：GPT-2 的 `wte` 与 `lm_head` 共享权重这一点要显式处理）。
-9. **混精度（可选）**：目标机是 Ampere 及以后，TF32/bf16/fp16 是真实可选项。设备叶子已经是模板，要动的是 `gemm` 的类型特化与 math mode 的选择策略（见 10.3）。
+9. ~~混精度（可选）~~ ✅ 已完成（6.4）：`bf16` / `fp16` 存储 + `fp32` 累加的 `gemm` 特化（`cublasGemmEx` + `CUBLAS_COMPUTE_32F`）、误差模型（量化 / 乘积精确 / 累加三源，每条都能单独验）、`cast` 与主机搬运原语。**仍未做的**：模型本身仍是全 `fp32` —— 这一轮交付的是**原语与误差模型**，还没到"用 `bf16` 存激活、真的往显存和带宽上省"那一步；另外 P4 上这条路只省显存不省时间（`reduced_precision_is_native()` 会把这点打出来，免得拿测试机的结论去推目标机）。
+10. **把融合注意力与混精度接到模型上**（下一步的自然入口）：`dev_mha_t` 已经能切引擎、`cast` 已经能把参数降精度，
+   缺的是「整模型用哪套精度、注意力用哪条引擎」的策略与验收 —— 这一步才真正把显存/带宽的收益兑现，
+   也才需要目标机的实测数据（P4 上既没有张量核也没有带宽余量，量出来的数不能用来推结论）。

@@ -9,6 +9,7 @@
  */
 
 #include <cmath>
+#include <limits>
 #include <type_traits>
 
 #ifdef __CUDACC__
@@ -92,6 +93,57 @@ JAS_INLINE_HD float device_sqrt(float x)
     return std::sqrt(x);
 #endif
 }
+
+/** 标量自然对数。融合注意力的 logsumexp（`L = m + log l`）要用。 */
+JAS_INLINE_HD double device_log(double x)
+{
+#if defined(__CUDA_ARCH__)
+    return ::log(x);
+#else
+    return std::log(x);
+#endif
+}
+
+JAS_INLINE_HD float device_log(float x)
+{
+#if defined(__CUDA_ARCH__)
+    return ::logf(x);
+#else
+    return std::log(x);
+#endif
+}
+
+/**
+ * 通用兜底：**先把操作数提升到 `float` 再算**，最后转回原类型。
+ *
+ * 只为降精度类型（`__half` / `__nv_bfloat16`）存在 —— 它们的算子虽然也能直接调
+ * `__expf` 之类，但那些内在函数按 `float` 定义，来回转换由我们来写更明确。
+ *
+ * 提升到 `float` 而不是在原精度里算，是这里唯一一个说得通的选择：`half` 的
+ * 动态范围只有 5 位指数，`exp` 的结果很容易溢出成 `inf` 或下溢成 0，
+ * 而算完再舍入只损失一次精度。所以降精度只该用在**存储**上，不该用在标量函数里 ——
+ * 这条原则与 `gemm` 一律用 fp32 累加是同一件事。
+ *
+ * 重载决议：`float` / `double` 的精确匹配优先于这个模板，所以它们仍走上面的版本。
+ */
+template <typename T>
+JAS_INLINE_HD T device_exp(T x)
+{
+    return static_cast<T>(device_exp(static_cast<float>(x)));
+}
+
+template <typename T>
+JAS_INLINE_HD T device_sqrt(T x)
+{
+    return static_cast<T>(device_sqrt(static_cast<float>(x)));
+}
+
+template <typename T>
+JAS_INLINE_HD T device_log(T x)
+{
+    return static_cast<T>(device_log(static_cast<float>(x)));
+}
+
 
 } // namespace detail
 

@@ -59,6 +59,7 @@
 #include "jas_cuda_compat.hpp"
 #include "jas_cuda_fused.hpp"
 #include "jas_cuda_gemm.hpp"
+#include "jas_cuda_attention.hpp"
 #include "jas_cuda_kv_cache.hpp"
 #include "jas_cuda_leaf.hpp"
 #include "jas_cuda_matrix.hpp"
@@ -205,10 +206,40 @@ void place_rows_owned(const dev_matrix_t<T>& src, dev_matrix_t<T>& dst, int row0
 /**
  * 输入已是切好的 Q/K/V（d_head × seq），本类**不含任何投影权重**。
  *
- * 前向留下两样东西给反向：`m_v`（未旋转）与 `m_weights`（softmax 的**概率矩阵**）。
- * 后者是必须的 —— softmax 反向的公式 `dx = w ⊙ (dy − row_sum(w ⊙ dy))` 里，
- * `w` 是前向输出，重算不出来（重算等于把前向再走一遍）。主机端把它存在
- * `hsoftmax_net_t::m_output` 里，设备端同样是成员。
+ * ## 概率矩阵为什么一直是"必须留下"的
+ *
+ * 前向本来要留下三样东西给反向：`m_q`、`m_k`（已旋转）、`m_v`（未旋转），
+ * 以及 `m_weights` —— softmax 的概率矩阵。前两个是输入本身，第三个是**输出**。
+ *
+ * 留着它的理由是 softmax 反向的公式 `dx = w ⊙ (dy − row_sum(w ⊙ dy))` 要用 `w`，
+ * 而一个通用 softmax 层确实重算不出来：它的分母是「先减最大值再求指数和」得到的
+ * 统计量，前向算完就丢了，重算等于把前向整个再走一遍。
+ *
+ * 但**注意力场合不一样**：这里的 `w` 有闭式表达
+ *
+ *   w_ij = exp(s_ij − L_i)，  s_ij = (Qᵀ·K)_ij / √d，  L_i = rowmax(s_i) + log(rowsum exp(s_i − rowmax))
+ *
+ * `s` 由 Q/K 重算（它们本来就留着），而分母那一整套统计量**可以压成一个数 L**
+ * （logsumexp）。所以注意力既能重算 `w`，又只需要每行留一个数 —— 这正是
+ * `jas_cuda_attention.hpp` 的全部立足点。
+ *
+ * ## 两条引擎
+ *
+ * 于是本类有两个前向/反向实现，`set_fused_attention(true)` 切到融合那条：
+ *
+ * | | 前向为反向留下的东西 | 反向的 softmax 环节 |
+ * | --- | --- | --- |
+ * | 非融合（默认） | `m_weights`：`q_len × k_len` 个数 | 直接读它 |
+ * | 融合 | `m_lse`：`q_len` 个数 | 从 `m_lse` 重算 |
+ *
+ * 默认仍然是**非融合**：融合是加速路径，不是替代品，而且它只在 `q_len × k_len`
+ * 真的成规模时才划算（decode 时 `q_len == 1`，概率矩阵是 `1 × len`，融合只会白绕一圈）。
+ * 两条都留着还有一个测试上的理由：融合路径不能因为「只在特定规模下被选中」而腐烂，
+ * 测试必须能把同一份输入两条都跑一遍再对拍（`softmax_rows` 的三趟回退路径吃过这个亏，
+ * 见 CUDA.md 5.6）。
+ *
+ * `m_engine` 记住前向**实际**用了哪条：反向必须与前向配对，中途换开关会让缓存与
+ * 引擎对不上，所以这里直接抛异常而不是静默出错。
  */
 template <typename T>
 class dev_head_gen_t
@@ -251,8 +282,61 @@ public:
     int d_head() const { return m_d_head; }
     bool masked() const { return m_mask; }
 
-    /** softmax 概率矩阵 (q_len × k_len)，反向要用；也供测试检查。 */
+    /**
+     * softmax 概率矩阵 (q_len × k_len)，反向要用；也供测试检查。
+     *
+     * **融合引擎下它是空的** —— 那份矩阵压根不存在。这不是"忘了填"，而是融合的
+     * 全部收益所在，所以测试反过来断言它为空（见 `test_cuda_attention.cu`）。
+     * 需要概率数值时用 `logsumexp()` 重算（`probabilities_row()` 就是干这个的）。
+     */
     const dev_matrix_t<T>& weights() const { return m_weights; }
+
+    /** 融合引擎前向留下的 `L = logsumexp`（q_len × 1）；非融合引擎下为空。 */
+    const dev_matrix_t<T>& logsumexp() const { return m_lse; }
+
+    /** 是否启用融合引擎（开关，前向后由 `m_engine` 记录实际用了哪条）。 */
+    bool fused_attention() const { return m_use_fused; }
+
+    void set_fused_attention(bool on) { m_use_fused = on; }
+
+    /** 前向**实际**走的引擎，供测试断言「开关确实生效了」。 */
+    bool fused_attention_used() const { return m_engine == engine::fused; }
+
+    /**
+     * 从融合引擎留下的 `L` 重算第 `row` 行的概率（`len` 个数，主机侧）。
+     *
+     * 反向内部是逐块重算的，这个函数是**给测试开的一扇窗**：它让「重算的概率」
+     * 与「非融合路径存下来的概率矩阵」能直接逐元素对拍 —— 否则融合路径的正确性
+     * 就只能靠最终梯度间接推断了。
+     */
+    mat_t<T> probabilities_row(int row) const
+    {
+        if (m_engine != engine::fused)
+            throw std::runtime_error("probabilities_row: 前向没有走融合引擎，没有 logsumexp 可用");
+        if (row < 0 || row >= m_lse.row_num())
+            throw std::out_of_range("probabilities_row: 行号越界");
+
+        // 这是个给测试看的窗口，所以走主机：`dev_mat_t::operator()` 在主机侧是**解引用设备指针**，
+        // 不能拿来当面算。也正因如此它按「调用者只需一行」设计，别在大矩阵上循环调。
+        const mat_t<T> q = m_q.download();
+        const mat_t<T> k = m_k.download();
+        const T lse = m_lse.download()(row, 0);
+        mat_t<T> p(1, k.col_num());
+        const T scale = ::jasmine::detail::device_sqrt(static_cast<T>(m_d_head));
+        for (int j = 0; j < p.col_num(); ++j)
+        {
+            T s = T(0);
+            for (int f = 0; f < m_d_head; ++f)
+                s += q(f, row) * k(f, j);
+            s /= scale;
+            // 与融合前向同一套掩码口径（前向只在 q_len > 1 时才掩）
+            const bool visible = !m_mask || m_q.col_num() == 1 || j <= row + m_mask_offset;
+            p(0, j) = (visible && lse != -std::numeric_limits<T>::infinity())
+                          ? ::jasmine::detail::device_exp(s - lse)
+                          : T(0);
+        }
+        return p;
+    }
 
     template <typename Q, typename K, typename V>
     dev_matrix_t<T> forward(const Q& q, const K& k, const V& v)
@@ -284,7 +368,26 @@ public:
         m_q_pos = q_pos;
         m_k_pos = k_pos;
 
-        return attend_impl(m_q.const_leaf(), m_k.const_leaf(), m_v.const_leaf(), 0);
+        // 掩码口径由实现决定（`q_len == 1` 时不存在未来，不掩），反向要复用同一个口径
+        m_mask_offset = 0;
+        const int q_len = m_q.col_num();
+        if (m_use_fused)
+        {
+            m_engine = engine::fused;
+            m_weights = dev_matrix_t<T>();  // 这份矩阵在融合引擎下根本不存在，清掉免得读到上一轮残留
+            attention_cache_t<T> cache =
+                fused_attention_forward<T>(m_q.const_leaf(), m_k.const_leaf(), m_v.const_leaf(),
+                                           m_mask && q_len > 1, m_mask_offset);
+            m_lse = std::move(cache.logsumexp);
+            // 反向里的 `D_i = Σ_f dO(f,i)·O(f,i)` 要用前向输出，所以这里留一份。
+            // 这是融合路径**唯一**额外留的东西，量级是 `d_head × q_len` ——
+            // 与非融合路径留的 `q_len × len` 相比，在长上下文下差着 `len / d_head` 倍。
+            detail::materialize_into(cache.out, m_fused_out);
+            return std::move(cache.out);
+        }
+        m_engine = engine::plain;
+        m_lse = dev_matrix_t<T>();
+        return attend_impl(m_q.const_leaf(), m_k.const_leaf(), m_v.const_leaf(), m_mask_offset);
     }
 
     /**
@@ -313,6 +416,10 @@ public:
             throw std::invalid_argument("dev_head_gen_t::attend_cached: K/V 长度不一致");
 
         m_q_pos = pos;
+        m_mask_offset = pos;
+        // decode 一律走非融合路径：此时概率矩阵只有 `1 × len`，融合省下的内存可以忽略，
+        // 反而多绕一圈「重算概率」的账。融合的价值只在 `q_len × len` 成规模时才存在。
+        m_engine = engine::plain;
         return attend_impl(q_new.const_leaf(), k_cached, v_cached, pos);
     }
 
@@ -332,7 +439,16 @@ public:
     bwd_pack_t backward(const Delta& delta)
     {
         const dev_mat_t<T> dl = detail::read_leaf_of<T>(delta);
+
+        // 先判"前向跑过没有"再判形状：没跑过前向时形状一定不匹配，此时"形状不对"是个
+        // 误导人的报错（真正的原因是压根没有缓存可配对）。
+        if (m_engine == engine::none)
+            throw std::runtime_error("dev_head_gen_t::backward: 前向还没跑过，"
+                                     "拿不到与前向配对的缓存");
         check_delta(dl);
+
+        if (m_engine == engine::fused)
+            return backward_fused(dl);
 
         dev_matrix_t<T> delta_v = matmul(dl, m_weights.const_leaf());
         dev_matrix_t<T> delta_w = matmul(dl.t(), m_v.const_leaf());
@@ -362,11 +478,38 @@ public:
     std::string net_type(int indent = 0) const
     {
         return std::string(static_cast<std::size_t>(indent) * 4, ' ') + "dev_head_gen_t(d_head:"
-               + std::to_string(m_d_head) + (m_mask ? ",mask" : "") + ")";
+               + std::to_string(m_d_head) + (m_mask ? ",mask" : "")
+               + (m_use_fused ? ",fused" : "") + ")";
     }
 
 private:
-    /** 打分 → 缩放 → 掩码 → softmax → 加权求和。前向、cache 前向共用。 */
+    /**
+     * 融合引擎的反向：块内从 `L = logsumexp` 重算概率，不读概率矩阵。
+     *
+     * 掩码与缩放都在 kernel 里（前者按 `m_mask_offset`，后者按 `√d`），所以这里
+     * 只剩 RoPE 反向这一步 —— 与非融合路径用的是同一批角度。
+     */
+    bwd_pack_t backward_fused(const dev_mat_t<T>& dl)
+    {
+        const bool causal = m_mask && m_q.col_num() > 1;
+        attention_cache_t<T> cache;
+        detail::materialize_into(m_fused_out, cache.out);
+        detail::materialize_into(m_lse, cache.logsumexp);
+
+        attention_grad_t<T> g = fused_attention_backward<T>(
+            cache, m_q.const_leaf(), m_k.const_leaf(), m_v.const_leaf(), dl, causal, m_mask_offset);
+
+        if (m_rope != nullptr)
+        {
+            if (g.d_q.col_num() > 0)
+                m_rope->backward_inplace(g.d_q, m_q_pos);
+            if (g.d_k.col_num() > 0)
+                m_rope->backward_inplace(g.d_k, m_k_pos);
+        }
+        return bwd_pack_t{std::move(g.d_q), std::move(g.d_k), std::move(g.d_v)};
+    }
+
+    /** 打分 → 缩放 → 掩码 → softmax → 加权求和。前向、cache 前向共用（非融合引擎）。 */
     dev_matrix_t<T> attend_impl(const dev_mat_t<T>& q, const dev_mat_t<T>& k, const dev_mat_t<T>& v,
                                 int mask_offset)
     {
@@ -395,18 +538,33 @@ private:
     {
         if (delta.row_num() != m_d_head)
             throw std::invalid_argument("dev_head_gen_t::backward: delta 行数应为 d_head");
-        if (m_weights.row_num() != delta.col_num())
+        // 两条引擎的「前向跑过没有」判据不同：非融合看概率矩阵，融合看 logsumexp
+        const int q_len_fwd = (m_engine == engine::fused) ? m_lse.row_num() : m_weights.row_num();
+        if (q_len_fwd != delta.col_num())
             throw std::invalid_argument("dev_head_gen_t::backward: delta 列数与前向 Q 长度不一致"
                                         "（forward 必须先被调用）");
     }
 
+    /** 前向**实际**走的引擎。默认 `none`：还没跑过前向，反向就无从配对。 */
+    enum class engine
+    {
+        none,
+        plain,
+        fused,
+    };
+
     dev_matrix_t<T> m_q, m_k, m_v;  // 前向缓存（Q/K 已旋转，V 不旋转 —— 与主机一致）
-    dev_matrix_t<T> m_weights;      // softmax 概率矩阵 (q_len × k_len)，反向必需
+    dev_matrix_t<T> m_weights;      // 非融合引擎：softmax 概率矩阵 (q_len × k_len)
+    dev_matrix_t<T> m_fused_out;    // 融合引擎：前向输出 (d_head × q_len)，反向算 D_i 要用
+    dev_matrix_t<T> m_lse;          // 融合引擎：logsumexp (q_len × 1)
     dev_rope_t<T>* m_rope = nullptr;  // 非拥有
     int m_d_head = 0;
-    int m_q_pos = 0;  // 前向用过的 RoPE 起点，反向照用
+    int m_q_pos = 0;      // 前向用过的 RoPE 起点，反向照用
     int m_k_pos = 0;
+    int m_mask_offset = 0;  // 前向用过的掩码偏移，反向照用
     bool m_mask = false;
+    bool m_use_fused = false;         // 开关：下一次前向走哪条
+    engine m_engine = engine::none;   // 事实：上一次前向走了哪条
 };
 
 // ---------------------------------------------------------------------------
@@ -489,6 +647,51 @@ public:
     }
 
     dev_rope_t<T>* rope() const { return m_rope; }
+
+    /**
+     * 整层切换注意力引擎（转发给每个 Q 头）。
+     *
+     * 只影响**训练/预填**那条路（`forward` → 各头的 `forward_at`）；decode 走
+     * `forward_one` → `attend_cached`，那里概率矩阵只有 `1 × len`，融合没有收益，
+     * 所以固定走非融合路径（理由见 `dev_head_gen_t` 的说明）。
+     */
+    void set_fused_attention(bool on)
+    {
+        m_use_fused = on;
+        for (auto& h : m_heads)
+            h.set_fused_attention(on);
+    }
+
+    bool fused_attention() const { return m_use_fused; }
+
+    /** 本层 Q 头是否都走了融合引擎（前向后才为真），供测试断言开关确实生效。 */
+    bool fused_attention_used() const
+    {
+        if (m_heads.empty())
+            return false;
+        for (const auto& h : m_heads)
+            if (!h.fused_attention_used())
+                return false;
+        return true;
+    }
+
+    /**
+     * 非融合引擎在这个形状下要留住多少字节的概率矩阵（融合收益的量化口径）。
+     *
+     * `q_len × len × sizeof(T)`，且**每个 Q 头一份** —— 所以传的是 `num_heads` 而不是单头。
+     *
+     * 这里**没有 `d_head`**，别把它乘进来：概率矩阵的形状就是 `(q_len × len)`，
+     * 每头一份。乘上 `d_head` 会把收益夸大成 64 倍（`d_head = 64` 时），
+     * 而这种数字一旦被写进文档就会被人当真（`weights_bytes` 的第一版就是这么错的，
+     * 是 `MemorySavingScalesWithContext` 里"比值必须恰好等于 `len`"这条断言把它抓出来的）。
+     *
+     * 单头版本见 `attention_cache_t<T>::weights_bytes(q_len, len)`。
+     */
+    static std::size_t weights_bytes(int q_len, int len, int num_heads)
+    {
+        return static_cast<std::size_t>(q_len) * static_cast<std::size_t>(len)
+               * static_cast<std::size_t>(num_heads) * sizeof(T);
+    }
 
     // ---- KV cache（只给 decode 用；训练路径不碰它）----
 
@@ -726,6 +929,7 @@ private:
     int m_d_head = 0;
     int m_d_kv = 0;
     bool m_mask = false;
+    bool m_use_fused = false;
 };
 
 } // namespace cuda

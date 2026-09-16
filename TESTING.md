@@ -648,7 +648,10 @@ softmax、归一化层，`tests/test_cuda_dot.cu` 覆盖 `dot` 分派与注意�
 decode/prefill 注意力、GQA），`tests/test_cuda_rope.cu` 覆盖设备端 RoPE
 （与主机 `RoPE_net_t` 对拍、两种配对约定、逐头旋转、RoPE+KV cache 端到端），
 `tests/test_cuda_backward.cu` 覆盖反向传播与设备端层库，`tests/test_cuda_mha.cu` 覆盖设备端
-MHA 与 Embedding，`tests/test_cuda_llama.cu` 覆盖整模型的参数搬运 / 增量解码 / 反向 / 收敛。
+MHA 与 Embedding，`tests/test_cuda_llama.cu` 覆盖整模型的参数搬运 / 增量解码 / 反向 / 收敛，
+`tests/test_cuda_attention.cu` 覆盖融合注意力（与非融合实现 / 主机算式三方对拍、分块无关性、
+"不物化"的状态断言与收益量化），`tests/test_cuda_precision.cu` 覆盖混精度（误差模型的校准与
+逐源验证、`cast` 与主机 `narrow` 逐位一致、`matmul` 拒绝隐式混精度）。
 细节见 `CUDA.md`。
 
 ### softmax 的两条路径，以及「优化没生效」这类失败
@@ -776,6 +779,57 @@ TF32 的 1e-3 一冲就没了；而且它在测试机（Pascal P4）上**看不�
 **抛异常**而不是静默降级（静默降级会让你在测试机上"验证过"一个在目标机上没生效的加速）。
 `Dgemm` 不受 TF32 影响，两种模式下都是真双精度。
 
+### 融合注意力：怎么证明「不物化」不只是一句口号
+
+`jas_cuda_attention.hpp` 的卖点是「概率矩阵不进显存」。但这件事最容易退化成一个自述：
+代码看着是分块流的、用例全绿，而中间矩阵其实还在某处 `allocate`。所以验收分三层：
+
+| 层次 | 怎么验 |
+|------|--------|
+| 数值 | 融合前向与**非融合实现**和**主机算式**三方对拍；反向与有限差分对拍 |
+| 结构 | 直接断言 `m_weights` 为空、`m_lse` 非空 —— "省掉了"必须能在**状态**上看见，而不是只能从耗时去推测 |
+| 收益 | `weights_bytes()` 把省下的量算出来，比值必须**恰好**等于 `len` |
+
+第三层不是走形式。`weights_bytes` 的第一版把 `d_head` 也乘了进去（成了每头一份
+`q_len × len × d_head` 的矩阵），比值就成了 `len·d_head/(d_head+1)` —— 一个 2048 上下文、
+32 头 / `d_head=64` 的层会被报成 65536 MiB（真值是 1024 MiB）。它**看起来只差百分之几**，
+光看"省了两千倍"根本发现不了。把比值卡成恰好 `len` 之后，这类夸大口径立刻现形。
+
+分块（`bc`）的测法与 softmax 的两条路径同构：`flash_attention_block_cols_override()` 把分块
+硬压到 1、压到 `len`、再留自动值，三档必须给出**同一个结果**。这是分块逻辑唯一的独立裁判 ——
+只跑自动值的话，分块写错会因为"恰好整块装下"而完全看不出来。
+
+有一条与分块绑死的 bug 值得记：前向里旧累加和的缩放写成 `s_l[warp] * corr`（每个 lane 都算一遍），
+被 warp 归约求和后等于把 `s_l[warp]` 加了 32 次。`bc >= len` 时 `s_l` 恒为 0，
+所以**单块用例全绿**，只有分块才错，而且错得像是"精度问题"。
+
+### 混精度：容差必须是算出来的，不是哄出来的
+
+降精度最容易滑向"把容差放宽到 1e-2、然后什么都不验"。这组用例拒绝那条路，改成
+**证明误差只来自它该来的地方**。误差只有四个来源，每个单独验：
+
+| 来源 | 上界 | 怎么验 |
+|------|------|--------|
+| 操作数量化 | `2·u_op` | 与"不舍入"的参考比，差异必须**明显大于**累加项（否则说明降精度压根没生效） |
+| 乘积 | **0** | 与"先把操作数舍入、再用 double 算"的参考比，差异只该落在累加项之内 |
+| 累加 | `K·u_fp32` | 同一条断言的反面：**若 cuBLAS 用 16 位累加，这条会以量级之差失败** |
+| 结果舍入 | `u_out` | 输出降精度那一档，与"同一个 gemm 但输出留 fp32"比 —— 差的正好是那一次舍入 |
+
+最后一行有个反例值得留档：这一条最初拿"把数学参考也量化一次"当基准。那份参考把结果舍入也做了
+一遍，**两次舍入互相抵消**，于是测出来的只有累加误差（实测 0），"输出类型到底生效没有"
+根本没被验证。换基准之后实测 2.7e-3 —— 正好是 `bf16` 的 `u` 量级。
+
+模型本身也要先校准：`u = 2^-(m+1)` 里 `m` 写错一个比特就是差一倍，所以第一条用例先拿
+"实测最大舍入误差"去比模型上界（实测占上界 99.6%，说明模型没写错）。另有一条比两种格式的
+实测误差，比值应当落在 8 附近（尾数 7 位对 10 位，差 3 位）—— 这条的样本要够多，
+否则比的是抽样噪声而不是模型（单种子下曾量到 17.6，扩到四个种子 × 64 元素之后回到 9.2）。
+
+`cast` 单独钉一条：设备端 `cast<bf16_t>` 必须与主机端 `narrow` **逐位一致**，
+不然"设备上算的"和"主机上算的"是两份不同的量化，所有对拍都会失去意义。
+
+`matmul` 则从另一头设防：**隐式混精度在编译期就不通过**（`matmul(a<float>, b<bf16>)` 报错），
+要混必须显式 `cast`。理由是隐式提升会在表达式树里四处发生，而"哪一步降了精度"必须留在源码里。
+
 ### 相关文件
 
 | 文件 | 作用 |
@@ -787,6 +841,8 @@ TF32 的 1e-3 一冲就没了；而且它在测试机（Pascal P4）上**看不�
 | `jas_cuda_leaf.hpp` | 设备叶子 `dev_mat_t`（薄壳、转置、**独立前导维 + `view()` 零拷贝子视图**、**`row_slice()` 行子块**） |
 | `jas_cuda_gemm.hpp` | cuBLAS GEMM、`matmul` 三入口、`.dot()` 的定义、**精度 math mode 控制** |
 | `jas_cuda_reduce.hpp` | 广播叶子、`dev_colvec_t`/`dev_rowvec_t`、归约 kernel、`softmax_rows`（**单趟共享内存 + 三趟回退**） / `layer_norm` / `rms_norm` |
+| `jas_cuda_attention.hpp` | 融合注意力：online softmax + 共享内存 K/V 分块，前向/反向不物化概率矩阵（`choose_block_cols`、`attention_cache_t` / `attention_grad_t`、分块覆写与启动计数两个测试钩子） |
+| `jas_cuda_precision.hpp` | 混精度：`bf16_t` / `fp16_t`、误差模型（`precision_traits` / 量化 / 累加 / 总上界）、`narrow` / `widen` / `quantize`、`cast`、`to_host_double` / `from_host_double` |
 | `jas_cuda_kv_cache.hpp` | `dev_kv_cache_t` / `dev_kv_caches_t`（GQA）、`attend_cached` |
 | `jas_cuda_rope.hpp` | `dev_rope_t`：cos/sin 表上设备、两种配对约定、`start_pos` 偏移、逐头行子块、原地旋转、**反向** |
 | `jas_cuda_updator.hpp` | 设备端优化器 `dev_sgd_t` / `dev_adam_t` / `dev_nadam_t` / `dev_cache_updator_t`（原地 kernel） |
@@ -796,6 +852,8 @@ TF32 的 1e-3 一冲就没了；而且它在测试机（Pascal P4）上**看不�
 | `tests/test_cuda_backward.cu` | 反向传播与层库：优化器对拍、各层反向的「主机 + 有限差分」双裁判、RoPE 转置回旋、整栈训练逐步对拍 |
 | `tests/test_cuda_mha.cu` | 设备端 MHA / Embedding：单头与多头（MHA/GQA/MQA）对拍、参数梯度、独立有限差分、KV cache 解码路径、重复 id 的原子累加、越界 id 报错 |
 | `tests/test_cuda_llama.cu` | 整模型：参数搬运后逐层对拍主机、增量解码对拍、全参数有限差分、训练收敛自检 |
+| `tests/test_cuda_attention.cu` | 融合注意力：与非融合/主机三方对拍、因果性、分块无关性、反向有限差分、引擎记录语义、`m_weights` 必须为空 + 收益量化 |
+| `tests/test_cuda_precision.cu` | 混精度：`u` 校准、误差逐源验证（量化/乘积精确/累加/结果舍入）、`cast` 逐位一致、`matmul` 拒绝隐式混精度、`alpha`/`beta`、显存减半 |
 | `tests/test_expression_lifetime.cpp` | `ExpressionLifetime.*`：值类别契约 + 生命周期回归 |
 | `tests/test_cuda_fused.cu` | `CudaEnvironment.*` / `CudaDeviceTest.*`：设备契约 + 融合/GEMM 对拍 |
 | `tests/test_cuda_reduce.cu` | `CudaReduceContract.*` / `CudaReduceTest.*`：归约、softmax、归一化、注意力端到端 |
