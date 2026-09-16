@@ -643,8 +643,138 @@ ASAN_OPTIONS=detect_leaks=0 ./build-asan/tests/unit_tests --gtest_filter='-Llama
 `is_mat_dot` 这个判别 trait 就是为了在编译期把两种返回类型分别断言出来。
 
 `tests/test_cuda_fused.cu` 覆盖逐元素/GEMM 契约，`tests/test_cuda_reduce.cu` 覆盖归约、
-softmax、归一化层，`tests/test_cuda_dot.cu` 覆盖 `dot` 分派与注意力端到端
-（编译期断言 + 与主机逐元素对拍）。细节见 `CUDA.md`。
+softmax、归一化层，`tests/test_cuda_dot.cu` 覆盖 `dot` 分派与注意力端到端，
+`tests/test_cuda_kv_cache.cu` 覆盖设备 KV cache（容器级与主机 `kv_cache_t` 对拍、
+decode/prefill 注意力、GQA），`tests/test_cuda_rope.cu` 覆盖设备端 RoPE
+（与主机 `RoPE_net_t` 对拍、两种配对约定、逐头旋转、RoPE+KV cache 端到端），
+`tests/test_cuda_backward.cu` 覆盖反向传播与设备端层库，`tests/test_cuda_mha.cu` 覆盖设备端
+MHA 与 Embedding，`tests/test_cuda_llama.cu` 覆盖整模型的参数搬运 / 增量解码 / 反向 / 收敛。
+细节见 `CUDA.md`。
+
+### softmax 的两条路径，以及「优化没生效」这类失败
+
+`softmax_rows` 现在按「整行能否放得进共享内存」自动选路：放得下就把整行留在**共享内存**里，
+`max` / `exp`+求和 / 归一化全在片上做（全局读 1 遍 + 写 1 遍、每元素 `exp` 1 次）；
+放不下就回退到原来的三趟实现（读 3 遍 + 写 1 遍、`exp` 2 次）。两条路径的数值结构刻意一致，
+所以能互相回退。细节见 `CUDA.md` 5.6。
+
+这里有个测试上的陷阱值得单独记：**快路径一上线，所有小矩阵用例都会走它，回退路径就再也没人测了**。
+所以除了 `softmax_shared_launch_count()` 计数器（用来断言「该走快路径时确实走了」——
+优化的典型失败方式是**压根没生效**，结果照样正确、用例照样全绿），还留了
+`softmax_max_cols_override()` 把阈值压到 0，让**同一份输入两边各跑一遍再对拍**。
+另外两条边界单独有用例：恰好用满共享内存预算的行仍走单趟（顺带验证
+`cudaFuncSetAttribute` 的 opt-in 生效），超预算的行自动回退而不是启动失败。
+
+### RoPE：以主机实现为参照，而不是重写一遍公式
+
+设备端 RoPE 的对拍基准是主机端 `RoPE_net_t` 本身。若另写一份公式做参考，
+测出来的只是「两处实现都照着我写的公式抄对了」，而抄错的公式两边一致、照样全绿。
+用主机实现当参照，测的才是**口径一致**。
+
+三个口径是分开钉的：
+
+| 口径 | 为什么容易错 | 怎么钉 |
+|------|--------------|--------|
+| 列 `j` 用绝对位置 `start_pos + j` | decode 每步只喂一列，位置必须来自 cache 长度而非列下标 | `start_pos != 0` 的专项用例 |
+| 两种配对约定的区别 | 位置 0 处两者都是恒等变换，单 token 无法区分 | 多列输入 + 显式 `rope_pair_layout` |
+| 表与 kernel 的行下标映射一致 | `interleaved` 是 `(2i, 2i+1)`、`half_split` 是 `(i, i+d/2)` | 逐元素对拍 + **保持每对模长**（不依赖参考实现的性质检查） |
+
+`start_pos = 0` 时**只有第 0 列**是恒等（第 `j` 列的绝对位置就是 `j`），这点最容易被想当然，
+也有单独用例盯着。最后一条端到端用例把 RoPE → KV cache → attention 串起来，
+以主机侧同一条链（`RoPE_net_t` + `kv_cache_t` + 手写注意力公式）为参照。
+
+### 反向传播：两套互不相干的裁判，以及「只对拍主机」为什么不够
+
+每个梯度都跑两条独立验证（细节见 `CUDA.md` 9.4）：
+
+| 裁判 | 能抓什么 | 抓不到什么 |
+|------|----------|------------|
+| 与主机解析解逐元素对拍 | 实现与主机不一致（符号、转置、广播方向、除数是行数还是列数） | **两边犯同一个错**，或主机实现本身写错 |
+| 有限差分 `(L(x+ε) − L(x−ε)) / 2ε` | 公式本身写错（不依赖任何一份解析反向的正确性） | 数值放大后的偏差（噪声随 `1/ε` 增长） |
+
+有限差分用**设备前向**算 `L`，让两边算术一致，容差才能卡到 1e-5 而不是被 GEMM 求和顺序淹没。
+
+**顺序有硬约束**：必须先做有限差分、再做解析反向。因为设备端层的 `backward` 会**就地更新参数**
+（与主机一致），而有限差分必须在一整套固定参数上完成。同理，算切线的用例都要
+`set_lr(0)`。
+
+有一条纪律在这里第一次收到回报：`dev_mse_loss_t::loss` 最初漏了平方（`mean(y−target)` 
+而不是 `mean((y−target)²)`）。**它有下降趋势、形状也对、逐层梯度全部正常** ——
+只有端到端那条对拍把差异暴露成 `0.44 vs 2.07`。所以「训练能跑、损失在降」不能当验收标准。
+
+参数梯度没有直接返回值（是在 `backward` 里就地更新的），对拍时用
+「初始参数 − 更新后参数，再除以学习率」反推：sgd 下这是精确值，顺带把**参数更新语义**一起验了。
+
+### 训练的容差：第 0 步卡 1e-12，之后必须放宽
+
+端到端用例（`LayerNorm → Linear → SiLU → Linear → MSE` 训练 6 步，与主机同构栈逐步对拍）
+的容差刻意分两段：
+
+- **第 0 步 1e-12**：两边走的是**同一批参数**，只有 GEMM 求和顺序不同。这一步卡紧才有意义 —— 
+  它是「梯度确实算对了」的证明。
+- **之后 1e-7**：训练是个反馈过程，第 0 步的 ulp 级差异会被逐步放大。再卡紧就不是在测正确性，
+  而是在测混沌。
+
+同理，除了损失值，**参数也要跟着比**：某一条路径的更新语义不同（比如学习率用错、更新顺序颠倒）
+时，损失可能仍然在降，只有参数轨迹会分道扬镳。另有一条与主机无关的自检（60 步后损失确实下降）
+用来确认「一致的方向是对的」，而不是两条实现一起朝着错误方向走。
+
+### 差分要覆盖**每一个**参数矩阵，不能只钉头、中、尾
+
+整模型反向（`tests/test_cuda_llama.cu`）没有主机 backward 可以对照 —— `llama_model_t` 是纯推理
+实现 —— 所以有限差分是**唯一**的裁判。最初只在三处取参数（`wte`、某一层的 `W_Q`、`lm_head`），
+看起来「头、中、尾各钉一个」很合理，其实漏得不轻：**整栈反向里任何一处漏算、符号反了、
+或者 GQA 下少累加一个共享 KV 头，都只影响它自己那一段**，三处之外的错误可以安然通过。
+现在差分覆盖每一个参数矩阵（每层 9 个 + `wte` + `ln_f` + `lm_head`），总共约两千次前向、
+两秒以内 —— 这个价格换来的确定性远比省下的时间值钱。
+
+由此还得到一条分诊经验，写在这里免得下次误判：
+
+> **损失炸了先怀疑步长，不要先怀疑梯度。**
+> 朴素 SGD 只保证在 `lr < 2/λ_max` 内收敛，越界就是单调发散。实测同一套参数：`lr=0.05` 时
+> 60 步从 0.69 降到 3e-5；`lr=0.2` 时 60 步涨到 1e76。**这两件事长得一模一样**，
+> 分开它们靠的正是上面那条差分用例（它用一次更新 + 小学习率反推梯度，与步长无关）。
+> 顺带一提，收敛用例打印的是**整条损失轨迹**而不是首尾两点：「降得慢」和「先降后炸」
+> 只看首尾是分不出来的。
+
+### 零拷贝子视图：`dev_mat_t` 的逻辑列数和前导维是分开的
+
+`dev_mat_t` 原来只有 `m_rows` / `m_cols`，而 `m_cols` 同时充当「逻辑列数」和「存储步长」。
+于是「缓冲区按 `cap` 分配、只对外暴露前 `len` 列」这种视图**表达不出来** —— 每个 decode step
+都得把已用部分拷成紧凑缓冲，正好把 KV cache 的意义抵消掉（每步 O(len) 拷贝 × 步数 = O(len²)）。
+
+现在 `m_cols` 是逻辑列数、`m_ld` 是存储步长，`view(rows, cols)` 只改前者。
+`cuBLAS` 本来就支持 `ld > cols`，`gemm` 读的也是 `leading_dim()`，所以零拷贝视图能直接进 GEMM。
+
+**为什么不会读到 `cap - len` 那段"空闲"列**：转置视图下每个矩阵槽被解释成 `(k × n)`，
+其中**被 ld 乘的那个下标只遍历逻辑列数**（≤ ld），最大偏移因此落在缓冲区实长之内。
+用例里用 `ld=48, cols=16` 的视图直接做 GEMM 并与主机端逐元素对拍。
+
+顺带一条容易踩的：`keys()` 返回的薄壳**在扩容后即悬空**（扩容会重新分配缓冲区）。
+decode 前 `reserve()` 一次就不再分配，也是推荐用法。
+
+### GQA：用 API 形状消灭「重复 append」
+
+主机端 `jas_mha_t.hpp` 记录过一次事故：GQA 下「每个 Q 头各自 append」会把同一份 K/V
+写进同一个 KV 头两次，形状不报错、单步看似可用，到多轮对话才炸。
+
+设备端不靠注释，而是让这种写法**根本不可达**：多 KV 头容器 `dev_kv_caches_t` 的唯一写入入口是
+`append_all(k_full, v_full)`（一次写给**所有** KV 头），没有按单个 KV 头 append 的接口；
+按 KV 头的访问只有 `const` 只读形式；`kv_head_of(q_head)` 的映射由容器持有，调用方不必自己算分组。
+于是「各 KV 头长度恒等」是结构性质，而不是需要靠用例维护的不变量。
+
+### 精度：默认不用 TF32（跨机器可复现的前提）
+
+Ampere 及以后的卡上，单精度 GEMM 可以走 **TF32 张量核**（尾数只剩 10 位，相对误差约 1e-3），
+而开不开取决于 math mode 与 `NVIDIA_TF32_OVERRIDE` 环境变量 —— **同一份代码在不同机器上数值不同**。
+
+本项目的整套对拍基准是「与主机参考逐元素对齐」，float 用的是 1e-5 量级的相对容差，
+TF32 的 1e-3 一冲就没了；而且它在测试机（Pascal P4）上**看不出来**，到目标机才发现。
+
+所以 `cublasCreate` 之后立刻钉死 `CUBLAS_PEDANTIC_MATH`（真 FP32/FP64），
+要 TF32 得显式 `cuda::set_gemm_math(cuda::gemm_math::tf32)`；在不支持 TF32 的卡上请求它会
+**抛异常**而不是静默降级（静默降级会让你在测试机上"验证过"一个在目标机上没生效的加速）。
+`Dgemm` 不受 TF32 影响，两种模式下都是真双精度。
 
 ### 相关文件
 
@@ -654,8 +784,18 @@ softmax、归一化层，`tests/test_cuda_dot.cu` 覆盖 `dot` 分派与注意�
 | `jas_mat_concepts.hpp` | `is_caculable`（判标量前 `remove_cvref`） |
 | `jas_mat_t.hpp` / `jas_mat_view_t.hpp` | `.dot()` 的 ref-qualified 声明；访问器的 `JAS_HD` 标注 |
 | `jas_cuda_compat.hpp` | `JAS_HD` / `JAS_DEV`、设备安全数学、`device_evaluable` 探测 |
-| `jas_cuda_gemm.hpp` | cuBLAS GEMM、`matmul` 三入口、`.dot()` 的定义 |
-| `jas_cuda_reduce.hpp` | 广播叶子、`dev_colvec_t`/`dev_rowvec_t`、归约 kernel、`softmax_rows` / `layer_norm` / `rms_norm` |
+| `jas_cuda_leaf.hpp` | 设备叶子 `dev_mat_t`（薄壳、转置、**独立前导维 + `view()` 零拷贝子视图**、**`row_slice()` 行子块**） |
+| `jas_cuda_gemm.hpp` | cuBLAS GEMM、`matmul` 三入口、`.dot()` 的定义、**精度 math mode 控制** |
+| `jas_cuda_reduce.hpp` | 广播叶子、`dev_colvec_t`/`dev_rowvec_t`、归约 kernel、`softmax_rows`（**单趟共享内存 + 三趟回退**） / `layer_norm` / `rms_norm` |
+| `jas_cuda_kv_cache.hpp` | `dev_kv_cache_t` / `dev_kv_caches_t`（GQA）、`attend_cached` |
+| `jas_cuda_rope.hpp` | `dev_rope_t`：cos/sin 表上设备、两种配对约定、`start_pos` 偏移、逐头行子块、原地旋转、**反向** |
+| `jas_cuda_updator.hpp` | 设备端优化器 `dev_sgd_t` / `dev_adam_t` / `dev_nadam_t` / `dev_cache_updator_t`（原地 kernel） |
+| `jas_cuda_net.hpp` | 设备端层库：linear / layer_norm / rms_norm / silu / gated / residual / mse，forward + backward |
+| `tests/test_cuda_kv_cache.cu` | 设备 KV cache：容器对拍、decode/prefill、GQA、扩容与边界、精度模式 |
+| `tests/test_cuda_rope.cu` | 设备 RoPE：与主机 `RoPE_net_t` 对拍、配对约定、`start_pos`、逐头、`row_slice` 地址运算、RoPE+KV cache 端到端 |
+| `tests/test_cuda_backward.cu` | 反向传播与层库：优化器对拍、各层反向的「主机 + 有限差分」双裁判、RoPE 转置回旋、整栈训练逐步对拍 |
+| `tests/test_cuda_mha.cu` | 设备端 MHA / Embedding：单头与多头（MHA/GQA/MQA）对拍、参数梯度、独立有限差分、KV cache 解码路径、重复 id 的原子累加、越界 id 报错 |
+| `tests/test_cuda_llama.cu` | 整模型：参数搬运后逐层对拍主机、增量解码对拍、全参数有限差分、训练收敛自检 |
 | `tests/test_expression_lifetime.cpp` | `ExpressionLifetime.*`：值类别契约 + 生命周期回归 |
 | `tests/test_cuda_fused.cu` | `CudaEnvironment.*` / `CudaDeviceTest.*`：设备契约 + 融合/GEMM 对拍 |
 | `tests/test_cuda_reduce.cu` | `CudaReduceContract.*` / `CudaReduceTest.*`：归约、softmax、归一化、注意力端到端 |

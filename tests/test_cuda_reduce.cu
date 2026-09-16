@@ -468,6 +468,152 @@ TEST_F(CudaReduceTest, HsoftmaxAcceptsAnExpression)
 }
 
 // ---------------------------------------------------------------------------
+// softmax 的路径选择：单趟共享内存 / 三趟回退
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+/**
+ * 覆盖值的作用域守卫。
+ *
+ * 用 ASSERT_* 的辅助函数会提前 return，不能靠函数末尾手动恢复；一旦残留，
+ * 后续用例会莫名其妙地走错路径。析构恢复才可靠。
+ */
+struct SoftmaxPathScope
+{
+    SoftmaxPathScope() { cuda::softmax_max_cols_override() = -1; }
+    ~SoftmaxPathScope() { cuda::softmax_max_cols_override() = -1; }
+
+    void force_fallback() { cuda::softmax_max_cols_override() = 0; }
+};
+
+/**
+ * 同一份输入分别走单趟路径与三趟回退路径，都要求与主机 `hsoftmax` 一致。
+ *
+ * 这是「两条路径不许分叉」的直接表达。必须显式检查**走了哪条路**：
+ * 优化的典型失败方式不是算错，而是压根没生效 —— 阈值算错、分支写反，
+ * 结果照样正确、测例照样全绿。计数器就是防这个的。
+ */
+void expect_softmax_both_paths_match_host(const mat_t<double>& h, const char* what,
+                                          SoftmaxPathScope& scope)
+{
+    cuda::dev_matrix_t<double> d(h.row_num(), h.col_num(), h);
+    const mat_t<double> ref = hsoftmax(h).clone();
+    const int before = cuda::softmax_shared_launch_count();
+
+    cuda::softmax_max_cols_override() = -1;
+    auto fast = cuda::softmax_rows(d.leaf()).download();
+    ASSERT_EQ(cuda::softmax_shared_launch_count(), before + 1)
+        << what << "：行放得下时应当走单趟路径";
+    expect_matrices_match(fast, ref, 1e-12, what);
+
+    scope.force_fallback();
+    auto slow = cuda::softmax_rows(d.leaf()).download();
+    ASSERT_EQ(cuda::softmax_shared_launch_count(), before + 1)
+        << what << "：覆盖值生效后不该再走单趟路径";
+    expect_matrices_match(slow, ref, 1e-12, what);
+
+    cuda::softmax_max_cols_override() = -1;
+}
+
+} // namespace
+
+TEST_F(CudaReduceTest, BothSoftmaxPathsMatchHost)
+{
+    SoftmaxPathScope scope;
+
+    expect_softmax_both_paths_match_host(make_host_signed<double>(12, 20, 0.7), "普通输入", scope);
+    expect_softmax_both_paths_match_host(make_host_signed<double>(1, 300, 0.9), "单行宽", scope);
+    expect_softmax_both_paths_match_host(make_host_signed<double>(5, 2, 1.7), "窄行", scope);
+
+    // 大值：不先减最大值就会溢出成 inf
+    mat_t<double> big(6, 18);
+    for (int i = 0; i < 6; ++i)
+        for (int j = 0; j < 18; ++j)
+            big(i, j) = 1000.0 + static_cast<double>(i * 3 + j);
+    expect_softmax_both_paths_match_host(big, "大值", scope);
+
+    // 因果掩码：-inf 在两条路径上都必须恰好归零
+    const int n = 7;
+    mat_t<double> masked = make_host_signed<double>(n, n, 0.5);
+    for (int i = 0; i < n; ++i)
+        for (int j = i + 1; j < n; ++j)
+            masked(i, j) = -std::numeric_limits<double>::infinity();
+    expect_softmax_both_paths_match_host(masked, "因果掩码", scope);
+}
+
+TEST_F(CudaReduceTest, SoftmaxPathsAgreeOnFloat)
+{
+    cuda::softmax_max_cols_override() = -1;
+    const int rows = 9, cols = 15;
+    auto h = make_host_signed<float>(rows, cols, 0.6f);
+    cuda::dev_matrix_t<float> d(rows, cols, h);
+
+    const int before = cuda::softmax_shared_launch_count();
+    auto fast = cuda::softmax_rows(d.leaf()).download();
+    ASSERT_EQ(cuda::softmax_shared_launch_count(), before + 1);
+
+    cuda::softmax_max_cols_override() = 0;
+    auto slow = cuda::softmax_rows(d.leaf()).download();
+    ASSERT_EQ(cuda::softmax_shared_launch_count(), before + 1);
+    cuda::softmax_max_cols_override() = -1;
+
+    for (int i = 0; i < rows; ++i)
+        for (int j = 0; j < cols; ++j)
+            ASSERT_NEAR(fast(i, j), slow(i, j), 1e-6)
+                << "float 两条路径在 (" << i << "," << j << ") 不一致";
+}
+
+TEST_F(CudaReduceTest, SoftmaxPicksFallbackWhenRowExceedsSharedMemory)
+{
+    // 不设覆盖，用真实阈值：造一行放不进共享内存的输入，
+    // 必须自动回退而不是让 kernel 启动失败
+    cuda::softmax_max_cols_override() = -1;
+    const int max_cols = cuda::softmax_shared_max_cols<double>();
+    ASSERT_GT(max_cols, 0) << "设备报出的动态共享内存上限异常";
+    const int cols = max_cols + 1;
+
+    auto h = make_host_signed<double>(1, cols, 0.25);
+    cuda::dev_matrix_t<double> d(1, cols, h);
+
+    const int before = cuda::softmax_shared_launch_count();
+    auto got = cuda::softmax_rows(d.leaf()).download();
+    ASSERT_EQ(cuda::softmax_shared_launch_count(), before)
+        << "行放不下时应当自动回退到三趟路径";
+
+    double s = 0.0;
+    for (int j = 0; j < cols; ++j)
+        s += got(0, j);
+    ASSERT_NEAR(s, 1.0, 1e-12);
+}
+
+TEST_F(CudaReduceTest, SoftmaxSharedPathHandlesMaxSizedRow)
+{
+    // 边界：恰好用满共享内存预算的那一行仍要走单趟路径，
+    // 同时也就验证了 cudaFuncSetAttribute 的 opt-in 生效
+    cuda::softmax_max_cols_override() = -1;
+    const int cols = cuda::softmax_shared_max_cols<double>();
+    ASSERT_GT(cols, 0);
+
+    auto h = make_host_signed<double>(2, cols, 0.3);
+    cuda::dev_matrix_t<double> d(2, cols, h);
+
+    const int before = cuda::softmax_shared_launch_count();
+    auto got = cuda::softmax_rows(d.leaf()).download();
+    ASSERT_EQ(cuda::softmax_shared_launch_count(), before + 1)
+        << "恰好装满共享内存的行应当仍走单趟路径";
+
+    for (int i = 0; i < 2; ++i)
+    {
+        double s = 0.0;
+        for (int j = 0; j < cols; ++j)
+            s += got(i, j);
+        ASSERT_NEAR(s, 1.0, 1e-12) << "第 " << i << " 行";
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LayerNorm / RMSNorm
 // ---------------------------------------------------------------------------
 

@@ -29,6 +29,22 @@
  * 各组合都已验证：不转置时 op = `CUBLAS_OP_N`（直接用那个转置视图），
  * 转置时 op = `CUBLAS_OP_T`（再转回来）。前导维一律用**未经转置解释的存储步长**
  * `leading_dim()` —— 转置只改索引解释，内存布局没动。
+ *
+ * 注意 `leading_dim()` **可以大于** `col_num()`（见 jas_cuda_leaf.hpp 的 `view()`）：
+ * KV cache 那种「按 cap 分配、只暴露前 len 列」的子视图就是这样传给 cuBLAS 的，
+ * 仍然是零拷贝。cuBLAS 本身完全支持 ld > cols，这里不能拿 col_num() 当 ld 用。
+ *
+ * 这样也不会越界读到 cap - len 那段"空闲"列：转置视图下每个矩阵槽被解释成
+ * `(k × n)`，其中**被 ld 乘的那个下标只遍历逻辑列数**，而逻辑列数 ≤ ld，
+ * 所以最大偏移落在缓冲区实长之内。即「按 cap 分配、只暴露前 len 列」多出来的
+ * 那段空间永远不会被 GEMM 碰到 —— 这正是子视图能零拷贝的直接原因。
+ *
+ * ## 精度：默认不用 TF32
+ *
+ * Ampere 及以后单精度 GEMM 可以走 TF32 张量核（尾数只剩 10 位），而开不开取决于
+ * math mode 与环境变量 —— 于是「同一份代码在不同机器上数值不同」。
+ * 本项目整套测试的基准就是「与主机参考逐元素对齐」，所以默认钉死 `gemm_math::precise`
+ * （`CUBLAS_PEDANTIC_MATH`），要 TF32 得显式 `set_gemm_math(gemm_math::tf32)`。
  */
 
 #include <cstddef>
@@ -80,15 +96,79 @@ private:
 namespace jasmine {
 namespace cuda {
 
+/**
+ * GEMM 的数学模式。
+ *
+ * 这不是可有可无的开关。Ampere 及以后的卡上，单精度 GEMM 可以选择走 **TF32 张量核** ——
+ * 指数位仍是 8 位，但尾数只剩 **10 位**，相对误差约 1e-3。
+ * 而 CUDA 的行为受「math mode + NVIDIA_TF32_OVERRIDE 环境变量」共同影响，
+ * 也就是说**同一份代码在不同机器上会给出不同数值**。
+ *
+ * 对本项目这是个陷阱：我们整套测试的价值就在于「设备结果与主机参考逐元素对齐」，
+ * 如果 GEMM 精度随机器漂移，那条基准线就没意义了（float 对拍用的是 1e-5 量级的相对容差，
+ * TF32 的 1e-3 直接把它冲掉）。
+ *
+ * 所以默认取 `precise`，把这层不确定性从默认路径上拿掉；
+ * 想要速度的显式调 `set_gemm_math(gemm_math::tf32)`，那时也知道自己换掉了什么。
+ * （double 的 Dgemm 不受 TF32 影响，两种模式下都是真双精度。）
+ */
+enum class gemm_math
+{
+    precise, // CUBLAS_PEDANTIC_MATH：强制真 FP32/FP64，跨机器可复现
+    tf32,    // CUBLAS_TF32_TENSOR_OP_MATH：Ampere+ 单精度走 TF32 张量核，快但尾数少 13 位
+};
+
+namespace detail {
+
+inline gemm_math& gemm_math_mode_ref()
+{
+    static gemm_math mode = gemm_math::precise;
+    return mode;
+}
+
 /** 进程内共享一个 cuBLAS 句柄。句柄创建有开销，没必要每次 GEMM 都建。 */
-inline cublasHandle_t cublas_handle()
+inline cublasHandle_t& cublas_handle_ref()
 {
     static cublasHandle_t handle = [] {
         cublasHandle_t h = nullptr;
         JAS_CUBLAS_CHECK(cublasCreate(&h));
+        // 建句柄时就钉死精度，别等某次 GEMM 才让结果悄悄变掉
+        JAS_CUBLAS_CHECK(cublasSetMathMode(h, CUBLAS_PEDANTIC_MATH));
         return h;
     }();
     return handle;
+}
+
+} // namespace detail
+
+inline cublasHandle_t cublas_handle() { return detail::cublas_handle_ref(); }
+
+/** 当前 GEMM 数学模式。 */
+inline gemm_math gemm_math_mode() { return detail::gemm_math_mode_ref(); }
+
+/** 本机是否支持 TF32 张量核（Ampere 及以后，即 sm_80+）。 */
+inline bool tf32_supported()
+{
+    return device_info().compute_capability() >= 80;
+}
+
+/**
+ * 切换 GEMM 数学模式。要求设备真实存在（会查询算力）。
+ *
+ * 在 P4（sm_61）这类没有 TF32 的卡上请求 `tf32` 会抛异常，而不是**静默降级成 FP32** ——
+ * 静默降级会让你在测试机上「验证过」的加速在目标机上完全没生效，却毫无提示。
+ */
+inline void set_gemm_math(gemm_math mode)
+{
+    if (mode == gemm_math::tf32 && !tf32_supported())
+        throw std::runtime_error(
+            "set_gemm_math(tf32): 本设备算力 "
+            + std::to_string(device_info().compute_capability())
+            + " 不支持 TF32（需要 sm_80 及以上）");
+    const cublasMath_t m = (mode == gemm_math::tf32) ? CUBLAS_TF32_TENSOR_OP_MATH
+                                                     : CUBLAS_PEDANTIC_MATH;
+    JAS_CUBLAS_CHECK(cublasSetMathMode(cublas_handle(), m));
+    detail::gemm_math_mode_ref() = mode;
 }
 
 /**

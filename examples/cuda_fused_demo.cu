@@ -18,11 +18,14 @@
 #include "jas_cuda_buffer.hpp"
 #include "jas_cuda_fused.hpp"
 #include "jas_cuda_gemm.hpp"
+#include "jas_cuda_kv_cache.hpp"
 #include "jas_cuda_leaf.hpp"
 #include "jas_cuda_matrix.hpp"
 #include "jas_cuda_reduce.hpp"
+#include "jas_cuda_rope.hpp"
 #include "jas_mat_t.hpp"
 #include "jas_net_t.hpp"
+#include "jas_RoPE_t.hpp"
 #include "jas_updator_t.hpp"
 
 using namespace jasmine;
@@ -304,6 +307,128 @@ int main(int argc, char** argv)
     auto ln_host = ln.forward(hx);
     std::printf("  LayerNorm（%d×%d）\n", d_model, seq2);
     print_diff(ln_dev, ln_host);
+
+    // ---------------------------------------------------------------------
+    // 多轮 decode：设备端 KV cache + 逐头 RoPE
+    // ---------------------------------------------------------------------
+    std::printf("\n=== 多轮 decode（设备 KV cache + 逐头 RoPE + GQA）===\n");
+    {
+        const int num_heads = 4;
+        const int num_kv_heads = 2; // GQA：每 2 个 Q 头共享 1 个 KV 头
+        const int d_head = 32;
+        const int steps = 16;
+        const int d_kv = num_kv_heads * d_head;
+
+        cuda::dev_kv_caches_t<double> caches;
+        // 容量刻意留出余量：这样 keys() 的"逻辑列数"与"存储前导维"就看得出不同
+        caches.configure(num_heads, num_kv_heads, d_head, steps * 3);
+
+        // RoPE 作用在 d_head 上（不是打包后的 d_kv）
+        cuda::dev_rope_t<double> rope(d_head);
+        rope.reserve(steps + 2);
+        RoPE_net_t<mat_t<double>> host_rope(d_head);
+
+        // 逐头 RoPE：打包成 (num_heads * d_head) 的行按头切成**行子块**（零拷贝），
+        // 各自旋转到目标矩阵的对应行段。row_slice 就是为这个场景加的。
+        auto rope_heads = [&](const dev_mat_t<double>& src, cuda::dev_matrix_t<double>& dst,
+                              int heads, int pos) {
+            for (int g = 0; g < heads; ++g)
+                rope.rotate_into(row_slice(src, g * d_head, d_head),
+                                 row_slice(dst.leaf(), g * d_head, d_head), pos);
+        };
+        // 主机侧同一操作的参考实现
+        auto host_rope_heads = [&](const mat_t<double>& src, int heads, int pos) {
+            mat_t<double> dst(src.row_num(), src.col_num());
+            for (int g = 0; g < heads; ++g)
+            {
+                mat_t<double> head(d_head, src.col_num());
+                for (int i = 0; i < d_head; ++i)
+                    for (int j = 0; j < src.col_num(); ++j)
+                        head(i, j) = src(g * d_head + i, j);
+                auto rotated = host_rope.forward_at(head, pos);
+                for (int i = 0; i < d_head; ++i)
+                    for (int j = 0; j < src.col_num(); ++j)
+                        dst(g * d_head + i, j) = rotated(i, j);
+            }
+            return dst;
+        };
+
+        // 主机侧照旧累积整块 K/V，用来对拍
+        std::vector<mat_t<double>> host_k;
+        std::vector<mat_t<double>> host_v;
+
+        double worst_k = 0.0;
+        double worst = 0.0;
+        for (int s = 0; s < steps; ++s)
+        {
+            mat_t<double> k = make_host(d_kv, 1, 0.1 + 0.01 * s);
+            mat_t<double> v = make_host(d_kv, 1, -0.05 + 0.005 * s);
+            host_k.push_back(k);
+            host_v.push_back(v);
+
+            cuda::dev_matrix_t<double> dk(d_kv, 1, k), dv(d_kv, 1, v);
+
+            // 契约：进 KV cache 的 K **必须是旋转过的**，位置是该 token 的绝对位置
+            cuda::dev_matrix_t<double> k_rot(d_kv, 1);
+            rope_heads(dk.const_leaf(), k_rot, num_kv_heads, s);
+            worst_k = std::max(worst_k, max_abs_diff(k_rot.download(),
+                                                     host_rope_heads(k, num_kv_heads, s))
+                                                   .max_abs);
+
+            // 唯一的写入入口：一批 token 一次写进**所有** KV 头。
+            // 所以 GQA 下"多个 Q 头各自 append 同一个 KV 头"这种写法压根表达不出来。
+            caches.append_all(k_rot.const_leaf(), dv);
+
+            for (int h = 0; h < num_heads; ++h)
+            {
+                mat_t<double> q = make_host(d_head, 1, 0.03 * (h + 1) + 0.001 * s);
+                cuda::dev_matrix_t<double> dq(d_head, 1, q);
+
+                // Q 同样要旋转，位置是当前步
+                auto q_rot = rope.forward_at(dq.const_leaf(), s);
+                // Q→KV 头的映射由容器内部完成，调用方不必自己算分组
+                mat_t<double> got = caches.attend_q_head(h, q_rot.const_leaf()).download();
+
+                const int g = caches.kv_head_of(h);
+                mat_t<double> k_g(d_head, s + 1), v_g(d_head, s + 1);
+                for (int j = 0; j <= s; ++j)
+                {
+                    // cache 里存的是**旋转后**的 K：位置 j 的 token 用位置 j 旋转
+                    mat_t<double> k_head(d_head, 1);
+                    for (int i = 0; i < d_head; ++i)
+                        k_head(i, 0) = host_k[static_cast<std::size_t>(j)](g * d_head + i, 0);
+                    auto k_used = host_rope.forward_at(k_head, j);
+                    for (int i = 0; i < d_head; ++i)
+                    {
+                        k_g(i, j) = k_used(i, 0);
+                        v_g(i, j) = host_v[static_cast<std::size_t>(j)](g * d_head + i, 0);
+                    }
+                }
+
+                mat_t<double> q_used = host_rope.forward_at(q, s);
+                mat_t<double> scores = q_used.t().dot(k_g) / std::sqrt(static_cast<double>(d_head));
+                mat_t<double> weights = hsoftmax(scores);
+                mat_t<double> want = v_g.dot(weights.t());
+
+                worst = std::max(worst, max_abs_diff(got, want).max_abs);
+            }
+        }
+
+        std::printf("  %d 步 × %d 个 Q 头 = %d 次注意力，全部与主机端实现逐元素对拍\n", steps,
+                    num_heads, steps * num_heads);
+        std::printf("  RoPE（逐头，旋转后的 K）最大绝对误差: %.3e\n", worst_k);
+        std::printf("  注意力输出最大绝对误差: %.3e\n", worst);
+
+        const cuda::dev_kv_cache_t<double>& head0 = caches.cache_of_kv_head(0);
+        std::printf("  KV 头 0：容量 %d 步、已用 %d 步\n", head0.capacity(), head0.length());
+
+        // 零拷贝视图：逻辑列数是"已用长度"，存储前导维是"容量"，两者不等
+        const dev_mat_t<double> keys = head0.keys();
+        std::printf("  keys() 视图: %d×%d，存储前导维 %d（= 容量，不是已用长度）\n",
+                    keys.row_num(), keys.col_num(), keys.leading_dim());
+        std::printf("  → 视图直接指向 cache 缓冲区，每步都零拷贝；这是 dev_mat_t 把逻辑列数\n"
+                    "     与前导维分开的直接好处（cuBLAS 支持 ld > cols，所以直接喂给 GEMM 即可）\n");
+    }
 
     print_temperature();
     return 0;

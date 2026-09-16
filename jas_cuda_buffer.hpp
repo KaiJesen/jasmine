@@ -217,6 +217,22 @@ inline void sync()
     JAS_CUDA_CHECK(cudaDeviceSynchronize());
 }
 
+/**
+ * 单块可用的动态共享内存上限（opt-in 之后）。
+ *
+ * Pascal 是 48 KiB，Ampere 视型号可到 100+ KiB。调用方用它判断「整行能否放得下」，
+ * 放不下就走回退路径，而不是让 kernel 启动失败。
+ */
+inline int max_dynamic_shared_bytes()
+{
+    static int v = [] {
+        int m = 0;
+        JAS_CUDA_CHECK(cudaDeviceGetAttribute(&m, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
+        return m > 0 ? m : 48 * 1024;
+    }();
+    return v;
+}
+
 /** 分配主机端「钉住的」（page-locked）内存，用于高频 H2D/D2H 时避免分页开销。 */
 template <typename T>
 class pinned_buf_t
