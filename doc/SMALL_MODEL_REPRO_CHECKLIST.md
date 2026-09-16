@@ -42,10 +42,29 @@
   - `jas_gelu_t.hpp` 的 `gelu_net_t`，接入 pre-norm FFN 分支
   - 注意：必须用 tanh 近似版，精确 erf 版与 GPT-2 对不上
   - 验收：`Gelu.*`（含数值梯度自检）
+- [x] **RMSNorm**
+  - `jas_net_t.hpp` 的 `rms_norm_net_t`，紧邻 `layer_norm_net_t` 便于对照
+  - 与 LayerNorm 的实质差别只有三处：**不减均值**、**没有 beta**、eps 加在均方值上
+  - eps 可通过 `set_param(d_model, eps)` 配置（对齐开源权重时要读模型 config：LLaMA 系 1e-5 / 1e-6 都有）
+  - 反向 = LayerNorm 的反向**删掉 `mean(g)` 那一项**，σ 换成 rms
+  - 验收：`RmsNorm.*`（13 例，含数值梯度 + PyTorch float64 基准 + "均值项必须删对"的反向断言）
 - [ ] **SwiGLU FFN**
-  - 对齐 LLaMA 系时再做；门控 FFN 尚未实现
-- [—] **GQA**
-  - 现状：标准 MHA；小模型可先不做，KV cache 已够用
+  - [x] 门控容器 `gated_net_t<gate, up>`：两分支共享输入、**逐元素乘**汇合
+  - [x] `silu_net_t`（`x⊙σ(x)`，含解析梯度）
+  - [x] `gated_ffn_branches_t<val_type, updator, act>`：换激活即得 GEGLU / ReGLU
+  - [ ] 接入 LLaMA 系模型；完整 FFN = `gated(...) → down_proj`
+  - 验收：`Gated.*`（11 例，含数值梯度 + PyTorch 端到端对撞）、`tools/verify_swiglu.py`
+- [x] **GQA / MQA**
+  - 实现方式：**参数化 `mat_mha_t`**，新增尾置参数 `n_kv_heads`（默认 0 ⇒ 等于 `num_heads`）
+    - `n_kv_heads == n_heads` → 经典 MHA（与旧实现逐位一致，现有 119 例全绿）
+    - `1 < n_kv_heads < n_heads` → GQA；`n_kv_heads == 1` → MQA（白送）
+  - 与 MHA 的差异只有三处：K/V 投影输出宽度变成 `n_kv_heads*d_head`、KV cache 只存 `n_kv_heads` 份、反向时共享 KV 头的多个 Q 头梯度**累加**
+  - 注意力核 `mat_head_gen_t` **零改动** —— 它本来就只认切好的 Q/K/V
+  - `forward/forward_one/backward/forward_at`（cross-attn）全部支持
+  - 验收：`Gqa.*`（11 例）；关键两例已做**变异测试**验证有效
+    - `Gqa.KvCacheGetsOneAppendPerKvHead`：naive 复用 `forward_one_at` 会让 cache 长度变成 `T*group_size`
+    - `Gqa.BackwardSumsKvGradientsAcrossGroup`：错用 `assign` 会只剩下组内最后一个 Q 头的贡献
+  - 权重加载：`num_kv_heads()/group_size()/d_head()/d_kv()` 供切分 fused QKV；LLaMA 的 `k_proj/v_proj` 直接是 `n_kv_heads*d_head` 行，无需复制
 
 ---
 
@@ -227,18 +246,23 @@ argmax 全位置一致，greedy 生成逐 token 与 HF 完全相同。
 ```
 
 已完成到「加载开源权重 + logits 黄金对齐」（GPT-2 / distilgpt2，见 §8）；
-剩余：从零训练配方（§5）与 SwiGLU / GQA（对齐 LLaMA 系时）。
+LLaMA 系的四块积木 —— **RMSNorm / RoPE / GQA / SwiGLU** —— 现已全部就绪且各自单测通过，
+剩余：用它们拼出 LLaMA 系模型（`jas_llama_t.hpp` + 导出/加载脚本 + 逐层对齐）
+与从零训练配方（§5）。
 
 ---
 
 ## 已具备（勿重复造轮子）
 
-- [x] 因果 MHA、RoPE(Q/K，可开关)、LayerNorm、FFN(ReLU)
+- [x] 因果 MHA（含 GQA / MQA 参数化）、RoPE(Q/K，可开关)、LayerNorm / **RMSNorm**、FFN(ReLU)
 - [x] `decoder_only_t`（无 cross-attn）
 - [x] Embedding / CE / pad·position mask
 - [x] 推理 KV cache（`forward_one`）
 - [x] enc–dec 玩具 demo（MSE / CE）——可作对照，不是 LM 复现终点
 - [x] Pre-norm 分支 + `gelu_net_t` + 绝对位置 + 权重绑定（`jas_gpt2_t.hpp`）
+- [x] 门控容器 `gated_net_t` + `silu_net_t` + `gated_ffn_branches_t`（SwiGLU / GEGLU / ReGLU 骨架）
+- [x] GQA / MQA（`mat_mha_t` 的 `n_kv_heads` 参数化，注意力核零改动）
+- [x] RMSNorm（`rms_norm_net_t`，eps 可配）
 - [x] 权重加载器（`jas_weight_io.hpp`）+ GPT-2 导出脚本 + 黄金对齐单测
 - [x] KV-cache 生成 demo（`examples/gpt2_generate.*`）
 
@@ -258,6 +282,14 @@ argmax 全位置一致，greedy 生成逐 token 与 HF 完全相同。
 | 逐 token `decode` 做流式输出 | 多字节字符被切成半个 token 时 HF 会替换成 U+FFFD，原始字节丢失，终端显示 `I��m`，且与全量 decode 不一致 | 每步重解**全量** token 列表，只输出相对上次的新增部分，并掐掉末尾 U+FFFD（详见 `gpt2_chat.cpp` 注释） |
 | 每轮起一个 Python 进程做 tokenize | `transformers` 冷启动约 2 秒，每轮两次调用 → 对话卡到不可用 | 常驻 tokenizer 子进程（`gpt2_tokenizer_server.py`），行协议 + base64 传输 |
 | raw 续写模式不补分隔符 | 上一轮结尾与这一轮开头粘成 `stillWhat`，模型困惑，下一个 token 直接预测 `endoftext`（表现为「0 个新 token」） | 轮与轮之间补一个换行 |
+| 门控 FFN 的反向：两分支**共享**同一输入 | 若把两条分支的 `backward` 结果取平均/只留一条，梯度就错了 | `gated_net_t::backward` 返回两条路径梯度**之和**；`∂L/∂gate = delta⊙up`、`∂L/∂up = delta⊙gate`（逐元素乘的梯度就是乘对方） |
+| 门控 FFN 用矩阵乘合并 | 维度能凑上（方阵时）但数值全错、且 `silu(x)*x` 与矩阵积在语义上完全不同 | 合并算子必须是**逐元素乘**（`operator*` 即 Hadamard），单测 `Gated.ForwardIsElementwiseProductNotMatmul` 专门钉住这一点 |
+| 数值梯度自检时容器 `backward` 会**原地**改权重与偏置 | 若数值基准取的是 `backward` 之后的参数状态，梯度比对的绝对误差约 `1e-3`，且集中在权重幅值最大的最后一行，看着像「容器反向有 bug」 | 数值梯度必须基于 `backward` **之前**的参数快照（`weight_net_t` 对 bias 也做 update，别只冻结权重） |
+| GQA 复用已有 `forward_one_at` 逐 Q 头写 cache | 共享同一 KV 头的 `group_size` 个 Q 头各写一次 → 同一份 K/V 被 append `group_size` 次。**形状不报错、单步看似可用**，但 cache 长度与内容全错，多轮对话才炸 | KV cache 的写入必须"每个 KV 头一次"：拆成 `append_kv_head`（写 + RoPE）+ `attend_cached`（只读不写），后者本就是现成原语 |
+| GQA 反向沿用 MHA 的 `assign` 写回 KV 梯度 | 组内多个 Q 头的梯度互相覆盖，只剩最后一个 → 训练能跑但学不到 K/V | `mat_view_t` 没有 `+=`，用 `add_rows` 在共享 KV 头上**累加**；判据见 `Gqa.BackwardSumsKvGradientsAcrossGroup` |
+| `backward` 依赖 `forward` 留下的头内缓存 | 若在 `forward_one`（推理路径）之后调用 `backward`，`attend_cached` 不填 `m_v`、`m_softmax.m_output` 也只有单步形状 → `inner dimensions do not match` | 训练前向与推理前向不可混用后接反向：先 `forward`（整段）再 `backward`；`clear_kv_cache()` 之后才走 `forward_one` |
+| 从 LayerNorm 抄反向实现给 RMSNorm | 会**多留一个 `mean(g)` 项**（LayerNorm 减均值带来的），解析梯度与数值梯度差约 1.0 —— 训练能跑但方向系统性偏 | RMSNorm 反向 = LayerNorm 反向去掉 `sum(g)/d` 那一项；`RmsNorm.BackwardOmitsCenteringTermLestItBeWrong` 双向钉住 |
+| 用 HF 的 `LlamaRMSNorm` 输出当 float64 基准 | 该类内部 `.to(torch.float32)`，即使传 float64，输出也与精确解差约 1e-7 | 基准取 float64 定义式（jasmine 是 double）；已核实差值恰为该精度转换 |
 
 ---
 

@@ -328,6 +328,141 @@ public:
     }
 };
 
+/**
+ * RMSNorm（Root Mean Square Normalization）：LayerNorm 的"去掉减均值"版本。
+ *
+ *     LayerNorm(x) = gamma ⊙ (x - mean(x)) / sqrt(var(x) + eps) + beta
+ *     RMSNorm(x)   = gamma ⊙  x            / sqrt(mean(x²) + eps)
+ *
+ * 相比 layer_norm_net_t 少了三样东西：**不减均值**、**没有平移参数 beta**、
+ * eps 加在"均方值"上而不是"方差"上。无参数外只有 gamma，且 gamma 恒为正缩放。
+ *
+ * 为什么删掉减均值还能work：归一化的关键作用是 **缩放不变性**（RMSNorm(c·x) = RMSNorm(x)，c>0），
+ * 它让梯度不依赖激活值的绝对幅度，从而抑制爆炸/消失。重新中心化（减均值）是最不重要的一环：
+ * 紧跟其后的仿射层本来就会重新引入偏置。代价是丢掉平移不变性（RMSNorm(x + c) ≠ RMSNorm(x)）。
+ *
+ * 实现代价：省掉一次行归约（不用算 mean），提速约 5~15%（主要省访存）。
+ * 反向也精确地"少一项"：delta 里不需要减去 mean(g)，其余与 LayerNorm 同形。
+ *
+ * 与 layer_norm_net_t 一样是 stable 网络（仿射参数按 d_model 固定，不随输入形状变化），
+ * 因此初始化接口叫 set_param 而不是 reinit —— 否则 is_reinitable_net 判定会变。
+ */
+template <typename input_type, template<typename> class updator_type>
+class rms_norm_net_t
+{
+public:
+    // 公开：complex_net_t 从首个成员取 val_type 推断整链类型（RMSNorm 常位于 pre-norm 链首）
+    using val_type = typename input_type::ele_type;
+
+    /** 默认 eps。注意：对齐开源权重时必须从模型 config 读（LLaMA 系 1e-5 / 1e-6 都有用） */
+    static constexpr val_type kDefaultEps = static_cast<val_type>(1e-5);
+
+private:
+    val_type m_eps = kDefaultEps;
+    mat_t<val_type> m_hx;       // 归一化后的 x/rms（不含 gamma），供反向使用
+    mat_t<val_type> m_rms;      // 每列的均方根 [1, T]
+    mat_t<val_type> m_gama;     // 缩放参数 [d_model, 1]（没有 beta）
+    updator_type<val_type> m_gama_updator;
+
+public:
+    rms_norm_net_t() = default;
+
+    /**
+     * 显式分配 gamma 并置为恒等（gamma=1）。权重加载器需在 forward 之前写入 gamma，
+     * 因此必须先调用本函数，否则访问到的是未分配的无效矩阵（同 layer_norm_net_t）。
+     */
+    void set_param(int const& d_model, val_type const& eps = kDefaultEps)
+    {
+        m_eps = eps;
+        m_gama.reshape(d_model, 1);
+        m_gama = val_type(1);
+    }
+
+    /** 单独设置 eps（对齐参考实现时用） */
+    void set_eps(val_type const& eps) { m_eps = eps; }
+    val_type eps() const { return m_eps; }
+
+    /** 缩放参数 gamma [d_model, 1]；供加载器写入 */
+    mat_t<val_type>& gama() { return m_gama; }
+    mat_t<val_type> const& gama() const { return m_gama; }
+
+    template <typename...upr_arg_types>
+    void set_updator(upr_arg_types&&... args)
+    {
+        m_gama_updator.set(std::forward<upr_arg_types>(args)...);
+    }
+
+    void set_lr(val_type lr)
+    {
+        m_gama_updator.set_lr(lr);
+    }
+
+    template<typename Src>
+    mat_t<val_type> forward(Src&& input)
+    {
+        // 对每一列在 row（特征）维上求均方根 —— 不减均值，这是与 LayerNorm 的唯一实质差别
+        // 注意：sqrt 要求实参已是 mat_t（它内部会按元素赋值），故先 clone 物化
+        mat_t<val_type> ms = (vmean(pow(input, 2.0)) + m_eps).clone();
+        m_rms = sqrt(ms);
+        m_hx = (input / m_rms).clone();
+        if (m_gama.valid() == false)
+        {
+            m_gama = mat_t<val_type>(input.row_num(), 1);
+            m_gama = val_type(1);
+        }
+        return (m_gama * m_hx).clone();
+    }
+
+    /** 无 KV 状态：单列与整段等价 */
+    template<typename Src>
+    mat_t<val_type> forward_one(Src&& input)
+    {
+        return forward(std::forward<Src>(input));
+    }
+
+    template <typename other_type>
+    auto backward(const other_type& delta)
+    {
+        // gamma 梯度与 LayerNorm 完全一致：沿序列维（列）累加
+        auto L_gama = hsum(delta * m_hx);
+
+        /* 输入梯度：与 layer_norm_net_t::backward 同形，但**没有** mean(g) 那一项。
+         *   LayerNorm: (g·m - sum(g) - hx·sum(g⊙hx)) / m / std
+         *   RMSNorm  : (g    -          hx·mean(g⊙hx))     / rms
+         * 推导：u = x/r，r = sqrt(mean(x²)+eps)
+         *   ∂u_j/∂x_i = δ_ij/r - x_j·x_i/(r³·d)
+         *   ∂L/∂x_i   = g_i/r - x_i·Σ_j(g_j·x_j)/(r³·d)
+         *             = (g_i - hx_i·mean(g⊙hx)) / r        （因 Σ_j g_j x_j / d = r·mean(g⊙hx)）
+         */
+        val_type const m = static_cast<val_type>(delta.row_num());
+        auto dx_norm = delta * m_gama;
+        auto sum_dx_norm_x_hx = vsum(dx_norm * m_hx);
+        mat_t<val_type> L_input =
+            ((dx_norm * m - m_hx * sum_dx_norm_x_hx) / m / m_rms).clone();
+
+        m_gama_updator.update(L_gama, m_gama);
+        return L_input;
+    }
+
+    std::string net_type(int const& indent = 0) const
+    {
+        std::stringstream ss;
+        ss << print_indent(indent) << "rms_norm_net_t(eps:" << m_eps << ")";
+        return ss.str();
+    }
+
+    template<typename init_type>
+    void init_weight()
+    {
+        // 仿射参数在首次 forward 时懒初始化为 gamma=1（同 LayerNorm）
+    }
+
+    void step()
+    {
+        m_gama_updator.step();
+    }
+};
+
 template <typename input_type>
 class hsoftmax_net_t
 {
@@ -447,13 +582,188 @@ public:
     }
 };
 
+/**
+ * 门控容器：两个分支共享同一输入，各自前向，结果逐元素相乘汇合。
+ *
+ *     out = gate_branch(x) ⊙ up_branch(x)
+ *
+ * 这就是 SwiGLU 的中间部分：gate 分支 = Linear→SiLU，up 分支 = Linear，
+ * 对应 HuggingFace 的 `silu(gate_proj(x)) * up_proj(x)`。
+ * **down_proj 不在本容器内**，它作为普通层接在容器后面 —— 与 residual_net_t 只负责
+ * 加 skip、不负责分支内部的层一样：容器只管拓扑（分叉 + 汇合），层的内容由分支决定。
+ *
+ * 与 residual_net_t 的差别：residual 是「单分叉 + 加法合并」，本容器是「双分叉 +
+ * 逐元素乘合并」。合并算子不同，且两分支不对称（通常只有一个带激活）。
+ * 把门控函数换成 GELU/ReLU 即得 GEGLU/ReGLU，所以本容器不依赖任何具体激活。
+ *
+ * 反向要点：两条分支读的是**同一个 x**，由多变量链式法则 ∂L/∂x 是两条路径之和
+ *     ∂L/∂x = ∂L/∂gate · ∂gate/∂x + ∂L/∂up · ∂up/∂x
+ * 而逐元素乘的梯度就是「乘对方」：
+ *     ∂L/∂gate = delta ⊙ up,   ∂L/∂up = delta ⊙ gate
+ * 所以 forward 必须缓存两个分支的输出（容器本身只多存这两份矩阵）。
+ */
+template <typename gate_net_type, typename up_net_type>
+class gated_net_t
+{
+public:
+    using val_type = typename gate_net_type::val_type;
+private:
+    gate_net_type m_gate;
+    up_net_type m_up;
+    // 前向输出缓存，供 backward 计算 ∂L/∂gate = delta ⊙ up、∂L/∂up = delta ⊙ gate
+    mat_t<val_type> m_gate_out;
+    mat_t<val_type> m_up_out;
+
+public:
+    gated_net_t() = default;
+
+    /** gate 分支（通常为 Linear→激活） */
+    gate_net_type& gate_branch() { return m_gate; }
+    gate_net_type const& gate_branch() const { return m_gate; }
+    /** up 分支（通常为纯 Linear，不过激活） */
+    up_net_type& up_branch() { return m_up; }
+    up_net_type const& up_branch() const { return m_up; }
+
+    template<typename Src>
+    mat_t<val_type> forward(Src&& input)
+    {
+        // 物化一份：两个分支都要用同一个 x（与 residual_net_t 先存 skip 同理）
+        mat_t<val_type> x(std::forward<Src>(input));
+        m_gate_out = m_gate.forward(x);
+        m_up_out = m_up.forward(x);
+        return m_gate_out * m_up_out;       // 逐元素乘（Hadamard），非矩阵乘
+    }
+
+    template<typename Src>
+    mat_t<val_type> forward_one(Src&& input)
+    {
+        mat_t<val_type> x(std::forward<Src>(input));
+        m_gate_out = m_gate.forward_one(x);
+        m_up_out = m_up.forward_one(x);
+        return m_gate_out * m_up_out;
+    }
+
+    template <typename other_type>
+    mat_t<val_type> backward(const other_type& delta)
+    {
+        if (delta.row_num() != m_gate_out.row_num() || delta.col_num() != m_gate_out.col_num())
+        {
+            throw std::runtime_error("delta size does not match output size");
+        }
+        mat_t<val_type> d(delta);
+        mat_t<val_type> delta_gate = d * m_up_out;      // ∂L/∂gate
+        mat_t<val_type> delta_up = d * m_gate_out;      // ∂L/∂up
+        // 两条分支梯度相加：它们共享同一个输入 x
+        return m_gate.backward(delta_gate) + m_up.backward(delta_up);
+    }
+
+    /**
+     * 用同一个 {in, out} 配置两个分支。
+     * 仅当两分支形状相同时才成立 —— SwiGLU 的 gate_proj/up_proj 都是 d_model→d_ff，正合此约定。
+     * 形状不同的分支请用 gate_branch()/up_branch() 各自 reinit。
+     * requires 子句保证：两分支都无权重时本层被视为静态层，不占用 reinit 的容器槽位。
+     */
+    void reinit(std::vector<int> const& container)
+        requires (is_reinitable_net<gate_net_type> || is_reinitable_net<up_net_type>)
+    {
+        if constexpr (is_reinitable_net<gate_net_type>)
+            m_gate.reinit(container);
+        if constexpr (is_reinitable_net<up_net_type>)
+            m_up.reinit(container);
+    }
+
+    template<typename init_type>
+    void init_weight()
+    {
+        m_gate.template init_weight<init_type>();
+        m_up.template init_weight<init_type>();
+    }
+
+    void step()
+    {
+        m_gate.step();
+        m_up.step();
+    }
+
+    template <typename...upr_arg_types>
+    void set_updator(upr_arg_types&&... args)
+    {
+        if constexpr (is_updatable_net<gate_net_type>)
+            m_gate.set_updator(std::forward<upr_arg_types>(args)...);
+        if constexpr (is_updatable_net<up_net_type>)
+            m_up.set_updator(std::forward<upr_arg_types>(args)...);
+    }
+
+    void set_lr(val_type lr)
+    {
+        if constexpr (requires(gate_net_type& net, val_type v) { net.set_lr(v); })
+            m_gate.set_lr(lr);
+        if constexpr (requires(up_net_type& net, val_type v) { net.set_lr(v); })
+            m_up.set_lr(lr);
+    }
+
+    /** 分支内的 KV cache 清理（FFN 用不到，但让容器对含注意力的分支也成立） */
+    void infer_reset()
+    {
+        if constexpr (requires { m_gate.infer_reset(); })
+            m_gate.infer_reset();
+        else if constexpr (requires { m_gate.clear_kv_cache(); })
+            m_gate.clear_kv_cache();
+        if constexpr (requires { m_up.infer_reset(); })
+            m_up.infer_reset();
+        else if constexpr (requires { m_up.clear_kv_cache(); })
+            m_up.clear_kv_cache();
+    }
+
+    std::string net_type(int const& indent = 0) const
+    {
+        std::stringstream ss;
+        ss << print_indent(indent) << "gated_net_t:\n"
+           << print_indent(indent + 2) << "gate:\n" << m_gate.net_type(indent + 4) << "\n"
+           << print_indent(indent + 2) << "up:\n" << m_up.net_type(indent + 4);
+        return ss.str();
+    }
+
+    /** get<0> = gate 分支，get<1> = up 分支；多级下标透传给对应分支（与 residual_net_t 对称） */
+    template <size_t N, size_t...nums>
+    decltype(auto) get()
+    {
+        if constexpr (N == 0)
+        {
+            if constexpr (sizeof...(nums) == 0) return (m_gate);
+            else return m_gate.template get<nums...>();
+        }
+        else
+        {
+            static_assert(N == 1, "gated_net_t 只有两个分支：get<0> = gate, get<1> = up");
+            if constexpr (sizeof...(nums) == 0) return (m_up);
+            else return m_up.template get<nums...>();
+        }
+    }
+
+    template <size_t N, size_t...nums>
+    decltype(auto) get() const
+    {
+        if constexpr (N == 0)
+        {
+            if constexpr (sizeof...(nums) == 0) return (m_gate);
+            else return m_gate.template get<nums...>();
+        }
+        else
+        {
+            static_assert(N == 1, "gated_net_t 只有两个分支：get<0> = gate, get<1> = up");
+            if constexpr (sizeof...(nums) == 0) return (m_up);
+            else return m_up.template get<nums...>();
+        }
+    }
+};
+
 template <typename... net_types>
 class complex_net_t
 {
 private:
     std::tuple<net_types...> m_nets;
 public:
-
     using val_type = typename std::tuple_element_t<0, std::tuple<net_types...>>::val_type;
 
     template <typename input_type>
@@ -703,7 +1013,20 @@ struct complex_net_builder_t
 
 };
 
-
+/**
+ * 门控 FFN 的两条分支：gate = Linear→act_net_tpl，up = Linear。
+ * 直接可用作 gated_net_t 的模板实参，激活类型作为参数传入：
+ *     SwiGLU: act_net_tpl = silu_net_t    GEGLU: gelu_net_t    ReGLU: relu_net_t
+ * 完整的前馈还要把本容器接一个 down_proj（d_ff→d_model）在后面。
+ * 注意 gate/up 形状相同（都是 d_model→d_ff），因此 gated_net_t::reinit 传一份 {d_model, d_ff} 即可。
+ */
+template <typename val_type, template<typename> class updator_type, template<typename> class act_net_tpl>
+using gated_ffn_branches_t = gated_net_t<
+    typename complex_net_builder_t<val_type>
+        ::template push_back_updatable<weight_net_t, updator_type>
+        ::template push_back_staticnet<act_net_tpl>
+        ::type,
+    weight_net_t<mat_t<val_type>, updator_type>>;
 
 } // namespace jasmine
 #endif

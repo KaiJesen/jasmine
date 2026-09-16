@@ -12,6 +12,10 @@ add_executable(unit_tests
   test_transformer_kernel.cpp
   test_layer_norm.cpp
   test_gpt2_weights.cpp
+  test_silu.cpp
+  test_gated.cpp
+  test_gqa.cpp
+  test_rms_norm.cpp
 )
 
 target_link_libraries(unit_tests

@@ -314,6 +314,14 @@ std::vector<mat_view_t<mat_type>> vsplit(mat_type& mat, int num_splits)
 *
 * 经典实现路径：全维 QKV 投影 → 按头切分 → 各头 attend → concat → W_O。
 * 每头看到的是全输入经投影后的不同切片，而不是把输入特征硬分区后各自投影。
+*
+* GQA（Grouped-Query Attention）不是另一套算法，而是把「K/V 头数」从 Q 头数上解耦：
+*   - n_kv_heads == n_heads  → 经典 MHA（默认，行为与旧版逐位一致）
+*   - 1 < n_kv_heads < n_heads → GQA：连续 group_size = n_heads/n_kv_heads 个 Q 头共享一个 KV 头
+*   - n_kv_heads == 1        → MQA
+* 与 MHA 的差异只有三处：① K/V 投影输出宽度变成 n_kv_heads*d_head；② KV cache 只存 n_kv_heads
+* 份（省显存之处）；③ 反向时共享同一 KV 头的多个 Q 头梯度要**累加**。
+* 注意力核 mat_head_gen_t 完全不需要改动 —— 它本来就只认切好的 Q/K/V。
 */
 template <typename input_type, template<typename> class updator_type>
 class mat_mha_t
@@ -330,55 +338,92 @@ private:
     proj_type m_v_net;
     std::vector<head_type> m_heads;
     proj_type m_output_proj;
-    int m_num_heads;
+    int m_num_heads;        // Q 头数
+    int m_num_kv_heads;     // K/V 头数：== m_num_heads 即经典 MHA，== 1 即 MQA，中间即 GQA
+    int m_group_size;       // 每个 KV 头被多少个 Q 头共享 = m_num_heads / m_num_kv_heads
     int m_d_model;
-    int m_d_head;
+    int m_d_head;           // 每个头的宽度 = d_model / num_heads
+    int m_d_kv;             // K/V 投影输出宽度 = m_num_kv_heads * m_d_head（GQA 下 < d_model）
     bool m_mask = false;
     bool m_use_rope = true;   // false = 绝对位置模型（GPT-2），Q/K 不做 RoPE
 
     // 前向缓存，供 backward 切分梯度
     mat_t<val_type> m_q_full, m_k_full, m_v_full;
 
-    // decoder self-attn 推理用：每头一份 KV（投影+RoPE 后）
+    // decoder self-attn 推理用：每个 **KV 头**一份（投影+RoPE 后）。
+    // GQA 下 m_num_kv_heads < m_num_heads，这正是 KV cache 的省显存之处。
     std::vector<kv_cache_t<val_type>> m_kv_caches;
 
     void ensure_kv_caches()
     {
-        if (static_cast<int>(m_kv_caches.size()) != m_num_heads)
-            m_kv_caches.resize(m_num_heads);
+        if (static_cast<int>(m_kv_caches.size()) != m_num_kv_heads)
+            m_kv_caches.resize(m_num_kv_heads);
+    }
+
+    /** Q 头 i 对应的 K/V 头下标（连续 group_size 个 Q 头共享一个 KV 头） */
+    int kv_head_of(int const& q_head) const { return q_head / m_group_size; }
+
+    /**
+     * 把 src 累加到 dst 的 [row0, row0+src.row_num()) 行。
+     * mat_view_t 只有 assign 没有 +=，而 GQA 下多个 Q 头要共享同一个 KV 头的梯度，必须累加。
+     */
+    static void add_rows(mat_t<val_type>& dst, int const& row0, const mat_t<val_type>& src)
+    {
+        for (int i = 0; i < src.row_num(); ++i)
+            for (int j = 0; j < src.col_num(); ++j)
+                dst(row0 + i, j) += src(i, j);
+    }
+
+    /**
+     * 把一个 KV 头的新列写入 cache：K 做 RoPE，V 不旋转（与 fill_kv_cache 口径一致）。
+     * GQA 下**每个 KV 头只能调用一次** —— 共享该 KV 头的多个 Q 头若各自调用，
+     * 同一份 K/V 会被重复 append，cache 长度与内容都会错。
+     */
+    void append_kv_head(int const& kv_head, const mat_t<val_type>& k_h,
+                        const mat_t<val_type>& v_h, int const& pos)
+    {
+        mat_t<val_type> k_rot(k_h);
+        if (auto rope = m_heads[kv_head].rope())
+            k_rot = rope->forward_at(k_rot, pos);
+        m_kv_caches[kv_head].append(k_rot, v_h);
     }
 
 public:
-    mat_mha_t(int num_heads = 1, int d_model = 1, bool mask = false, int seq_len = 1)
-        : m_q_net(d_model, d_model), m_k_net(d_model, d_model), m_v_net(d_model, d_model),
-          m_output_proj(d_model, d_model), m_num_heads(num_heads), m_d_model(d_model),
-          m_d_head(d_model / num_heads), m_mask(mask)
+    mat_mha_t(int num_heads = 1, int d_model = 1, bool mask = false, int seq_len = 1,
+              int n_kv_heads = 0)
     {
         /* 设置默认构造参数目的是让其可以没有参数进行构造，以便放入其他复杂网络结构中 */
-        if (d_model % num_heads != 0)
-            throw std::runtime_error("d_model must be divisible by num_heads");
-
-        for (int i = 0; i < num_heads; ++i)
-            m_heads.emplace_back(m_d_head, mask, seq_len);
-        ensure_kv_caches();
-        if (seq_len > 0)
-            reserve_kv_cache(seq_len);
-        bind_rope();
+        set_param(num_heads, d_model, mask, seq_len, n_kv_heads);
     }
 
-    void set_param(int num_heads, int d_model, bool mask = false, int seq_len = 1)
+    /**
+     * 配置维度。
+     * n_kv_heads == 0（默认）表示与 num_heads 相同 → 经典 MHA，行为与旧版逐位一致；
+     * 0 < n_kv_heads < num_heads → GQA；n_kv_heads == 1 → MQA。
+     * 约束：d_model % num_heads == 0 且 num_heads % n_kv_heads == 0。
+     */
+    void set_param(int num_heads, int d_model, bool mask = false, int seq_len = 1,
+                   int n_kv_heads = 0)
     {
-        m_num_heads = num_heads;
-        m_d_model = d_model;
-        m_d_head = d_model / num_heads;
-        m_mask = mask;
-
         if (d_model % num_heads != 0)
             throw std::runtime_error("d_model must be divisible by num_heads");
+        if (n_kv_heads <= 0)
+            n_kv_heads = num_heads;      // 默认退化为 MHA
+        if (num_heads % n_kv_heads != 0)
+            throw std::runtime_error("num_heads must be divisible by n_kv_heads");
+
+        m_num_heads = num_heads;
+        m_num_kv_heads = n_kv_heads;
+        m_group_size = num_heads / n_kv_heads;
+        m_d_model = d_model;
+        m_d_head = d_model / num_heads;
+        m_d_kv = m_num_kv_heads * m_d_head;
+        m_mask = mask;
 
         m_q_net.reinit(std::vector<int>{d_model, d_model});
-        m_k_net.reinit(std::vector<int>{d_model, d_model});
-        m_v_net.reinit(std::vector<int>{d_model, d_model});
+        // GQA 关键差异：K/V 只投影出 n_kv_heads 个头，而不是 d_model
+        m_k_net.reinit(std::vector<int>{d_model, m_d_kv});
+        m_v_net.reinit(std::vector<int>{d_model, m_d_kv});
         m_output_proj.reinit(std::vector<int>{d_model, d_model});
 
         m_heads.resize(num_heads);
@@ -417,14 +462,14 @@ public:
     }
 
     /**
-     * 用整段 K/V（已按头拼接的 d_model×seq）填满各头 cache。
+     * 用整段 K/V（已按 KV 头拼接的 m_d_kv×seq）填满各 KV 头 cache。
      * K 在写入前按 k_start_pos 做 RoPE；V 不旋转。
      * 供 cross-attn：encode 后一次性写入，之后 decode 只读。
      */
     void fill_kv_cache(mat_t<val_type> k_full, mat_t<val_type> v_full, int k_start_pos = 0)
     {
-        if (k_full.row_num() != m_d_model || v_full.row_num() != m_d_model)
-            throw std::runtime_error("fill_kv_cache: row dim must be d_model");
+        if (k_full.row_num() != m_d_kv || v_full.row_num() != m_d_kv)
+            throw std::runtime_error("fill_kv_cache: row dim must be n_kv_heads * d_head");
         if (k_full.col_num() != v_full.col_num())
             throw std::runtime_error("fill_kv_cache: K/V seq length mismatch");
 
@@ -434,9 +479,9 @@ public:
             c.reserve(m_d_head, std::max(1, seq));
         clear_kv_cache();
 
-        auto k_splits = vsplit(k_full, m_num_heads);
-        auto v_splits = vsplit(v_full, m_num_heads);
-        for (int i = 0; i < m_num_heads; ++i)
+        auto k_splits = vsplit(k_full, m_num_kv_heads);
+        auto v_splits = vsplit(v_full, m_num_kv_heads);
+        for (int i = 0; i < m_num_kv_heads; ++i)
         {
             if (auto rope = m_heads[i].rope())
             {
@@ -479,7 +524,8 @@ public:
 #pragma omp parallel for schedule(static) if(par_heads)
 #endif
         for (int i = 0; i < m_num_heads; ++i)
-            head_outputs[i] = m_heads[i].attend_cached(q_splits[i], q_pos, m_kv_caches[i]);
+            head_outputs[i] = m_heads[i].attend_cached(
+                q_splits[i], q_pos, m_kv_caches[kv_head_of(i)]);
 
         return m_output_proj.forward(vconcat(head_outputs));
     }
@@ -508,15 +554,27 @@ public:
     /** W_Q 投影 [d_model, d_model]；供权重加载器写入 */
     proj_type& q_proj() { return m_q_net; }
     proj_type const& q_proj() const { return m_q_net; }
-    /** W_K 投影 [d_model, d_model] */
+    /** W_K 投影 [m_d_kv, d_model]：GQA 下输出宽度是 n_kv_heads*d_head（< d_model） */
     proj_type& k_proj() { return m_k_net; }
     proj_type const& k_proj() const { return m_k_net; }
-    /** W_V 投影 [d_model, d_model] */
+    /** W_V 投影 [m_d_kv, d_model]：同 W_K */
     proj_type& v_proj() { return m_v_net; }
     proj_type const& v_proj() const { return m_v_net; }
     /** W_O 输出投影 [d_model, d_model] */
     proj_type& out_proj() { return m_output_proj; }
     proj_type const& out_proj() const { return m_output_proj; }
+
+    // ---- GQA 维度自省（权重加载器据此切分 fused QKV、测试据此断言分组） ----
+    /** Q 头数 */
+    int num_heads() const { return m_num_heads; }
+    /** K/V 头数；== num_heads() 即 MHA，== 1 即 MQA */
+    int num_kv_heads() const { return m_num_kv_heads; }
+    /** 每个 KV 头被多少个 Q 头共享（MHA 下恒为 1） */
+    int group_size() const { return m_group_size; }
+    /** 每个头的宽度 */
+    int d_head() const { return m_d_head; }
+    /** K/V 投影输出宽度 = num_kv_heads() * d_head() */
+    int d_kv() const { return m_d_kv; }
 
     mat_t<val_type> forward(const input_type& input)
     {
@@ -551,11 +609,13 @@ public:
         }
 
         // Step 3: 按头切分投影结果（切的是 Q/K/V，不是原始输入特征）
+        // Q 切成 n_q_heads 份（d_model 宽），K/V 切成 n_kv_heads 份（d_kv 宽）
         auto q_splits = vsplit(m_q_full, m_num_heads);
-        auto k_splits = vsplit(m_k_full, m_num_heads);
-        auto v_splits = vsplit(m_v_full, m_num_heads);
+        auto k_splits = vsplit(m_k_full, m_num_kv_heads);
+        auto v_splits = vsplit(m_v_full, m_num_kv_heads);
 
         // Step 4: 每个头独立 attend（RoPE / score / mask / softmax / V）
+        // GQA：连续的 group_size 个 Q 头共用同一个 KV 头
         std::vector<mat_t<val_type>> head_outputs(m_num_heads);
         const int seq_len = input.col_num();
         const bool par_heads = detail::mha_heads_should_parallel(m_num_heads, seq_len, m_d_head);
@@ -563,7 +623,8 @@ public:
 #pragma omp parallel for schedule(static) if(par_heads)
 #endif
         for (int i = 0; i < m_num_heads; ++i)
-            head_outputs[i] = m_heads[i].forward(q_splits[i], k_splits[i], v_splits[i]);
+            head_outputs[i] = m_heads[i].forward(
+                q_splits[i], k_splits[kv_head_of(i)], v_splits[kv_head_of(i)]);
 
         // Step 5: 拼接所有头的输出，再经 W_O 映射回 d_model
         mat_t<val_type> concatenated_output = vconcat(head_outputs);
@@ -584,25 +645,34 @@ public:
         ensure_kv_caches();
 
         const int pos = kv_cache_length();
+        const int seq_len = input.col_num();
         m_q_full = m_q_net.forward(input);
         m_k_full = m_k_net.forward(input);
         m_v_full = m_v_net.forward(input);
 
         auto q_splits = vsplit(m_q_full, m_num_heads);
-        auto k_splits = vsplit(m_k_full, m_num_heads);
-        auto v_splits = vsplit(m_v_full, m_num_heads);
+        auto k_splits = vsplit(m_k_full, m_num_kv_heads);
+        auto v_splits = vsplit(m_v_full, m_num_kv_heads);
+
+        /*!ANCHOR GQA 的 KV cache 必须"每个 KV 头 append 一次"
+         * 共享同一个 KV 头的多个 Q 头如果各自 append，同一份 K/V 会被写入两次：
+         * 形状不报错、单步看似可用，但 cache 长度与内容全错，到多轮对话才炸。
+         * 因此拆成两步：先按 KV 头写入（K 做 RoPE），再让各 Q 头只读不写（attend_cached）。
+         * group_size == 1（MHA）时，这与原来的 forward_one_at 完全等价。
+         */
+        for (int g = 0; g < m_num_kv_heads; ++g)
+            append_kv_head(g, k_splits[g], v_splits[g], pos);
 
         std::vector<mat_t<val_type>> head_outputs(m_num_heads);
-        const int seq_len = input.col_num();
         // decode 单列时 cache 长度决定 attend 工作量
-        const int attend_seq = std::max(seq_len, kv_cache_length() + seq_len);
+        const int attend_seq = std::max(seq_len, kv_cache_length());
         const bool par_heads = detail::mha_heads_should_parallel(m_num_heads, attend_seq, m_d_head);
 #ifdef JASMINE_USE_OPENMP
 #pragma omp parallel for schedule(static) if(par_heads)
 #endif
         for (int i = 0; i < m_num_heads; ++i)
-            head_outputs[i] = m_heads[i].forward_one_at(
-                q_splits[i], k_splits[i], v_splits[i], pos, m_kv_caches[i]);
+            head_outputs[i] = m_heads[i].attend_cached(
+                q_splits[i], pos, m_kv_caches[kv_head_of(i)]);
 
         mat_t<val_type> concatenated_output = vconcat(head_outputs);
         return m_output_proj.forward(concatenated_output);
@@ -631,10 +701,10 @@ public:
 
         // Step 3: 按头切分投影结果
         auto q_splits = vsplit(m_q_full, m_num_heads);
-        auto k_splits = vsplit(m_k_full, m_num_heads);
-        auto v_splits = vsplit(m_v_full, m_num_heads);
+        auto k_splits = vsplit(m_k_full, m_num_kv_heads);
+        auto v_splits = vsplit(m_v_full, m_num_kv_heads);
 
-        // Step 4: 每个头独立进行正向传播（Q 用 q_pos，K 从 0）
+        // Step 4: 每个头独立进行正向传播（Q 用 q_pos，K 从 0）；GQA 下多个 Q 头共享 KV 头
         std::vector<mat_t<val_type>> head_outputs(m_num_heads);
         const int seq_len = input.col_num();
         const bool par_heads = detail::mha_heads_should_parallel(m_num_heads, seq_len, m_d_head);
@@ -643,7 +713,7 @@ public:
 #endif
         for (int i = 0; i < m_num_heads; ++i)
             head_outputs[i] = m_heads[i].forward_at(
-                q_splits[i], k_splits[i], v_splits[i], q_pos, 0);
+                q_splits[i], k_splits[kv_head_of(i)], v_splits[kv_head_of(i)], q_pos, 0);
 
         // Step 5: 拼接所有头的输出，再经输出映射网络得到最终结果
         mat_t<val_type> concatenated_output = vconcat(head_outputs);
@@ -661,22 +731,24 @@ public:
         auto deltas = vsplit(delta_concat, m_num_heads);
 
         // 聚合各头的 delta_q/k/v，再经全维投影回传到输入
-        mat_t<val_type> delta_q(m_d_model, delta.col_num());
-        mat_t<val_type> delta_k(m_d_model, delta.col_num());
-        mat_t<val_type> delta_v(m_d_model, delta.col_num());
+        // delta_q 是 Q 头数宽（d_model），delta_k/v 是 KV 头数宽（d_kv）
+        const int T = delta.col_num();
+        mat_t<val_type> delta_q(m_d_model, T);
+        mat_t<val_type> delta_k(m_d_kv, T);
+        mat_t<val_type> delta_v(m_d_kv, T);
         delta_q = val_type(0);
         delta_k = val_type(0);
         delta_v = val_type(0);
         auto dq_views = vsplit(delta_q, m_num_heads);
-        auto dk_views = vsplit(delta_k, m_num_heads);
-        auto dv_views = vsplit(delta_v, m_num_heads);
 
         for (int i = 0; i < m_num_heads; ++i)
         {
             auto g = m_heads[i].backward(deltas[i]);
             dq_views[i].assign(g.delta_q);
-            dk_views[i].assign(g.delta_k);
-            dv_views[i].assign(g.delta_v);
+            // GQA：多个 Q 头共享一个 KV 头 → 梯度必须**累加**（assign 会只剩最后一个头）
+            const int kv = kv_head_of(i);
+            add_rows(delta_k, kv * m_d_head, g.delta_k);
+            add_rows(delta_v, kv * m_d_head, g.delta_v);
         }
 
         return mat_t<val_type>(
@@ -696,21 +768,21 @@ public:
         auto deltas = vsplit(delta_concat, m_num_heads);
 
         mat_t<val_type> delta_q(m_d_model, delta.col_num());
-        mat_t<val_type> delta_k(m_d_model, m_k_full.col_num());
-        mat_t<val_type> delta_v(m_d_model, m_v_full.col_num());
+        mat_t<val_type> delta_k(m_d_kv, m_k_full.col_num());
+        mat_t<val_type> delta_v(m_d_kv, m_v_full.col_num());
         delta_q = val_type(0);
         delta_k = val_type(0);
         delta_v = val_type(0);
         auto dq_views = vsplit(delta_q, m_num_heads);
-        auto dk_views = vsplit(delta_k, m_num_heads);
-        auto dv_views = vsplit(delta_v, m_num_heads);
 
         for (int i = 0; i < m_num_heads; ++i)
         {
             auto g = m_heads[i].backward(deltas[i]);
             dq_views[i].assign(g.delta_q);
-            dk_views[i].assign(g.delta_k);
-            dv_views[i].assign(g.delta_v);
+            // GQA：共享 KV 头的多个 Q 头梯度累加
+            const int kv = kv_head_of(i);
+            add_rows(delta_k, kv * m_d_head, g.delta_k);
+            add_rows(delta_v, kv * m_d_head, g.delta_v);
         }
 
         encoder_delta += (m_k_net.backward(delta_k) + m_v_net.backward(delta_v));
@@ -751,7 +823,14 @@ public:
 
     std::string net_type(int const& indent = 0) const
     {
-        return print_indent(indent) + "MHA(classic,heads:" + std::to_string(m_num_heads)
+        std::string tag = "MHA(classic";
+        if (m_num_kv_heads == 1)
+            tag = "MQA";
+        else if (m_num_kv_heads != m_num_heads)
+            tag = "GQA";
+        return print_indent(indent) + tag
+            + ",q_heads:" + std::to_string(m_num_heads)
+            + ",kv_heads:" + std::to_string(m_num_kv_heads)
             + ", d_model:" + std::to_string(m_d_model) + ")";
     }
 
@@ -778,8 +857,9 @@ private:
     // decode 时 Q 的 RoPE 绝对位置（与同层 self-attn 时间步对齐）；clear 时归零
     int m_q_rope_pos = 0;
 public:
-    mat_mhca_t(int num_heads = 1, int d_model = 1, bool mask = false, int seq_len = 1)
-        : base_type(num_heads, d_model, mask, seq_len)
+    mat_mhca_t(int num_heads = 1, int d_model = 1, bool mask = false, int seq_len = 1,
+               int n_kv_heads = 0)
+        : base_type(num_heads, d_model, mask, seq_len, n_kv_heads)
     {
         m_encoder_output = nullptr;
         m_encoder_delta = nullptr;

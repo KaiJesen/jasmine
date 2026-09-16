@@ -218,3 +218,161 @@ REPL 内命令：
 | `examples/gpt2_chat.cpp` | 交互式对话 REPL |
 
 对齐机制与踩坑记录见 [`doc/SMALL_MODEL_REPRO_CHECKLIST.md`](doc/SMALL_MODEL_REPRO_CHECKLIST.md)。
+
+## 6. 门控 FFN（SwiGLU）：容器与激活
+
+对齐 LLaMA 系模型需要 SwiGLU。拆成两块：**激活** `silu_net_t` + **门控容器**
+`gated_net_t<gate, up>`，容器只负责拓扑（双分叉 + 逐元素乘汇合），层的类型由分支决定：
+
+```text
+完整 FFN =  gated( gate: Linear → SiLU ,  up: Linear )  →  down_proj
+                 └────── gated_net_t ──────┘              └ 普通 weight_net_t
+```
+
+`down_proj` **不在**容器里，和 `residual_net_t` 只负责 `+skip` 是同一个设计取向。
+
+```bash
+# 单测：容器正向 / 反向数值梯度 / reinit / 接入 complex_net / 残差包裹
+./build/tests/unit_tests --gtest_filter='Gated.*'
+
+# 与 PyTorch 端到端对撞：y = down(silu(gate(x)) * up(x))
+python3 tools/verify_swiglu.py
+# -> SwiGLU FFN vs PyTorch: d_model=6 d_ff=16 T=4  max_abs_diff=8.327e-17  PASS
+```
+
+用法要点：
+
+```cpp
+// 换个激活就是 GEGLU / ReGLU（silu_net_t / gelu_net_t / relu_net_t）
+using upr_tpl = cache_updator_t<double, nadam_t>;
+gated_ffn_branches_t<double, upr_tpl, silu_net_t> gated;
+gated.reinit(std::vector<int>{d_model, d_ff});   // gate/up 形状相同，一份就够
+
+// 分支是 Linear→SiLU，访问它要再下一层：gate 分支的 Linear 是 get<0, 0>()
+auto& gate_lin = gated.gate_branch().template get<0>();
+auto& up_lin   = gated.up_branch();              // up 分支本身就是 Linear
+```
+
+反向要点：两条分支读的是**同一个 `x`**，所以 `∂L/∂x` 是两条路径梯度**之和**；
+而逐元素乘的梯度就是「乘对方」（`∂L/∂gate = delta⊙up`、`∂L/∂up = delta⊙gate`），
+因此 `forward` 必须缓存两分支的输出（容器只多存这两份矩阵）。
+
+### 相关文件（门控 FFN）
+
+| 文件 | 作用 |
+|------|------|
+| `jas_silu_t.hpp` | `silu_net_t`：`x⊙σ(x)`，含解析梯度、饱和区不产 NaN |
+| `jas_net_t.hpp` | `gated_net_t<gate, up>` 容器 + `gated_ffn_branches_t` 别名 |
+| `tests/test_silu.cpp` | `SiLU.*`：定义 / PyTorch 参考值 / 数值梯度 / 非单调性 / 饱和 |
+| `tests/test_gated.cpp` | `Gated.*`：逐元素乘（非矩阵乘）/ 数值梯度 / reinit / 链路与残差集成 |
+| `tools/verify_swiglu.py` | 用 PyTorch 生成权重与期望输出，端到端对撞完整 SwiGLU FFN |
+
+## 7. GQA / MQA：`n_kv_heads` 参数化
+
+GQA 不是新算法，而是把「K/V 头数」从 Q 头数上解耦，因此**没有新文件、没有新注意力核**——
+注意力核 `mat_head_gen_t` 本来就只认切好的 Q/K/V，一行没改。
+
+```text
+n_kv_heads == n_heads    → 经典 MHA（默认，与旧实现逐位一致）
+1 < n_kv_heads < n_heads → GQA
+n_kv_heads == 1          → MQA
+```
+
+```cpp
+// 构造函数 / set_param 的最后一个参数，默认 0 表示"等于 num_heads"
+mat_mha_t<mat_t<float>, nadam_t> gqa(n_q_heads, d_model, /*mask=*/true, seq_len, /*n_kv_heads=*/2);
+
+gqa.num_heads();      // Q 头数
+gqa.num_kv_heads();   // K/V 头数
+gqa.group_size();     // 每个 KV 头被几个 Q 头共享 = num_heads / num_kv_heads
+gqa.d_head();         // 每头宽度 = d_model / num_heads
+gqa.d_kv();           // K/V 投影输出宽度 = num_kv_heads * d_head
+
+gqa.k_proj().weight();  // [d_kv, d_model] —— 注意不是 [d_model, d_model]
+gqa.q_proj().weight();  // [d_model, d_model] 不变
+```
+
+与 MHA 的差异只有三处：
+
+1. **K/V 投影变窄**：输出宽度 `n_kv_heads*d_head`（`q_proj`/`out_proj` 仍是 `d_model`）；
+2. **KV cache 只存 `n_kv_heads` 份**（省显存之处）；
+3. **反向时共享同一 KV 头的多个 Q 头梯度累加**（不是覆盖）。
+
+```bash
+./build/tests/unit_tests --gtest_filter='Gqa.*'
+```
+
+### 两个必须知道的坑
+
+- **KV cache 必须"每个 KV 头只 append 一次"。** 若图省事让共享 KV 头的多个 Q 头各自走
+  `forward_one_at`，同一份 K/V 会被写入 `group_size` 次 —— 形状不报错、单步看似可用，
+  但 cache 长度与内容全错，到多轮对话才炸。正确做法是拆两步：`append_kv_head`（写 + RoPE）
+  再 `attend_cached`（只读不写）。回归测试 `Gqa.KvCacheGetsOneAppendPerKvHead` 专门钉这一点。
+- **`backward` 不能接在 `forward_one` 之后。** 训练前向把所有头内缓存都填了，而推理前向
+  `attend_cached` 不填 `m_v`、`m_softmax.m_output` 也只有单步形状。顺序应是
+  `forward`（整段）→ `backward`，需要推理时先 `clear_kv_cache()` 再 `forward_one`。
+
+### 相关文件（GQA）
+
+| 文件 | 作用 |
+|------|------|
+| `jas_mha_t.hpp` | `mat_mha_t` 的 `n_kv_heads` 参数化（投影/cache/分组/反向累加/cross-attn） |
+| `tests/test_gqa.cpp` | `Gqa.*`：朴素参考对撞 / 等价 K-V 复制版 MHA / 分组累加 / cache 回归 / 数值梯度 / MQA |
+
+---
+
+## 8. RMSNorm：`rms_norm_net_t`
+
+放在 `jas_net_t.hpp` 里紧邻 `layer_norm_net_t`，**便于对照阅读**——因为两者的差别小到
+可以逐行对比，而"抄错"恰恰是这里最容易犯的错。
+
+```text
+LayerNorm(x) = gamma ⊙ (x - mean(x)) / sqrt(var(x) + eps) + beta
+RMSNorm(x)   = gamma ⊙  x            / sqrt(mean(x²) + eps)
+```
+
+差异只有三处：**不减均值**、**没有 beta**、eps 加在**均方值**上而不是方差上。
+
+```cpp
+rms_norm_net_t<mat_t<double>, nadam_t> norm;
+norm.set_param(d_model, /*eps=*/1e-6);   // 不传 eps 则用 kDefaultEps(1e-5)
+
+norm.gama();       // [d_model, 1] —— 只有缩放，没有 beta
+norm.eps();        // 读当前 eps
+norm.set_eps(1e-5);// 单独改 eps
+```
+
+和 `layer_norm_net_t` 一样，初始化接口是 `set_param` 而**不是** `reinit`
+（否则 `is_reinitable_net` 判定会变，`complex_net_t::reinit` 的槽位会对不上）。
+`val_type` 是 public，因为 RMSNorm 常位于 pre-norm 链首，`complex_net_t` 要从它推断整链类型。
+
+```bash
+./build/tests/unit_tests --gtest_filter='RmsNorm.*'
+```
+
+### 为什么"删掉减均值"还能 work
+
+归一化真正起作用的是 **缩放不变性**（`RMSNorm(c·x) == RMSNorm(x)`，`c>0`），
+它让梯度不依赖激活的绝对幅度，从而抑制爆炸/消失。重新中心化是最不重要的一环：
+紧跟其后的仿射层本来就会重新引入偏置。代价是丢掉平移不变性（`RMSNorm(x+c) ≠ RMSNorm(x)`）。
+收益：省掉一次行归约，快约 5~15%，且少一组 `beta` 参数。
+
+几何上两者都落在半径 `sqrt(d)` 的球面上——**LayerNorm 先减均值改变方向，RMSNorm 不改变方向**。
+（严格说，`eps>0` 时半径是 `sqrt(d)·sqrt(ms/(ms+eps))`，略小于 `sqrt(d)`。）
+
+### 两个必须知道的坑
+
+- **反向必须删掉 `mean(g)` 那一项。** 直接从 `layer_norm_net_t::backward` 复制会多留一项
+  （LayerNorm 减均值才需要的 `sum(g)/d`）。这个错误**不会报错、训练也能跑**，只是方向系统性偏，
+  解析梯度与数值梯度差约 1.0。测试 `RmsNorm.BackwardOmitsCenteringTermLestItBeWrong`
+  从两侧钉住：解析梯度既**不等于**那个错误版本，也要与数值梯度一致——避免"两处同错"互相掩盖。
+- **别拿 HF `LlamaRMSNorm` 的输出当 float64 基准。** 该类内部先 `.to(torch.float32)` 再算，
+  即使你传入 float64，输出也与精确解差约 `1e-7`。jasmine 是 double，基准应取
+  **float64 定义式**。已核实：测试里的 `kY` 与定义式差 `0.0`，与官方类之差恰为该精度转换。
+
+### 相关文件（RMSNorm）
+
+| 文件 | 作用 |
+|------|------|
+| `jas_net_t.hpp` | `rms_norm_net_t`（紧邻 `layer_norm_net_t`）+ `rms_norm_net_t::kDefaultEps` |
+| `tests/test_rms_norm.cpp` | `RmsNorm.*`：定义式逐元素 / PyTorch float64 基准 / 缩放不变 / 平移不敏感 / 与 LayerNorm 对照 / 数值梯度 / 均值项删除断言 / pre-norm 接入 |
