@@ -1,19 +1,25 @@
 #ifndef __JAS_ROPE_HPP__
 #define __JAS_ROPE_HPP__
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 #include "jas_mat_view_t.hpp"
 #include "jas_mat_express_t.hpp"
 
 namespace jasmine {
 
 /**
- * dynamic: 按需扩容（可能替换底层存储，多线程共享时不安全）
- * static_fixed: 预先 reserve，运行期禁止扩容（适合多线程只读共享）
+ * dynamic: 按需扩容 —— 补齐与扩容都在锁内完成，且判「已填充」的范围永远是一个
+ *          真被写满的矩形，因此可以多线程共享（读路径只做两次 acquire 读，不加锁）。
+ *          代价是扩容时旧存储不释放（已交给别人的视图还指着它），见 mat_cache_t::m_retired。
+ * static_fixed: 预先 reserve 一次填满，运行期不写、不扩容，最强约束。
  */
 enum class rope_cache_mode
 {
@@ -55,6 +61,15 @@ private:
     int m_cache_cols;
     rope_cache_mode m_mode;
 
+    /**
+     * 扩容时退休的旧存储。缓存在多线程间共享，读者拿到的 mat_view_t 指向缓冲区，
+     * 出了锁还会继续用 —— 扩容时若析构旧缓冲区就是 use-after-free。
+     *
+     * 代价是内存：扩容按「至少 1.5 倍」（EXPAND_SIZE 保底）增长，所以退休总量收敛
+     * ——在职 + 退休 ≤ 4 倍最终容量，不会随扩容次数线性累积。
+     */
+    std::vector<std::unique_ptr<mat_t<val_type>>> m_retired;
+
     static constexpr int EXPAND_SIZE = 1024;
 
     void ensure_capacity(int rows, int cols)
@@ -70,10 +85,12 @@ private:
 
         int new_rows = m_cache.row_num();
         if (rows > m_cache.row_num())
-            new_rows = std::max(rows, m_cache.row_num() + EXPAND_SIZE);
+            new_rows = std::max(rows, std::max(m_cache.row_num() + EXPAND_SIZE,
+                                               m_cache.row_num() * 3 / 2));
         int new_cols = m_cache.col_num();
         if (cols > m_cache.col_num())
-            new_cols = std::max(cols, m_cache.col_num() + EXPAND_SIZE);
+            new_cols = std::max(cols, std::max(m_cache.col_num() + EXPAND_SIZE,
+                                               m_cache.col_num() * 3 / 2));
 
         mat_t<val_type> new_cache(new_rows, new_cols);
         for (int i = 0; i < m_cache.row_num(); ++i)
@@ -83,6 +100,7 @@ private:
                 new_cache(i, j) = m_cache(i, j);
             }
         }
+        m_retired.emplace_back(std::make_unique<mat_t<val_type>>(std::move(m_cache)));
         m_cache = std::move(new_cache);
     }
 
@@ -119,6 +137,7 @@ public:
             // 静态模式允许在 reserve 时（一次性）分配/重分配
             if (rows != m_cache.row_num() || cols != m_cache.col_num())
             {
+                m_retired.emplace_back(std::make_unique<mat_t<val_type>>(std::move(m_cache)));
                 m_cache = mat_t<val_type>(rows, cols);
             }
             m_cache_rows = 0;
@@ -129,34 +148,29 @@ public:
         ensure_capacity(rows, cols);
     }
 
-    val_type& operator()(int row, int col)
+    /**
+     * 只把容量和「已准备区间」扩到 rows × cols，不写值、不判断哪些格子需要填。
+     * 写值的记账由 mat_RoPE_t 负责（它必须精确到「哪些格子真写过」）。
+     */
+    void grow_to(int rows, int cols)
     {
-        if (row >= m_cache_rows || col >= m_cache_cols)
-        {
-            ensure_capacity(row + 1, col + 1);
-            m_cache_rows = std::max(m_cache_rows, row + 1);
-            m_cache_cols = std::max(m_cache_cols, col + 1);
-        }
+        ensure_capacity(rows, cols);
+        m_cache_rows = std::max(m_cache_rows, rows);
+        m_cache_cols = std::max(m_cache_cols, cols);
+    }
+
+    /** 写入用：容量已由 grow_to 保证，这里不做扩容、不改记账 */
+    val_type& cell(int row, int col)
+    {
         return m_cache(row, col);
     }
 
-    val_type& operator()(int row, int col) const
+    /**
+     * 共享读用：不加锁、不改任何状态，直接给视图。
+     * 调用方（mat_RoPE_t）必须自己保证 [row, row+rows) × [col, col+cols) 已经写满。
+     */
+    mat_view_t<mat_t<val_type>> raw_view(int row, int col, int rows, int cols)
     {
-        if (row >= m_cache_rows || col >= m_cache_cols)
-        {
-            throw std::out_of_range("Cache access out of range");
-        }
-        return m_cache(row, col);
-    }
-
-    mat_view_t<mat_t<val_type>> range(int row, int col, int rows, int cols)
-    {
-        if (row + rows > m_cache_rows || col + cols > m_cache_cols)
-        {
-            ensure_capacity(row + rows, col + cols);
-            m_cache_rows = std::max(m_cache_rows, row + rows);
-            m_cache_cols = std::max(m_cache_cols, col + cols);
-        }
         return m_cache.view(row, col, rows, cols);
     }
 
@@ -183,21 +197,28 @@ class mat_RoPE_t
 {
 private:
     mat_cache_t<val_type> m_cache;    // 用于存储sin和cos的缓存矩阵
-    int m_enable_rows;              // 当前已填充 RoPE 值的行数
-    int m_enable_cols;              // 当前已填充 RoPE 值的列数
+    /**
+     * 已填充范围的上限：保证 [0, m_filled_rows) × [0, m_filled_cols) 每个格子都真写过。
+     * 读路径只用它做「够不够」的判断，所以发布必须用 release（写完再置位），
+     * 读用 acquire；这样别的线程一旦看到上限，对应的值一定已经可见。
+     */
+    std::atomic<int> m_filled_rows;
+    std::atomic<int> m_filled_cols;
+    /** 串行化「扩容 + 补齐」；读命中已填充区域时不进去，所以不会成为读的瓶颈 */
+    std::mutex m_fill_mutex;
     int m_d;
     int m_max_seq_len;              // static 模式下预留的最大序列长；dynamic 为 0 表示未限制
 public:
     mat_RoPE_t(int const& d)
-        : m_enable_rows(0), m_enable_cols(0), m_d(d), m_max_seq_len(0)
+        : m_filled_rows(0), m_filled_cols(0), m_d(d), m_max_seq_len(0)
     {
     }
 
     void set_cache_mode(rope_cache_mode mode)
     {
         m_cache.set_mode(mode);
-        m_enable_rows = 0;
-        m_enable_cols = 0;
+        m_filled_rows.store(0, std::memory_order_relaxed);
+        m_filled_cols.store(0, std::memory_order_relaxed);
         m_cache.reset_logical();
         m_max_seq_len = 0;
     }
@@ -222,16 +243,16 @@ public:
         const int rows = m_d;
         const int cols = max_seq_len * 2;
         m_cache.reserve(rows, cols);
-        m_enable_rows = 0;
-        m_enable_cols = 0;
+        m_filled_rows.store(0, std::memory_order_relaxed);
+        m_filled_cols.store(0, std::memory_order_relaxed);
         init(0, rows, 0, cols);
     }
 
     void set_d(int const& d)
     {
         m_d = d;
-        m_enable_rows = 0;
-        m_enable_cols = 0;
+        m_filled_rows.store(0, std::memory_order_relaxed);
+        m_filled_cols.store(0, std::memory_order_relaxed);
         m_cache.reset_logical();
         if (m_cache.mode() == rope_cache_mode::static_fixed && m_max_seq_len > 0)
         {
@@ -249,24 +270,102 @@ public:
         return m_max_seq_len;
     }
 
-    // 一次性先初始化一块
+    /**
+     * 补齐缓存：保证 [0, row_beg+rows) × [0, col_beg+cols) 里每个格子都已写入。
+     *
+     * 缓存内容的布局：
+     * | cos(m * A_i), -sin(m * A_i) |
+     * | sin(m * A_i),  cos(m * A_i) |
+     * 其中 A_i = 1 / 10000^(2i/d)，m 是位置索引，i 是维度对索引（特征下标 n 对应 i = n/2），
+     * d 是模型维度。缓存行按特征二维对展开，列按位置展开为 2x2 块；同一块共用 θ = m / 10000^(2i/d)。
+     *
+     * 只增不减、只补齐不重算，并且永远从原点补齐（调用方都传 row_beg = col_beg = 0）。
+     * 需要补的因此总是「L 形带」：新来的行配全部列 + 老行配新来的列。
+     *
+     * 不能在请求到的矩形里逐格判断「已初始化」再按两轴的 max 记账：先补 (d, 2) 再补 (2, 8)
+     * 时第二次只遍历 2 行，却把列数记到 8，于是 [2, d) × [2, 8) 成了「自称已填、其实从没写过」
+     * 的格子 —— 读到的是一律 0 的旋转矩阵（mat_t 分配时 memset 过），数值会静默偏掉。
+     */
     void init(int const& row_beg, int const& rows, int const& col_beg, int const& cols)
     {
-        // 初始化正向矩阵
-        /**!SECTION
-         * | cos(m * A_i), -sin(m * A_i) |
-         * | sin(m * A_i),  cos(m * A_i) |
-         * 其中A_i = 1 / 10000^(2i/d)，m是位置索引，i是维度对索引（特征下标 n 对应 i=n/2），d是模型维度。
-         * 缓存布局：行按特征二维对展开，列按位置展开为 2x2 块；同一块共用 θ = m / 10000^(2i/d)。
-         */
-        const int row_end = row_beg + rows;
-        const int col_end = col_beg + cols;
-        for (int i = 0; i < row_end; ++i)
+        std::lock_guard<std::mutex> lk(m_fill_mutex);
+        fill_from_origin(row_beg + rows, col_beg + cols);
+    }
+
+    mat_view_t<mat_t<val_type>> range(int row_beg, int row_num, int col_beg, int col_num)
+    {
+        const int row_end = row_beg + row_num;
+        const int col_end = col_beg + col_num;
+
+        // 快路径：只做两次 acquire 读，不碰任何共享状态。命中已填充区时多线程可以随便读。
+        if (row_end <= m_filled_rows.load(std::memory_order_acquire) &&
+            col_end <= m_filled_cols.load(std::memory_order_acquire))
         {
-            for (int j = 0; j < col_end; ++j)
+            if (m_cache.mode() == rope_cache_mode::static_fixed)
+                return m_cache.range_readonly(row_beg, col_beg, row_num, col_num);
+            return m_cache.raw_view(row_beg, col_beg, row_num, col_num);
+        }
+
+        // 慢路径：扩容 + 补齐，串行化（fill_from_origin 里会重新读一次上限并取 max，
+        // 所以两个线程同时要走慢路径时不会丢更新）
+        init(0, row_end, 0, col_end);
+
+        if (m_cache.mode() == rope_cache_mode::static_fixed)
+        {
+            if (row_end > m_filled_rows.load(std::memory_order_acquire) ||
+                col_end > m_filled_cols.load(std::memory_order_acquire))
             {
-                if (i < m_enable_rows && j < m_enable_cols)
-                    continue;   // 已经初始化过了
+                throw std::out_of_range(
+                    "RoPE static cache miss; increase reserve(max_seq_len)");
+            }
+            return m_cache.range_readonly(row_beg, col_beg, row_num, col_num);
+        }
+        return m_cache.raw_view(row_beg, col_beg, row_num, col_num);
+    }
+
+    mat_view_t<mat_t<val_type>> forward_unite(int const& i, int const& m)
+    {
+        return range(i * 2, 2, m * 2, 2);
+    }
+
+private:
+    /** 前置：已持有 m_fill_mutex。把已填充矩形扩到至少 row_end × col_end */
+    void fill_from_origin(int row_end, int col_end)
+    {
+        // 静态模式：容量就是上限，越界直接报「没预留够」（与旧行为一致，且绝不在运行期扩容）
+        if (m_cache.mode() == rope_cache_mode::static_fixed &&
+            (m_max_seq_len <= 0 || row_end > m_cache.capacity_rows() ||
+             col_end > m_cache.capacity_cols()))
+        {
+            throw std::out_of_range(
+                "RoPE static cache miss; increase reserve(max_seq_len)");
+        }
+
+        const int have_rows = m_filled_rows.load(std::memory_order_relaxed);
+        const int have_cols = m_filled_cols.load(std::memory_order_relaxed);
+        row_end = std::max(row_end, have_rows);
+        col_end = std::max(col_end, have_cols);
+
+        if (row_end > have_rows || col_end > have_cols)
+        {
+            // 扩容先行：旧存储会退休而不是析构，别人手里的视图不会悬空
+            m_cache.grow_to(row_end, col_end);
+            fill_rect(have_rows, row_end, 0, col_end);       // 新行 × 全部列
+            fill_rect(0, have_rows, have_cols, col_end);     // 老行 × 新列
+        }
+
+        // 先写完再发布：读者 acquire 到上限时，值一定已经就位
+        m_filled_rows.store(row_end, std::memory_order_release);
+        m_filled_cols.store(col_end, std::memory_order_release);
+    }
+
+    /** 前置：已持有 m_fill_mutex，且容量已经够 */
+    void fill_rect(int row_beg, int row_end, int col_beg, int col_end)
+    {
+        for (int i = row_beg; i < row_end; ++i)
+        {
+            for (int j = col_beg; j < col_end; ++j)
+            {
                 const int pair = i / 2;
                 const int pos = j / 2;
                 const val_type angle = static_cast<val_type>(pos)
@@ -276,51 +375,23 @@ public:
                 const val_type s = std::sin(angle);
                 if (i % 2 == 0 && j % 2 == 0)    // cos
                 {
-                    m_cache(i, j) = c;
+                    m_cache.cell(i, j) = c;
                 }
                 else if (i % 2 == 1 && j % 2 == 1)   // cos
                 {
-                    m_cache(i, j) = c;
+                    m_cache.cell(i, j) = c;
                 }
                 else if (i % 2 == 0 && j % 2 == 1)   // -sin
                 {
-                    m_cache(i, j) = -s;
+                    m_cache.cell(i, j) = -s;
                 }
                 else                            // sin
                 {
-                    m_cache(i, j) = s;
+                    m_cache.cell(i, j) = s;
                 }
             }
         }
-        m_enable_rows = std::max(m_enable_rows, row_end);
-        m_enable_cols = std::max(m_enable_cols, col_end);
     }
-
-    mat_view_t<mat_t<val_type>> range(int row_beg, int row_num, int col_beg, int col_num)
-    {
-        if (m_cache.mode() == rope_cache_mode::static_fixed)
-        {
-            if (row_beg + row_num > m_enable_rows || col_beg + col_num > m_enable_cols)
-            {
-                throw std::out_of_range(
-                    "RoPE static cache miss; increase reserve(max_seq_len)");
-            }
-            return m_cache.range_readonly(row_beg, col_beg, row_num, col_num);
-        }
-
-        if (row_beg + row_num > m_enable_rows || col_beg + col_num > m_enable_cols)
-        {
-            init(0, std::max(m_enable_rows, row_beg + row_num),
-                 0, std::max(m_enable_cols, col_beg + col_num));
-        }
-        return m_cache.range(row_beg, col_beg, row_num, col_num);
-    }
-
-    mat_view_t<mat_t<val_type>> forward_unite(int const& i, int const& m)
-    {
-        return range(i * 2, 2, m * 2, 2);
-    }
-
 };
 
 template <typename input_type>

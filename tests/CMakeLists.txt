@@ -6,6 +6,7 @@ add_executable(unit_tests
   test_mat_init.cpp
   test_gemm.cpp
   test_rope.cpp
+  test_rope_cache_race.cpp
   test_mha.cpp
   test_kv_cache.cpp
   test_net.cpp
