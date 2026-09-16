@@ -220,6 +220,9 @@ int main(int argc, char** argv)
         if (max_context <= 0) max_context = cfg.n_pos;
         max_context = std::min(max_context, cfg.n_pos);
         model.reserve_kv_cache(max_context);
+        // RoPE 缓存也按同一个上限预留。它和 KV cache 一样是按 (d_head, layout) 在进程内共享的，
+        // 不预留的话每个新位置都要惰性算、还会中途扩容；预留之后运行期只读、越界早失败。
+        model.reserve_rope_cache(max_context);
 
         // 权重已全部读入模型，把这 4.4GB 的原始 blob 还给系统
         wf.release();

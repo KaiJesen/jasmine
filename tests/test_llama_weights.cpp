@@ -291,6 +291,47 @@ TEST(LlamaStructure, SingleTokenOutputIsPositionIndependent)
 }
 
 
+/**
+ * 预留 RoPE 缓存（llama_chat 走的那条路）：结果必须与惰性填充**逐位一致**，
+ * 超出预留长度则早失败。
+ *
+ * 用 d_head = 6，与其它用例的 d_head = 4 错开：RoPE 缓存是按 (d_head, layout)
+ * 挂在进程级注册中心上的，共用维度会互相影响模式与预留长度。
+ */
+TEST(LlamaStructure, ReservedRopeCacheKeepsOutputIdenticalAndFailsFast)
+{
+    auto& reg = rope_registry_t<double>::instance();
+    reg.clear();
+
+    const int n_pos = 16;
+    // layers=1, heads=2, kv_heads=1, d_model=12 → d_head = 6, group_size = 2
+    auto model = make_small_llama(1, 2, 1, 12, 24, 7, n_pos);
+    const mat_t<double> ids(1, 5, {1.0, 2.0, 3.0, 4.0, 5.0});
+
+    model.clear_kv_cache();
+    const mat_t<double> lazy = model.forward_one(ids);      // 默认：dynamic 惰性填充
+
+    model.reserve_rope_cache(n_pos);
+    // 注册中心的 key 是 (d_head, layout)，LLaMA 用 half_split —— 这里从模型自己身上
+    // 取共享条目，避免测试里重复「猜」注册键。
+    auto rope = model.attn(0).head(0).rope();
+    ASSERT_NE(rope, nullptr);
+    EXPECT_EQ(rope->cache_mode(), rope_cache_mode::static_fixed);
+    EXPECT_EQ(rope->cache_max_seq_len(), n_pos);
+
+    model.clear_kv_cache();
+    const mat_t<double> reserved = model.forward_one(ids);  // 预留 + 只读
+    EXPECT_EQ(MaxAbsDiff(lazy, reserved), 0.0)
+        << "预留路径与惰性填充必须给出同一组数（同一个公式、同一份缓存）";
+
+    // 预留之外的位置：抛异常，而不是默默扩容
+    model.clear_kv_cache();
+    mat_t<double> too_long(1, n_pos + 1, 1.0);   // 17 个位置 > 预留的 16
+    EXPECT_THROW(model.forward_one(too_long), std::out_of_range);
+
+    reg.clear();
+}
+
 TEST(LlamaStructure, RopeEncodesRelativeDistance)
 {
     // 在注意力层上直接验证 RoPE 的语义：把同一组 K/V 固定在相同位置，

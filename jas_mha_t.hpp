@@ -542,6 +542,46 @@ public:
     }
 
     /**
+     * 把各头共享的 RoPE 缓存切成 static 并预留到 max_seq 个位置。
+     *
+     * 注册中心按 (d_head, layout) 共享，`set_default_mode` 只作用于**新建**的条目，
+     * 所以这里直接对拿到的那一个对象设置，不依赖调用顺序，也不改全局默认模式
+     * （否则会波及同进程里其它维度的用法）。
+     *
+     * 预留长度取单调最大值：同一个 d_head 被多个模型共享时，先来的大长度不会被后来的小长度缩掉。
+     *
+     * static 之后越界是**抛异常**而不是默默扩容 —— 这是把「上下文上限」变成可检查的不变量，
+     * 而不是一句注释。因此要在生成之前调用（此时还没有视图被别人持有）。
+     */
+    void reserve_rope_cache(int max_seq, rope_cache_mode mode = rope_cache_mode::static_fixed)
+    {
+        if (max_seq <= 0)
+            throw std::invalid_argument("RoPE reserve length must be positive");
+        if (!m_use_rope || m_d_head <= 0 || m_d_head % 2 != 0)
+            return;                     // 绝对位置模型（GPT-2 等）没有 RoPE 可预留
+
+        auto& reg = rope_registry_t<val_type>::instance();
+        std::shared_ptr<RoPE_net_t<mat_t<val_type>>> rope =
+            reg.get(m_d_head, 0, m_rope_layout);
+        if (!rope)
+            return;
+
+        // 同一个 d_head 被多层/多模型共享，上层会逐层调到这里。已经就位就直接返回，
+        // 否则 reserve() 在 static 模式下会重置记账并整表重填，白白重算 n_layers 遍。
+        const int already = rope->cache_max_seq_len();
+        if (rope->cache_mode() == mode && already >= max_seq)
+            return;
+
+        const int want = std::max(max_seq, already);      // 先读后切：set_cache_mode 会清掉这个值
+        if (rope->cache_mode() != mode)
+            rope->set_cache_mode(mode);
+        rope->reserve(want);
+
+        for (auto& head : m_heads)      // 头们共享同一个指针，这里只是保证绑定关系是最新的
+            head.set_rope(rope);
+    }
+
+    /**
      * 选择 RoPE 的特征配对约定（见 rope_pair_layout）。
      * 导出 HF LLaMA 系权重时必须用 half_split；jasmine 原生训练保持 interleaved。
      */

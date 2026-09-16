@@ -256,6 +256,17 @@ public:
             attn_of(block).reserve_kv_cache(max_seq);
     }
 
+    /**
+     * 把各层共享的 RoPE 缓存切 static 并预留到 max_seq 个位置（与 reserve_kv_cache 配套）。
+     * 之后请求超过 max_seq 的位置会抛 std::out_of_range，而不是默默扩容。
+     */
+    void reserve_rope_cache(int max_seq,
+                            rope_cache_mode mode = rope_cache_mode::static_fixed)
+    {
+        for (auto& block : m_blocks)
+            attn_of(block).reserve_rope_cache(max_seq, mode);
+    }
+
     void set_kv_cache_mode(kv_cache_mode mode)
     {
         for (auto& block : m_blocks)
