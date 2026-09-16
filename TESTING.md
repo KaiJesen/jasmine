@@ -517,3 +517,95 @@ norm.set_eps(1e-5);// 单独改 eps
 |------|------|
 | `jas_net_t.hpp` | `rms_norm_net_t`（紧邻 `layer_norm_net_t`）+ `rms_norm_net_t::kDefaultEps` |
 | `tests/test_rms_norm.cpp` | `RmsNorm.*`：定义式逐元素 / PyTorch float64 基准 / 缩放不变 / 平移不敏感 / 与 LayerNorm 对照 / 数值梯度 / 均值项删除断言 / pre-norm 接入 |
+
+---
+
+## 9. 表达式模板的操作数生命周期（值类别契约）
+
+表达式模板 (`mat_add_t` / `mat_mul_t` / `mat_dot_t` …) 是**惰性**的：节点里存的是操作数，
+真正的求值发生在 `clone()` / `operator mat_t<>`。因此「节点怎么持有操作数」直接决定了
+表达式树能不能被安全地存下来、拷贝、或者传给别的执行后端。
+
+### 曾经的 bug：一律按引用持有 → 悬垂
+
+早期实现里，非标量操作数一律按 `T const&` 存（`storage_selector`）。这对具名变量没问题，
+但对临时量必然悬垂 —— 而**嵌套表达式本身也是临时量**：
+
+```cpp
+auto tree = (a + b) * c;   // (a+b) 所在的临时 mat_add_t 在本语句结束即销毁
+mat_t<double> r = tree;    // tree 持有的引用已失效
+```
+
+ASan 会直接抓到：
+
+```
+ERROR: AddressSanitizer: stack-use-after-scope
+    #1 mat_express_2_param_stable_t<mat_add_t<...>, mat_t<double>, mat_mul_t>::col_num() const
+    #2 ...::clone() const
+```
+
+同一个成因还有一种更隐蔽的形态。成员函数里的 `*this` **永远是左值**，哪怕对象本身是临时量：
+
+```cpp
+auto tree = a.t().dot(b);      // a.t() 是临时视图，却被当成左值借了引用
+auto tree = (a + b).dot(c);    // 同上：临时表达式节点作为 .dot() 的接收者
+auto tree = make_mat().dot(b); // 同上：临时矩阵作为接收者
+```
+
+### 规则
+
+按**值类别**分派（见 `storage_type` / `storage_of`）：
+
+| 操作数 | 存储方式 | 语义 |
+|--------|----------|------|
+| 标量 | `mat_t<T>` 按值 | 包成 1×1，与矩阵共用 `row_num`/`col_num`/`operator()` |
+| 非标量**左值** | `T const&` | **借引用，零拷贝**。调用方保证它比表达式活得久 |
+| 非标量**右值** | `T` 按值 | **拥有**。右值就是临时量，必须拥有 |
+
+配套的三条实现约定：
+
+1. 二元/一元运算符用**转发引用**接收操作数，并以 `lval_type&&` / `val_type&&` 作模板实参，
+   这样值类别信息才传得到 `storage_type`。
+2. 各类构造函数形参取**存储类型**（而非 `lval_type`）。这既让右值走移动、左值零拷贝，
+   又保证构造函数首参类型不可能是节点自身 —— 于是不会顶掉隐式拷贝/移动构造，
+   表达式树仍然可拷贝（这正是它能被安全传递的前提）。
+3. `.dot()` 成员用 **ref-qualifier** 区分接收者：`const&` 借引用，`const&&` 按值拥有
+   （`mat_t` / `mat_view_t` / 两个表达式基类 / `mat_dot_t` 都是如此）。
+   右操作数同样转发。
+
+`is_caculable` 判标量前必须 `remove_cvref`：左值标量（`double s; m / s;`）推导出的是
+`double&`，直接 `is_arithmetic_v<double&>` 是 false，会让整个重载悄悄消失。
+
+### 仍然存在的边界（有意保留）
+
+- **左值操作数**：借引用是表达式模板避免临时量的根本，改成按值会让每次构造表达式都深拷贝
+  整块矩阵。所以「左值必须比表达式活得久」是调用方契约。副作用是表达式保持惰性 ——
+  构造之后、物化之前修改原矩阵，结果会跟着变（`ExpressionLifetime.LvalueOperandsAreBorrowedSoMutationIsVisible`）。
+- **视图所引用的矩阵**：视图本身被按值拥有，但它只是「引用 + 偏移」，其指向的矩阵仍由调用方
+  持有。`f().view(...) + c` 这种「对临时矩阵取视图」的写法依然不安全（与 Eigen 的约定一致）。
+
+### 单测
+
+`tests/test_expression_lifetime.cpp`（18 例）把上面每条都锁死了：编译期 `static_assert`
+左值借引用 / 右值按值拥有，运行期覆盖嵌套树、拷贝、按值传参、移入容器、临时矩阵/视图接收者、
+`.dot()` 链、以及惰性可见性。**这些用例在 ASan 下必须零告警**：
+
+```bash
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_FLAGS="-fsanitize=address -fno-omit-frame-pointer -O1 -g" \
+  -DJASMINE_BUILD_BENCH=OFF -DJASMINE_BUILD_EXAMPLES=OFF
+cmake --build build-asan -j
+ASAN_OPTIONS=detect_leaks=0 ./build-asan/tests/unit_tests --gtest_filter='-LlamaAlignmentTest.*'
+```
+
+（`detect_leaks=0` 是因为在 `ptrace` 环境下 LeakSanitizer 会直接 fatal；
+`LlamaAlignmentTest` 需要 4.2 GiB 权重且耗时很长，按需单独跑。）
+
+### 相关文件
+
+| 文件 | 作用 |
+|------|------|
+| `jas_mat_express_t.hpp` | `storage_of` / `storage_type` 存储策略；各表达式节点与运算符；`mat_dot_t` |
+| `jas_mat_concepts.hpp` | `is_caculable`（判标量前 `remove_cvref`） |
+| `jas_mat_t.hpp` / `jas_mat_view_t.hpp` | `.dot()` 的 ref-qualified 声明 |
+| `tests/test_expression_lifetime.cpp` | `ExpressionLifetime.*`：值类别契约 + 生命周期回归 |

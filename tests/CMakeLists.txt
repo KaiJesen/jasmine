@@ -2,6 +2,7 @@ add_executable(unit_tests
   test_mha_tools.cpp
   test_causal_attention.cpp
   test_mat_basic.cpp
+  test_expression_lifetime.cpp
   test_mat_init.cpp
   test_gemm.cpp
   test_rope.cpp

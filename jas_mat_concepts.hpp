@@ -14,8 +14,16 @@ concept is_matrix =
         { m(i, j) } ;
     };
 
+/**
+ * 可参与矩阵表达式运算：标量或矩阵。
+ *
+ * 判标量前必须先剥掉引用 / const —— 二元运算符如今用转发引用接收操作数，
+ * 左值标量（例如 `double s; m / s;`）推导出的类型是 `double&`，
+ * 直接 `is_arithmetic_v<double&>` 是 false，会让整个重载悄悄消失。
+ */
 template<typename...val_types>
-concept is_caculable = ((std::is_arithmetic_v<val_types> || is_matrix<val_types>) && ...);
+concept is_caculable =
+    ((std::is_arithmetic_v<std::remove_cvref_t<val_types>> || is_matrix<val_types>) && ...);
 
 template<typename val_type>
 concept is_serializable = 

@@ -103,9 +103,15 @@ public:
         return mv;
     }
 
+    // 同 mat_t::dot：按接收者值类别分派，否则 `m.t().dot(x)` 这类写法存下来会悬垂
+    // 实现放到jas_mat_express_t.hpp中，因为此时还没有定义全局的dot函数
     template<typename other_type>
     requires is_matrix<other_type>
-    auto dot(const other_type& m) const;    // 实现放到jas_mat_express_t.hpp中，因为此时还没有定义全局的dot函数
+    auto dot(other_type&& m) const &;
+
+    template<typename other_type>
+    requires is_matrix<other_type>
+    auto dot(other_type&& m) const &&;
 
     operator agent_type() const
     {

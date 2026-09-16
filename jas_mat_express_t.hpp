@@ -5,6 +5,7 @@
 #include <sstream>
 #include <tuple>
 #include <string>
+#include <utility>
 #include <vector>
 #include <numeric>
 
@@ -16,24 +17,43 @@ namespace jasmine {
 
 template<typename lval_type, typename rval_type>
 requires is_matrix<lval_type> && is_matrix<rval_type>
-auto dot(lval_type const& lval, rval_type const& rval);
+auto dot(lval_type&& lval, rval_type&& rval);
 
-template<typename T, bool is_trivial>
-struct storage_selector;
-template<typename T>
-struct storage_selector<T, true>
+/**
+ * 表达式操作数的存储方式，按【值类别】决定：
+ *
+ *  - 标量        → 存 `mat_t<T>`：包成 1×1 矩阵，才能和矩阵共用 row_num/col_num/operator() 接口
+ *  - 左值（具名变量）→ 存 `T const&`：借引用，零拷贝。这是表达式模板能避免临时量的前提，
+ *                      代价是调用方必须保证它比表达式活得久（与 Eigen/Blaze 同一套约定）
+ *  - 右值（临时量）  → 存 `T`：按值拥有。右值往往就是临时的子表达式或临时矩阵
+ *                      （`(a+b)*c` 里的 `a+b`、`f() + x` 里的 `f()`），借引用必然悬垂
+ *
+ * 「右值按值拥有」这一条是表达式树能成为【可安全拷贝/传递的值】的关键。
+ * 之前一律按引用存，于是 `auto tree = (a+b)*c;` 会在语句结束时丢掉 `a+b` 这个临时量，
+ * tree 里的引用随即悬垂（ASan 报 stack-use-after-scope）。按值类别分派后，
+ * 这类树全程自持结构，拷贝/传参都安全。
+ *
+ * 仍然存在的边界：左值操作数、以及"视图所引用的矩阵"，其生命周期依旧由调用方负责。
+ * 前者是有意为之（否则每次构造表达式都要深拷贝整块矩阵），后者见下方 mat_view_t 的说明。
+ */
+template <typename T, bool is_scalar>
+struct storage_of;
+template <typename T>
+struct storage_of<T, true>
 {
-    using type = mat_t<T>;
+    using type = mat_t<std::remove_cvref_t<T>>;
+};
+template <typename T>
+struct storage_of<T, false>
+{
+    using type = std::conditional_t<std::is_lvalue_reference_v<T>,
+                                    std::remove_cvref_t<T> const&,   // 左值：借引用
+                                    std::remove_cvref_t<T>>;         // 右值：按值拥有
 };
 
-template<typename T>
-struct storage_selector<T, false>
-{
-    using type = T const &;
-};
-
-template<typename T>
-using storage_type = typename storage_selector<T, std::is_trivial_v<T>>::type;
+template <typename T>
+using storage_type = typename storage_of<
+    T, std::is_arithmetic_v<std::remove_cvref_t<T>>>::type;
 
 template <typename lval_type, typename rval_type, template<typename,typename> class tpl>
 class mat_express_2_param_stable_t
@@ -46,8 +66,13 @@ public:
     using derived_type = tpl<lval_type, rval_type>;
     using ele_type = std::common_type_t<lval_base_type, rval_base_type>;
 
-    mat_express_2_param_stable_t(lval_type const& left, rval_type const& right)
-        : m_left(left), m_right(right)
+    // 形参直接取「存储类型」而不是 lval_type/rval_type：
+    //  - 左值操作数 → 形参是 `T const&`，只是再绑一次引用，不拷贝
+    //  - 右值操作数 → 形参是 `T`（值），配合 std::forward 就是移动构造，不深拷贝临时量
+    // 另外，这样写出来的构造函数首参类型不可能是本节点自身，因此不会顶掉隐式拷贝/移动构造，
+    // 表达式树本身仍可正常拷贝（这是它能被安全传递的前提）。
+    mat_express_2_param_stable_t(lval_storage_type left, rval_storage_type right)
+        : m_left(std::move(left)), m_right(std::move(right))
     {
     }
 
@@ -89,10 +114,27 @@ public:
         return ss.str();
     }
 
+    /**
+     * `.dot()` 必须按【接收者】的值类别分派，原因很反直觉：
+     * 成员函数里的 `*this` 永远是左值，哪怕对象本身是临时量。
+     * 于是 `(a+b).dot(c)`、`a.t().dot(c)` 里的接收者会被当成左值借引用，
+     * 而它其实是临时量 —— 表达式树一旦被存下来就是悬垂引用。
+     * 这里用 ref-qualifier 区分：
+     *   const&  → 左值接收者，借引用（零拷贝）
+     *   const&& → 右值接收者，按值拥有（视图/节点都很小，拷贝极廉价；矩阵则必须拥有）
+     */
     template<typename other_type>
-    auto dot(const other_type& m) const
+    auto dot(other_type&& m) const &
     {
-        return jasmine::dot(*reinterpret_cast<derived_type const*>(this), m);
+        return jasmine::dot(*reinterpret_cast<derived_type const*>(this),
+                            std::forward<other_type>(m));
+    }
+
+    template<typename other_type>
+    auto dot(other_type&& m) const &&
+    {
+        return jasmine::dot(std::move(*reinterpret_cast<derived_type const*>(this)),
+                            std::forward<other_type>(m));
     }
 
     // 计算所有元素的值，并赋值给一个新的mat_t对象并返回
@@ -127,11 +169,13 @@ public:
     using rreturn_type = rval_type;
 
     using base_type = mat_express_2_param_stable_t<lval_type, rval_type, mat_greater_t>;
+    using lval_storage_type = typename base_type::lval_storage_type;
+    using rval_storage_type = typename base_type::rval_storage_type;
     using lval_base_type = typename base_type::lval_base_type;
     using rval_base_type = typename base_type::rval_base_type;
     using ele_type = std::common_type_t<lval_base_type, rval_base_type>;
-    mat_greater_t(lval_type const& left, rval_type const& right)
-        : base_type(left, right)
+    mat_greater_t(lval_storage_type left, rval_storage_type right)
+        : base_type(std::move(left), std::move(right))
     {
     }
 
@@ -148,9 +192,10 @@ public:
 
 template <typename lval_type, typename rval_type>
 requires is_caculable<lval_type, rval_type>
-auto operator>(lval_type const& left, rval_type const& right)
+auto operator>(lval_type&& left, rval_type&& right)
 {
-    return mat_greater_t<lval_type, rval_type>(left, right);
+    return mat_greater_t<lval_type&&, rval_type&&>(
+        std::forward<lval_type>(left), std::forward<rval_type>(right));
 }
 
 template <typename lval_type, typename rval_type>
@@ -161,12 +206,14 @@ public:
     using rreturn_type = rval_type;
 
     using base_type = mat_express_2_param_stable_t<lval_type, rval_type, mat_less_t>;
+    using lval_storage_type = typename base_type::lval_storage_type;
+    using rval_storage_type = typename base_type::rval_storage_type;
     using lval_base_type = typename base_type::lval_base_type;
     using rval_base_type = typename base_type::rval_base_type;
     using ele_type = std::common_type_t<lval_base_type, rval_base_type>;
 
-    mat_less_t(lval_type const& left, rval_type const& right)
-        : base_type(left, right)
+    mat_less_t(lval_storage_type left, rval_storage_type right)
+        : base_type(std::move(left), std::move(right))
     {
     }
 
@@ -183,9 +230,10 @@ public:
 
 template <typename lval_type, typename rval_type>
 requires is_caculable<lval_type, rval_type>
-auto operator<(lval_type const& left, rval_type const& right)
+auto operator<(lval_type&& left, rval_type&& right)
 {
-    return mat_less_t<lval_type, rval_type>(left, right);
+    return mat_less_t<lval_type&&, rval_type&&>(
+        std::forward<lval_type>(left), std::forward<rval_type>(right));
 }
 
 template <typename lval_type, typename rval_type>
@@ -196,13 +244,15 @@ public:
     using rreturn_type = rval_type;
 
     using base_type = mat_express_2_param_stable_t<lval_type, rval_type, mat_add_t>;
+    using lval_storage_type = typename base_type::lval_storage_type;
+    using rval_storage_type = typename base_type::rval_storage_type;
     using lval_base_type = typename base_type::lval_base_type;
     using rval_base_type = typename base_type::rval_base_type;
     using ele_type = std::common_type_t<lval_base_type, rval_base_type>;
 
 
-    mat_add_t(lval_type const& left, rval_type const& right)
-        : base_type(left, right)
+    mat_add_t(lval_storage_type left, rval_storage_type right)
+        : base_type(std::move(left), std::move(right))
     {
     }
 
@@ -220,9 +270,10 @@ public:
 
 template<typename lval_type, typename rval_type>
 requires is_caculable<lval_type, rval_type>
-auto operator+(lval_type const& left, rval_type const& right)
+auto operator+(lval_type&& left, rval_type&& right)
 {
-    return mat_add_t<lval_type, rval_type>(left, right);
+    return mat_add_t<lval_type&&, rval_type&&>(
+        std::forward<lval_type>(left), std::forward<rval_type>(right));
 }
 
 template<typename lval_type, typename rval_type>
@@ -261,12 +312,14 @@ public:
     using rreturn_type = rval_type;
 
     using base_type = mat_express_2_param_stable_t<lval_type, rval_type, mat_sub_t>;
+    using lval_storage_type = typename base_type::lval_storage_type;
+    using rval_storage_type = typename base_type::rval_storage_type;
     using lval_base_type = typename base_type::lval_base_type;
     using rval_base_type = typename base_type::rval_base_type;
     using ele_type = std::common_type_t<lval_base_type, rval_base_type>;
 
-    mat_sub_t(lval_type const& left, rval_type const& right)
-        : base_type(left, right)
+    mat_sub_t(lval_storage_type left, rval_storage_type right)
+        : base_type(std::move(left), std::move(right))
     {
     }
 
@@ -283,9 +336,10 @@ public:
 
 template<typename lval_type, typename rval_type>
 requires is_caculable<lval_type, rval_type>
-auto operator-(lval_type const& left, rval_type const& right)
+auto operator-(lval_type&& left, rval_type&& right)
 {
-    return mat_sub_t<lval_type, rval_type>(left, right);
+    return mat_sub_t<lval_type&&, rval_type&&>(
+        std::forward<lval_type>(left), std::forward<rval_type>(right));
 }
 
 template <typename lval_type, typename rval_type>
@@ -296,12 +350,14 @@ public:
     using rreturn_type = rval_type;
 
     using base_type = mat_express_2_param_stable_t<lval_type, rval_type, mat_mul_t>;
+    using lval_storage_type = typename base_type::lval_storage_type;
+    using rval_storage_type = typename base_type::rval_storage_type;
     using lval_base_type = typename base_type::lval_base_type;
     using rval_base_type = typename base_type::rval_base_type;
     using ele_type = std::common_type_t<lval_base_type, rval_base_type>;
 
-    mat_mul_t(lval_type const& left, rval_type const& right)
-        : base_type(left, right)
+    mat_mul_t(lval_storage_type left, rval_storage_type right)
+        : base_type(std::move(left), std::move(right))
     {
     }
 
@@ -318,9 +374,10 @@ public:
 
 template<typename lval_type, typename rval_type>
 requires is_caculable<lval_type, rval_type>
-auto operator*(lval_type const& left, rval_type const& right)
+auto operator*(lval_type&& left, rval_type&& right)
 {
-    return mat_mul_t<lval_type, rval_type>(left, right);
+    return mat_mul_t<lval_type&&, rval_type&&>(
+        std::forward<lval_type>(left), std::forward<rval_type>(right));
 }
 
 template <typename lval_type, typename rval_type>
@@ -331,13 +388,15 @@ public:
     using rreturn_type = rval_type;
 
     using base_type = mat_express_2_param_stable_t<lval_type, rval_type, mat_div_t>;
+    using lval_storage_type = typename base_type::lval_storage_type;
+    using rval_storage_type = typename base_type::rval_storage_type;
     using lval_base_type = typename base_type::lval_base_type;
     using rval_base_type = typename base_type::rval_base_type;
     using ele_type = std::common_type_t<lval_base_type, rval_base_type>;
 
 
-    mat_div_t(lval_type const& left, rval_type const& right)
-        : base_type(left, right)
+    mat_div_t(lval_storage_type left, rval_storage_type right)
+        : base_type(std::move(left), std::move(right))
     {
     }
 
@@ -355,9 +414,10 @@ public:
 
 template<typename lval_type, typename rval_type>
 requires is_caculable<lval_type, rval_type>
-auto operator/(lval_type const& left, rval_type const& right)
+auto operator/(lval_type&& left, rval_type&& right)
 {
-    return mat_div_t<lval_type, rval_type>(left, right);
+    return mat_div_t<lval_type&&, rval_type&&>(
+        std::forward<lval_type>(left), std::forward<rval_type>(right));
 }
 
 template<typename val_type, template<typename> class tpl>
@@ -369,8 +429,9 @@ public:
     using val_base_type = typename std::decay_t<val_storage_type>::ele_type;
     using ele_type = val_base_type;
 
-    mat_express_1_param_stable_t(val_type const& val)
-        : m_val(val)
+    // 与二元基类同理：形参取存储类型，左值零拷贝、右值移入（见 storage_type 的说明）
+    mat_express_1_param_stable_t(val_storage_type val)
+        : m_val(std::move(val))
     {
     }
 
@@ -410,10 +471,19 @@ public:
         return ss.str();
     }
 
+    // 同二元基类：`*this` 在成员函数里恒为左值，必须用 ref-qualifier 区分接收者是否为临时量
     template<typename other_type>
-    auto dot(const other_type& m) const
+    auto dot(other_type&& m) const &
     {
-        return jasmine::dot(*reinterpret_cast<derived_type const*>(this), m);
+        return jasmine::dot(*reinterpret_cast<derived_type const*>(this),
+                            std::forward<other_type>(m));
+    }
+
+    template<typename other_type>
+    auto dot(other_type&& m) const &&
+    {
+        return jasmine::dot(std::move(*reinterpret_cast<derived_type const*>(this)),
+                            std::forward<other_type>(m));
     }
 
     mat_t<ele_type> clone() const
@@ -445,11 +515,13 @@ class mat_exp_t:public mat_express_1_param_stable_t<val_type, mat_exp_t>
 {
 public:
     using base_type = mat_express_1_param_stable_t<val_type, mat_exp_t>;
-    using ele_type = typename val_type::ele_type;
+    using val_storage_type = typename base_type::val_storage_type;
+    // val_type 可能是 `T&`（左值操作数）或 `T&&`，取 ele_type 前必须先剥掉引用
+    using ele_type = typename std::remove_cvref_t<val_type>::ele_type;
     using val_base_type = typename base_type::val_base_type;
 
-    mat_exp_t(val_type const& val)
-        : mat_express_1_param_stable_t<val_type, mat_exp_t>(val)
+    mat_exp_t(val_storage_type val)
+        : mat_express_1_param_stable_t<val_type, mat_exp_t>(std::move(val))
     {
     }
 
@@ -467,9 +539,9 @@ public:
 
 template <typename val_type>
 requires is_matrix<val_type>
-auto exp(val_type const& val)
+auto exp(val_type&& val)
 {
-    return mat_exp_t<val_type>(val);
+    return mat_exp_t<val_type&&>(std::forward<val_type>(val));
 }
 
 template <typename val_type>
@@ -486,11 +558,13 @@ class mat_sigmoid_t:public mat_express_1_param_stable_t<val_type, mat_sigmoid_t>
 {
 public:
     using base_type = mat_express_1_param_stable_t<val_type, mat_sigmoid_t>;
+    using val_storage_type = typename base_type::val_storage_type;
     using val_base_type = typename base_type::val_base_type;
-    using ele_type = typename val_type::ele_type;
+    // val_type 可能是 `T&`（左值操作数）或 `T&&`，取 ele_type 前必须先剥掉引用
+    using ele_type = typename std::remove_cvref_t<val_type>::ele_type;
 
-    mat_sigmoid_t(val_type const& val)
-        : mat_express_1_param_stable_t<val_type, mat_sigmoid_t>(val)
+    mat_sigmoid_t(val_storage_type val)
+        : mat_express_1_param_stable_t<val_type, mat_sigmoid_t>(std::move(val))
     {
     }
 
@@ -507,9 +581,9 @@ public:
 
 template <typename val_type>
 requires is_matrix<val_type>
-auto sigmoid(val_type const& val)
+auto sigmoid(val_type&& val)
 {
-    return mat_sigmoid_t<val_type>(val);
+    return mat_sigmoid_t<val_type&&>(std::forward<val_type>(val));
 }
 
 template<typename val_type>
@@ -636,18 +710,23 @@ class mat_softmax_t:public mat_express_1_param_stable_t<val_type, mat_softmax_t>
 {
 public:
     using base_type = mat_express_1_param_stable_t<val_type, mat_softmax_t>;
-    using ele_type = typename val_type::ele_type;
+    using val_storage_type = typename base_type::val_storage_type;
+    // val_type 可能是 `T&`（左值操作数）或 `T&&`，取 ele_type 前必须先剥掉引用
+    using ele_type = typename std::remove_cvref_t<val_type>::ele_type;
     using val_base_type = typename base_type::val_base_type;
 private:
     ele_type m_sum;
     ele_type m_max;     // 用于数值稳定性的最大值
 public:
 
-    mat_softmax_t(val_type const& val)
-        : mat_express_1_param_stable_t<val_type, mat_softmax_t>(val)
+    mat_softmax_t(val_storage_type val)
+        : mat_express_1_param_stable_t<val_type, mat_softmax_t>(std::move(val))
     {
-        m_max = max(val);
-        m_sum = sum(exp(val - m_max));           // 初始化的时候求一遍和
+        // 注意：val 已经被 move 进基类的 m_val，此后不能再读 val
+        //（右值操作数 move 之后 val.data() 已是 nullptr）。统计量一律从 m_val 取，
+        // 这样左值（m_val 是引用）和右值（m_val 是拥有的值）两条路径都对。
+        m_max = max(base_type::m_val);
+        m_sum = sum(exp(base_type::m_val - m_max));           // 初始化的时候求一遍和
     }
 
     void reset()
@@ -677,9 +756,9 @@ auto softmax(val_type const& val)
 
 template <typename val_type>
 requires is_matrix<val_type>
-auto softmax(val_type const& val)
+auto softmax(val_type&& val)
 {
-    return mat_softmax_t<val_type>(val);
+    return mat_softmax_t<val_type&&>(std::forward<val_type>(val));
 }
 
 template <typename input_type>
@@ -702,15 +781,22 @@ requires is_matrix<lval_type> && is_matrix<rval_type>       // 矩阵点乘要�
 class mat_dot_t
 {
 public:
-    using ele_type = std::common_type_t<typename lval_type::ele_type, typename rval_type::ele_type>;
+    // lval_type/rval_type 可能是 `T&`（左值）或 `T&&`（右值），取 ele_type 前必须先剥掉引用
+    using ele_type = std::common_type_t<
+        typename std::remove_cvref_t<lval_type>::ele_type,
+        typename std::remove_cvref_t<rval_type>::ele_type>;
+    // 与其它表达式节点一致：左值借引用、右值按值拥有。
+    // 这里原来把引用写死在成员上，绕过了存储策略，是 `auto e = a.t().dot(b);` 悬垂的来源。
+    using lval_storage_type = storage_type<lval_type>;
+    using rval_storage_type = storage_type<rval_type>;
 private:
-    lval_type const& m_lval;
-    rval_type const& m_rval;
+    lval_storage_type m_lval;
+    rval_storage_type m_rval;
 public:
-    mat_dot_t(lval_type const& lval, rval_type const& rval)
-        : m_lval(lval), m_rval(rval)
+    mat_dot_t(lval_storage_type lval, rval_storage_type rval)
+        : m_lval(std::move(lval)), m_rval(std::move(rval))
     {
-        if (lval.col_num() != rval.row_num())
+        if (m_lval.col_num() != m_rval.row_num())
         {
             throw std::invalid_argument("mat_dot_t: inner dimensions do not match for dot product");
         }
@@ -739,10 +825,17 @@ public:
         return s;
     }
 
+    // 同其它基类：`*this` 恒为左值，需按接收者值类别分派，否则 `a.t().dot(b).dot(c)` 会悬垂
     template<typename other_type>
-    auto dot(const other_type& m) const
+    auto dot(other_type&& m) const &
     {
-        return jasmine::dot(*this, m);
+        return jasmine::dot(*this, std::forward<other_type>(m));
+    }
+
+    template<typename other_type>
+    auto dot(other_type&& m) const &&
+    {
+        return jasmine::dot(std::move(*this), std::forward<other_type>(m));
     }
 
     std::string to_string() const
@@ -784,9 +877,10 @@ public:
 
 template<typename lval_type, typename rval_type>
 requires is_matrix<lval_type> && is_matrix<rval_type>
-auto dot(lval_type const& lval, rval_type const& rval)
+auto dot(lval_type&& lval, rval_type&& rval)
 {
-    return mat_dot_t<lval_type, rval_type>(lval, rval);
+    return mat_dot_t<lval_type&&, rval_type&&>(
+        std::forward<lval_type>(lval), std::forward<rval_type>(rval));
 }
 
 // 在这里实现mat_t::dot成员函数
@@ -794,17 +888,36 @@ template <typename val_type>
 requires std::is_arithmetic_v<val_type>
 template<typename other_type>
 requires is_matrix<other_type>
-auto mat_t<val_type>::dot(const other_type& m) const
+auto mat_t<val_type>::dot(other_type&& m) const &
 {
-    return jasmine::dot(*this, m);
+    return jasmine::dot(*this, std::forward<other_type>(m));
+}
+
+template <typename val_type>
+requires std::is_arithmetic_v<val_type>
+template<typename other_type>
+requires is_matrix<other_type>
+auto mat_t<val_type>::dot(other_type&& m) const &&
+{
+    // 临时矩阵必须被拥有：std::move(*this) 使其以右值身份进入存储策略，
+    // 于是节点内保存的是一份真实的矩阵拷贝，而不是对已销毁临时量的引用
+    return jasmine::dot(std::move(*this), std::forward<other_type>(m));
 }
 
 template <typename val_type>
 template<typename other_type>
 requires is_matrix<other_type>
-auto mat_view_t<val_type>::dot(const other_type& m) const
+auto mat_view_t<val_type>::dot(other_type&& m) const &
 {
-    return jasmine::dot(*this, m);
+    return jasmine::dot(*this, std::forward<other_type>(m));
+}
+
+template <typename val_type>
+template<typename other_type>
+requires is_matrix<other_type>
+auto mat_view_t<val_type>::dot(other_type&& m) const &&
+{
+    return jasmine::dot(std::move(*this), std::forward<other_type>(m));
 }
 
 template<typename val_type>

@@ -392,9 +392,16 @@ public:
         return mat_t<val_type>(*this);
     }
 
+    // 成员函数里的 *this 恒为左值，所以这里按【接收者】的值类别分派：
+    //   const&  → 左值矩阵：借引用（零拷贝）
+    //   const&& → 临时矩阵（如 `make().dot(x)`）：按值拥有，否则表达式树存下来就是悬垂引用
     template<typename other_type>
     requires is_matrix<other_type>
-    auto dot(const other_type& m) const;
+    auto dot(other_type&& m) const &;
+
+    template<typename other_type>
+    requires is_matrix<other_type>
+    auto dot(other_type&& m) const &&;
 };
 
 
