@@ -59,8 +59,11 @@ constexpr void assert_device_ready()
 {
     static_assert(is_device_evaluable_v<Expr>,
                   "这个表达式含有无法在设备上求值的操作数（例如 mat_t / mat_view_t）。"
-                  "设备表达式必须由 dev_mat_t 叶子构成；dot / softmax 也不能逐元素融合，"
-                  "它们需要专用 kernel 或 cuBLAS。");
+                  "设备表达式必须由 dev_mat_t 叶子构成。注意 dot / softmax 节点也在这里被挡住 —— "
+                  "它们不是「忘了标注」，而是**刻意不能融合**：矩阵乘每个输出元素要跨一行求和，"
+                  "硬塞进逐元素 kernel 会把访存复用全丢掉。设备端请用立即求值的 "
+                  "cuda::matmul(a, b) 或 a.leaf().dot(b.leaf())（结果可再用 .leaf() 参与表达式），"
+                  "以及 cuda::softmax_rows(x)（见 jas_cuda_reduce.hpp）。");
     static_assert(is_self_contained_v<Expr>,
                   "表达式树里有引用成员，不能作为 kernel 参数。kernel 参数是【按值】搬到设备上的，"
                   "引用成员搬过去的是主机地址，设备端一解引用就是 cudaErrorIllegalAddress。"

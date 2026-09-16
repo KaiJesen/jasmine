@@ -18,12 +18,13 @@
 | 标量操作数 | ✅ 已实现 |
 | 转置视图（逐元素路径） | ✅ 已实现 |
 | GEMM 与转置组合（`A·B`、`Aᵀ·B`、`Q·Kᵀ`、双转置、`beta` 累加） | ✅ 已实现（cuBLAS） |
+| `.dot()` 的设备分派（立即求值 + 链式 + 表达式操作数） | ✅ 已实现（第 6 节） |
 | 归约（`row_sum` / `col_sum` / `sum_all` / …） | ✅ 已实现（第 5 节） |
 | 逐行 softmax（含 `-inf` 因果掩码） | ✅ 已实现（`softmax_rows`） |
 | LayerNorm / RMSNorm | ✅ 已实现 |
 | 单头注意力前向端到端 | ✅ 已实现（GEMM + 掩码 + softmax + GEMM，有对拍用例） |
 | 反向传播的设备路径 | ❌ 尚未实现 |
-| 整个模型的端到端 GPU 推理 | ❌ 尚未实现（缺 `mat_dot_t` 的 cuBLAS 调度与 KV cache） |
+| KV cache 与整个模型的端到端 GPU 推理 | ❌ 尚未实现 |
 
 ---
 
@@ -55,6 +56,13 @@ auto y = cuda::eval_fused_to_host((a.leaf() + b.leaf()) * c.leaf());
 // 矩阵乘：走 cuBLAS
 auto s = cuda::gemm_to_host(q.leaf(), k.leaf().t());   // S = Q·Kᵀ
 
+// .dot() 立即求值，写法与主机端几乎同形（第 6 节）
+auto scores = q.leaf().t().dot(k.leaf());              // → dev_matrix_t
+auto prod   = a.dot(b);                                // 链式：a.dot(b).dot(c)
+
+// 操作数可以是表达式：非叶子的先融合物化
+auto mixed = cuda::matmul(a.leaf() + b.leaf(), c.leaf());   // (a + b)·c
+
 // 归约：整棵表达式树都能塞进去，exp 融进求和那一趟
 auto row_totals = cuda::row_sum(exp(x.leaf() * 2.0));
 
@@ -64,7 +72,10 @@ auto weights = cuda::softmax_rows(scores.leaf() / scale + mask.leaf());
 // 归一化层：gamma 是 (d_model × 1) 的列向量，沿列广播
 cuda::dev_colvec_t<double> gamma(d_model);
 gamma.buffer().upload(host_gamma.data(), d_model);
-auto normed = cuda::rms_norm(x.leaf(), gamma, 1e-5f);
+auto normed = cuda::rms_norm(x.leaf(), gamma, 1e-5);
+
+// GEMM 的结果用 .leaf() 回到表达式世界
+auto out = v.leaf().dot(weights.leaf().t());
 ```
 
 归约结果的两种用法：`.download()` 回主机对拍，或 `.leaf()` 取广播叶子继续参与表达式运算。
@@ -162,9 +173,9 @@ inline constexpr bool is_self_contained_v = std::is_copy_assignable_v<T>;
 
 `softmax` 另有一层原因：它的 `max` / `sum` 统计量在**构造时于主机上算好**，而 `max()`/`sum()` 是主机独占的归约。对一个设备矩阵调 `softmax()`，会在主机上解引用设备指针。所以它既不能融合，也不该被构造出来。
 
-这两类节点因此刻意**不标** `device_evaluable`，含它们的表达式会在编译期被 `static_assert` 挡住。
+这两类节点因此刻意**不标** `device_evaluable`（`mat_dot_t` 里显式写了 `= false`，免得日后有人「顺手」补上），含它们的表达式会在编译期被 `static_assert` 挡住。
 
-> 注意区分：**`mat_softmax_t` 这个节点**不能用于设备（理由如上），但「在设备上做 softmax」是另一回事 —— 见第 5 节，走归约 kernel 而不是靠节点融合。
+> 注意区分：**`mat_softmax_t` 这个节点**不能用于设备（理由如上），但「在设备上做 softmax」是另一回事 —— 见第 5 节，走归约 kernel 而不是靠节点融合。`dot` 同理，见第 6 节。
 
 ---
 
@@ -214,7 +225,59 @@ inline constexpr bool is_self_contained_v = std::is_copy_assignable_v<T>;
 
 ---
 
-## 6. 行优先 ↔ 列优先
+## 6. `dot` 的设备分派：立即求值
+
+主机端的 `.dot()` 返回一个**惰性**的 `mat_dot_t` 节点。这个设计在 CPU 上是对的 —— 节点能被并进更大的表达式树，由 `work()` 逐元素求值，省掉中间的矩阵物化。
+
+设备端不能照搬，而且原因不是「还没实现」，是**它不该被那样用**：`mat_dot_t::operator()` 的实现是「每个输出元素自己走一遍 K 循环」。真把它融进逐元素 kernel，每个线程都会重算一遍整行内积，访存复用全部丢掉 —— 正确但性能塌方。
+
+既然 GEMM 必然要单独执行一次，那就不该假装它是个惰性节点。所以设备端的 `.dot()` **立即求值**：
+
+```cpp
+// 主机端：返回惰性节点，可继续并进表达式
+auto s = m_q.t().dot(m_k);
+
+// 设备端：立即落成 cuBLAS，返回拥有显存的结果
+auto s = dq.leaf().t().dot(dk);              // → dev_matrix_t<double>
+```
+
+于是两边写法几乎同形，语义差异（惰性 vs 立即）由类型系统显式承载：主机端返回 `mat_dot_t`，设备端返回 `dev_matrix_t`。测试里有编译期断言盯住这一条。
+
+### 6.1 三种入口
+
+| 写法 | 用途 |
+| --- | --- |
+| `a.leaf().dot(b.leaf())` | 叶子之间，最贴近主机端写法 |
+| `A.dot(B)` | `dev_matrix_t` 之间；结果是拥有者，可继续链式 `.dot()` |
+| `cuda::matmul(a, b, alpha)` | **操作数可以是任意设备可求值的表达式**：非叶子的会先被融合物化成临时矩阵，再进 GEMM |
+
+`matmul` 的第三种能力是这里唯一比主机端更灵活的地方，也补上了「分派点必须可组合」这一环：
+
+```cpp
+auto y = cuda::matmul(x.leaf() + residual.leaf(), w.leaf());   // (x + residual)·W
+```
+
+结果 `dev_matrix_t` 用 `.leaf()` 就能回到表达式世界：
+
+```cpp
+auto scores = q.leaf().t().dot(k.leaf());
+auto prob   = cuda::softmax_rows(scores.leaf() / scale + mask.leaf());
+auto out    = v.leaf().dot(prob.leaf().t());
+```
+
+### 6.2 转置仍然只翻标志位
+
+`.t()` 在设备端和主机端一样只是翻一个 `m_transposed`、不碰内存，所以 GEMM 的四种转置组合（`A·B`、`Aᵀ·B`、`A·Bᵀ`、`Aᵀ·Bᵀ`）都自动成立，前导维始终是**未经转置解释**的存储步长。内维校验读的是叶子报出的（已含转置的）形状，因此「同一块内存，直接乘该抛、转置后合法」这种边界也有专门用例盯着。
+
+### 6.3 一处刻意的 `const_cast`
+
+`dev_mat_t::m_data` 是 `T*`（因为 GEMM 的输出要写它），所以从 `const dev_matrix_t` 里取不出 `dev_mat_t<T>`。为此 `dev_matrix_t` 提供了一个 `const_leaf()`，里面是一次显式 `const_cast`。
+
+它只在**语义上只读**的地方用（`gemm` 的 A/B 形参本就是 `const dev_mat_t<T>&`，只读 `m_data`，从不写），拿到它只应传给 GEMM 这类只读接口；要写仍然必须用非 const 的 `leaf()`。这比让所有 `.dot()` 都要求非 const 接收者要好 —— 后者会把「读操作」的 const 正确性代价转嫁给每个调用方。
+
+---
+
+## 7. 行优先 ↔ 列优先
 
 cuBLAS 只认列优先，而本项目一律行优先。做法是不复制数据，靠「转置同一块内存」对齐：
 
@@ -234,9 +297,9 @@ cublasXgemm(handle, opB, opA, N, M, K, ..., B, ldb, A, lda, ..., C, ldc)
 
 ---
 
-## 7. 这台机器上的注意事项
+## 8. 这台机器上的注意事项
 
-### 7.1 必须用 CUDA 12.4，不能用 13.x
+### 8.1 必须用 CUDA 12.4，不能用 13.x
 
 **CUDA 13 起移除了 Pascal 支持**，而本机 `/usr/local/cuda` 默认指向 13.2。用它编译 `sm_61` 会直接失败。
 
@@ -248,7 +311,7 @@ cmake -S . -B build-cuda -DJASMINE_USE_CUDA=ON \
       -DJASMINE_CUDA_ARCHITECTURES=61
 ```
 
-### 7.2 散热（重要）
+### 8.2 散热（重要）
 
 本机只有一张 **Tesla P4，没有风扇**，靠机箱风道散热，TDP 75W。长时间满负载会持续升温。
 
@@ -264,7 +327,7 @@ JASMINE_CUDA_STRESS=1 ./build-cuda/tests/cuda_tests
 
 实测这两个压力用例合计约 0.5 秒，跑完 45℃。**只要不是反复循环跑，就不会有问题。**
 
-### 7.3 Pascal 的算力特性
+### 8.3 Pascal 的算力特性
 
 P4 是 Pascal（sm_61），没有 Tensor Core，也没有 TF32。所以：
 
@@ -273,7 +336,7 @@ P4 是 Pascal（sm_61），没有 Tensor Core，也没有 TF32。所以：
 
 ---
 
-## 8. 测试
+## 9. 测试
 
 ```bash
 # 主机端回归（必须仍然全绿）
@@ -293,33 +356,35 @@ JASMINE_CUDA_STRESS=1 ./build-cuda/tests/cuda_tests   # 含算力型用例
 - **归约**：`row_sum`/`row_max`/`col_sum`/`col_max`/`sum_all`/`max_all` 与主机端逐元素对拍，含**轴不得搞反**的专项用例（形状不对称 + 行列和各不相同）、融合归约（`row_sum(exp(x*2))`）、float32、单行/单列/单元素边界。
 - **softmax**：与主机 `hsoftmax` 对拍、每行和为 1、大输入（1000 量级）的数值稳定性、**`-inf` 因果掩码**（未来位置必须恰好为 0 且整行不出现 nan）、表达式输入、具名表达式输入。
 - **归一化层**：`layer_norm` / `rms_norm` 与主机 `layer_norm_net_t` / `rms_norm_net_t` 对拍（含非平凡 gamma/beta）、每列零均值、RMSNorm 的尺度不变性与非平移不变性、表达式输入。
-- **注意力端到端**：`GEMM → 缩放/加掩码 → 逐行 softmax → GEMM` 拼起来与主机算式对拍，外加一条不依赖参考实现的**因果性**行为检查（改动第 t 个 token 之后的内容，前 t 个位置的输出必须一字不变）。
+- **`dot` 分派**（`test_cuda_dot.cu`）：`.dot()` 在设备端立即求值（编译期断言返回类型是拥有者而非节点）、`mat_dot_t` 仍被显式拒绝上设备、`matmul` 三入口（叶子/拥有者/表达式操作数）、四种转置组合、链式 `.dot()`、`alpha` 缩放、结果回灌表达式、内维不匹配报错、**转置后形状参与校验**、float32。
+- **注意力端到端**：`GEMM → 缩放/加掩码 → 逐行 softmax → GEMM` 拼起来与主机算式对拍（两份：`gemm_to_host` 版与自然 `.dot()` 版），外加一条不依赖参考实现的**因果性**行为检查（改动第 t 个 token 之后的内容，前 t 个位置的输出必须一字不变）。
 - **压力**（默认跳过）：4096² 融合、256³ GEMM。
 
 数值对拍一律用**相对容差**，原因见 5.4。
 
 ---
 
-## 9. 文件一览
+## 10. 文件一览
 
 | 文件 | 职责 |
 | --- | --- |
 | `jas_cuda_compat.hpp` | `JAS_HD` / `JAS_DEV` 宏、设备安全数学（`device_exp` / `device_max` / `device_sqrt`）、`device_evaluable` 探测。**不依赖 CUDA 运行时**，纯 CPU 构建也能 include |
-| `jas_cuda_leaf.hpp` | 设备叶子 `dev_mat_t`（薄壳、转置视图）、按值拥有定制点。同样不依赖运行时 |
+| `jas_cuda_leaf.hpp` | 设备叶子 `dev_mat_t`（薄壳、转置视图）、按值拥有定制点、`is_dev_leaf` 判别、`.dot()` 的声明。同样不依赖运行时 |
 | `jas_cuda_buffer.hpp` | 运行时基础设施：错误检查、设备查询、`dev_buf_t`、`pinned_buf_t`、`sync()` |
-| `jas_cuda_matrix.hpp` | `dev_matrix_t`：把「管内存的 buf」和「薄壳 leaf」绑成所有者 |
-| `jas_cuda_fused.hpp` | 融合逐元素 kernel 与启动器 |
-| `jas_cuda_gemm.hpp` | cuBLAS GEMM（含行优先映射与转置组合） |
+| `jas_cuda_matrix.hpp` | `dev_matrix_t`：把「管内存的 buf」和「薄壳 leaf」绑成所有者；`const_leaf()` |
+| `jas_cuda_fused.hpp` | 融合逐元素 kernel 与启动器（含「不可上设备」的编译期断言） |
+| `jas_cuda_gemm.hpp` | cuBLAS GEMM、`matmul` 三入口、`.dot()` 的定义（含行优先映射与转置组合） |
 | `jas_cuda_reduce.hpp` | 广播叶子、`dev_colvec_t`/`dev_rowvec_t`、归约 kernel、`softmax_rows` / `layer_norm` / `rms_norm` |
 
-主机端被改动的文件只有三处加注 `JAS_HD`，以及 `jas_mat_express_t.hpp` 里的标量叶子（`scalar_leaf_t`）与「按值拥有」判据（见 3.3）。
+主机端被改动的文件：三处加注 `JAS_HD`、`jas_mat_express_t.hpp` 里的标量叶子（`scalar_leaf_t`）、「按值拥有」判据（见 3.3）、`mat_dot_t` 显式标注 `device_evaluable = false`、以及 `is_mat_dot` 判别 trait。
 
 ---
 
-## 10. 下一步
+## 11. 下一步
 
 1. ~~归约 kernel~~ ✅ 已完成（第 5 节）：`row_*` / `col_*` / `sum_all` / `max_all`，以及建立其上的 `softmax_rows` / `layer_norm` / `rms_norm`。
-2. **softmax 专用 kernel（性能）**：现在 `softmax_rows` 是**三趟**（求最大值 → 求指数和 → 归一化），每趟都融合。合成一趟 online-softmax（边扫边修正 `m` 与 `s`）可以把三遍读 x 降到一遍，对带宽受限的 P4 收益明显。当前实现优先保证与主机端语义易于对拍。
-3. **把 `mat_dot_t` 接上 cuBLAS 调度**：让 `a.dot(b)` 在设备叶子上自动落到 GEMM，而不是只在编译期被挡住。这是让整个 `mat_mha_t` / `mat_llama_t` 能直接跑在 GPU 上的最后一块拼图。
-4. **KV cache 与 attention**：P4 只有 8 GB 显存，量化或分页 KV cache 是跑长上下文的前提。
-5. **反向传播的设备路径**：目前只做了前向。训练要跑在 GPU 上还需要归约的梯度（`hsum` 的反向是广播）。
+2. ~~`dot` 接上 cuBLAS 调度~~ ✅ 已完成（第 6 节）。
+3. **softmax 专用 kernel（性能）**：现在 `softmax_rows` 是**三趟**（求最大值 → 求指数和 → 归一化），每趟都融合。合成一趟 online-softmax（边扫边修正 `m` 与 `s`）可以把三遍读 x 降到一遍，对带宽受限的 P4 收益明显。当前实现优先保证与主机端语义易于对拍。
+4. **KV cache**：P4 只有 8 GB 显存，量化或分页 KV cache 是跑长上下文的前提。这是「整模型上 GPU」剩下的主要工程件。
+5. **反向传播的设备路径**：目前只做了前向。训练要跑在 GPU 上还需要归约的梯度（`hsum` 的反向是广播）与 GEMM 的转置配对。
+6. **把 `mat_mha_t` / `mat_llama_t` 真正搬上设备**：「设备端能做注意力」现在已经成立，但那些 net 类本身仍是主机实现（`mat_t` 成员、OpenMP 循环、主机端统计）。要在 GPU 上跑整个模型，还需要一层「把主机 net 的参数搬成 `dev_matrix_t`、并按设备路径重写 forward」的适配。

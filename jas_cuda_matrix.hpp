@@ -29,6 +29,8 @@ template <typename T>
 class dev_matrix_t
 {
 public:
+    using ele_type = T;
+
     dev_matrix_t() = default;
 
     dev_matrix_t(int rows, int cols)
@@ -78,6 +80,25 @@ public:
 
     /** 转置视图的薄壳。 */
     dev_mat_t<T> leaf_transposed() { return dev_mat_t<T>(m_buf.data(), m_rows, m_cols, true); }
+
+    /**
+     * 只读叶子。仅用于作 GEMM 的**输入**。
+     *
+     * `dev_mat_t::m_data` 是 `T*`（GEMM 的输出要写它），所以从 const 的
+     * `dev_matrix_t` 里取不出 `dev_mat_t<T>`。这里用一次显式 `const_cast` 把
+     * 「语义上只读」这件事表达出来 —— `gemm` 的 A/B 形参本就是
+     * `const dev_mat_t<T>&`，只读 `m_data`，从不写。
+     *
+     * **拿到它只应传给 GEMM 这类只读接口**；要写请用非 const 的 `leaf()`。
+     */
+    dev_mat_t<T> const_leaf() const
+    {
+        return dev_mat_t<T>(const_cast<T*>(m_buf.data()), m_rows, m_cols);
+    }
+
+    /** 矩阵乘 `this · other`；立即求值，定义在 jas_cuda_gemm.hpp。 */
+    dev_matrix_t<T> dot(const dev_mat_t<T>& other) const;
+    dev_matrix_t<T> dot(const dev_matrix_t<T>& other) const;
 
     dev_buf_t<T>& buffer() { return m_buf; }
     const dev_buf_t<T>& buffer() const { return m_buf; }

@@ -198,6 +198,49 @@ int main(int argc, char** argv)
     print_diff(s_dev, s_host);
 
     // ---------------------------------------------------------------------
+    // .dot() 的设备分派：立即落成 cuBLAS，结果可再参与表达式
+    // ---------------------------------------------------------------------
+    std::printf("\n=== .dot() 设备分派（与主机端几乎同形的写法）===\n");
+    {
+        const int dh = 32, sq = 24;
+        auto hq2 = make_host(dh, sq, 0.13);
+        auto hk2 = make_host(dh, sq, 0.17);
+        auto hv2 = make_host(dh, sq, 0.11);
+
+        cuda::dev_matrix_t<double> dq2(dh, sq, hq2), dk2(dh, sq, hk2), dv2(dh, sq, hv2);
+
+        // 主机端 m_head_gen_t::forward_at 里是 m_q.t().dot(m_k) / sqrt(d) 再 softmax 再 dot
+        auto scores_h = (hq2.t().dot(hk2) / std::sqrt(static_cast<double>(dh))).clone();
+        for (int i = 0; i < sq; ++i)
+            for (int j = i + 1; j < sq; ++j)
+                scores_h(i, j) = -std::numeric_limits<double>::infinity();
+        auto attn_h = hsoftmax(scores_h);
+        auto out_h = (hv2.dot(attn_h.t())).clone();
+
+        mat_t<double> mask_h(sq, sq);
+        mask_h = 0.0;
+        for (int i = 0; i < sq; ++i)
+            for (int j = i + 1; j < sq; ++j)
+                mask_h(i, j) = -std::numeric_limits<double>::infinity();
+        cuda::dev_matrix_t<double> dmask(sq, sq, mask_h);
+
+        // 设备端：三个 GEMM 分派点 + 两个融合/归约送算，全部同形
+        auto scores = dq2.leaf().t().dot(dk2);                        // GEMM：打分
+        auto weights = cuda::softmax_rows(scores.leaf() / std::sqrt(static_cast<double>(dh))
+                                          + dmask.leaf());            // 融合 + 掩码 + softmax
+        auto out = dv2.leaf().dot(weights.leaf().t());                // GEMM：加权求和
+        std::printf("  q.t().dot(k) → %d×%d，softmax，再 v.dot(w.t()) → %d×%d\n", scores.row_num(),
+                    scores.col_num(), out.row_num(), out.col_num());
+        print_diff(out.download(), out_h);
+
+        // GEMM 的结果是「拥有者」，能继续链式 dot，也能用 .leaf() 回到表达式世界
+        auto chained = scores.dot(scores.leaf().t());                 // 结果·结果ᵀ
+        auto composed = cuda::eval_fused_to_host(chained.leaf() / static_cast<double>(sq));
+        std::printf("  链式 s.dot(s.t()) → %d×%d；再 .leaf() 参与融合 → %d×%d\n",
+                    chained.row_num(), chained.col_num(), composed.row_num(), composed.col_num());
+    }
+
+    // ---------------------------------------------------------------------
     // 归约：逐行 softmax（把 mask 直接加进表达式）
     // ---------------------------------------------------------------------
     std::printf("\n=== 逐行 softmax（因果掩码 + 数值稳定）===\n");

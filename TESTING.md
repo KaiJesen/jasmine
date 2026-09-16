@@ -636,18 +636,27 @@ ASAN_OPTIONS=detect_leaks=0 ./build-asan/tests/unit_tests --gtest_filter='-Llama
 `row_sum` / `col_sum` / `softmax_rows`：设备叶子与主机表达式同住 `jasmine` 命名空间，
 同名会让 ADL 把主机重载静默拉进候选集，产生极难定位的错误。
 
+`dot` 在两侧的语义刻意不同，且由类型系统承载：主机端 `.dot()` 返回惰性 `mat_dot_t` 节点
+（可继续并进表达式树），设备端 `.dot()` **立即求值**并返回 `cuda::dev_matrix_t`。
+理由见 `CUDA.md` 第 6 节 —— `mat_dot_t::operator()` 是「每个输出元素自己走一遍 K 循环」，
+融进逐元素 kernel 会把访存复用全丢掉，所以它显式标注 `device_evaluable = false`。
+`is_mat_dot` 这个判别 trait 就是为了在编译期把两种返回类型分别断言出来。
+
 `tests/test_cuda_fused.cu` 覆盖逐元素/GEMM 契约，`tests/test_cuda_reduce.cu` 覆盖归约、
-softmax、归一化层与注意力端到端（编译期断言 + 与主机逐元素对拍）。细节见 `CUDA.md`。
+softmax、归一化层，`tests/test_cuda_dot.cu` 覆盖 `dot` 分派与注意力端到端
+（编译期断言 + 与主机逐元素对拍）。细节见 `CUDA.md`。
 
 ### 相关文件
 
 | 文件 | 作用 |
 |------|------|
-| `jas_mat_express_t.hpp` | `storage_of` / `storage_type` 存储策略；`scalar_leaf_t`；`is_self_contained_v`；各表达式节点与运算符；`mat_dot_t` |
+| `jas_mat_express_t.hpp` | `storage_of` / `storage_type` 存储策略；`scalar_leaf_t`；`is_self_contained_v`；`is_mat_dot`；各表达式节点与运算符；`mat_dot_t` |
 | `jas_mat_concepts.hpp` | `is_caculable`（判标量前 `remove_cvref`） |
 | `jas_mat_t.hpp` / `jas_mat_view_t.hpp` | `.dot()` 的 ref-qualified 声明；访问器的 `JAS_HD` 标注 |
 | `jas_cuda_compat.hpp` | `JAS_HD` / `JAS_DEV`、设备安全数学、`device_evaluable` 探测 |
+| `jas_cuda_gemm.hpp` | cuBLAS GEMM、`matmul` 三入口、`.dot()` 的定义 |
 | `jas_cuda_reduce.hpp` | 广播叶子、`dev_colvec_t`/`dev_rowvec_t`、归约 kernel、`softmax_rows` / `layer_norm` / `rms_norm` |
 | `tests/test_expression_lifetime.cpp` | `ExpressionLifetime.*`：值类别契约 + 生命周期回归 |
 | `tests/test_cuda_fused.cu` | `CudaEnvironment.*` / `CudaDeviceTest.*`：设备契约 + 融合/GEMM 对拍 |
 | `tests/test_cuda_reduce.cu` | `CudaReduceContract.*` / `CudaReduceTest.*`：归约、softmax、归一化、注意力端到端 |
+| `tests/test_cuda_dot.cu` | `CudaDotContract.*` / `CudaDotTest.*`：`dot` 分派、转置组合、链式与表达式操作数 |

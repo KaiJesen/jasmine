@@ -30,6 +30,13 @@
 
 namespace jasmine {
 
+namespace cuda {
+// 前向声明：dot() 要返回拥有者类型，但它的定义在 jas_cuda_gemm.hpp（那里才有 cuBLAS）。
+// 只在类里声明、在 GEMM 头里定义，是为了让本头继续不依赖 CUDA 运行时。
+template <typename T>
+class dev_matrix_t;
+} // namespace cuda
+
 /**
  * 行优先存储的设备矩阵句柄，带可选的转置视图。
  *
@@ -82,7 +89,33 @@ struct dev_mat_t
 
     JAS_HD bool transposed() const { return m_transposed; }
     JAS_HD bool valid() const { return m_data != nullptr; }
+
+    /**
+     * 设备端矩阵乘 `this · other`（转置视图自动生效，见 jas_cuda_gemm.hpp）。
+     *
+     * 与主机端的 `.dot()` 有个本质区别：**这里立即求值**，返回一个拥有显存的结果，
+     * 而不是构造一个 `mat_dot_t` 节点。
+     *
+     * 理由是 GEMM 根本无法融合。主机端的 `.dot()` 返回惰性节点是有意义的 ——
+     * 它还能被并进更大的表达式树、由 `work()` 逐元素求值；而设备端的
+     * `mat_dot_t::operator()` 是「每个输出元素自己走一遍 K 循环」，融进逐元素 kernel
+     * 等于把访存复用完全丢掉。既然它必然要单独执行，那就不该假装它是个惰性节点：
+     * 显式地立即落成 cuBLAS，语义与性能都对得上。
+     *
+     * 也正因如此，`mat_dot_t` 刻意不标 `device_evaluable`（见 jas_mat_express_t.hpp），
+     * 于是「误把主机 dot 节点丢给融合 kernel」在编译期就被挡住。
+     */
+    cuda::dev_matrix_t<T> dot(const dev_mat_t<T>& other) const;
+    cuda::dev_matrix_t<T> dot(const cuda::dev_matrix_t<T>& other) const;
 };
+
+/** 判断是不是设备叶子。用来给「叶子直通、表达式先物化」的重载分流。 */
+template <typename T>
+struct is_dev_leaf : std::false_type {};
+template <typename T>
+struct is_dev_leaf<dev_mat_t<T>> : std::true_type {};
+template <typename T>
+inline constexpr bool is_dev_leaf_v = is_dev_leaf<std::remove_cvref_t<T>>::value;
 
 /**
  * 设备叶子按值拥有：即便调用方传的是左值，树里也存一份薄壳。

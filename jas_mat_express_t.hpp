@@ -869,6 +869,16 @@ public:
     // 这里原来把引用写死在成员上，绕过了存储策略，是 `auto e = a.t().dot(b);` 悬垂的来源。
     using lval_storage_type = storage_type<lval_type>;
     using rval_storage_type = storage_type<rval_type>;
+
+    /**
+     * 矩阵乘**刻意不标 `device_evaluable`**（显式写出来，免得日后有人"顺手"补上）。
+     *
+     * 它的 `operator()` 是让每个输出元素自己走一遍 K 循环，融进逐元素 kernel 会丢掉
+     * 全部访存复用。设备端走 `cuda::matmul` / `dev_mat_t::dot`（立即 cuBLAS），
+     * 见 jas_cuda_gemm.hpp。这个 false 让「误用」在编译期就变成构建错误。
+     */
+    static constexpr bool device_evaluable = false;
+
 private:
     lval_storage_type m_lval;
     rval_storage_type m_rval;
@@ -954,6 +964,20 @@ public:
         return m;
     }
 };
+
+/**
+ * 判断某个类型是不是 `mat_dot_t` 节点。
+ *
+ * 设备端做重载分流时要用：`.dot()` 在主机端产出这个节点，在设备端则**不**产出它
+ * （设备端立即落成 cuBLAS，见 jas_cuda_gemm.hpp）。有了这个 trait 就能在编译期
+ * 把「两种语义」分别断言出来，而不是写死 receiver 的引用类别去比类型。
+ */
+template <typename T>
+struct is_mat_dot : std::false_type {};
+template <typename lval_type, typename rval_type>
+struct is_mat_dot<mat_dot_t<lval_type, rval_type>> : std::true_type {};
+template <typename T>
+inline constexpr bool is_mat_dot_v = is_mat_dot<std::remove_cvref_t<T>>::value;
 
 template<typename lval_type, typename rval_type>
 requires is_matrix<lval_type> && is_matrix<rval_type>
