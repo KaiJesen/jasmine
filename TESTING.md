@@ -858,3 +858,92 @@ TF32 的 1e-3 一冲就没了；而且它在测试机（Pascal P4）上**看不�
 | `tests/test_cuda_fused.cu` | `CudaEnvironment.*` / `CudaDeviceTest.*`：设备契约 + 融合/GEMM 对拍 |
 | `tests/test_cuda_reduce.cu` | `CudaReduceContract.*` / `CudaReduceTest.*`：归约、softmax、归一化、注意力端到端 |
 | `tests/test_cuda_dot.cu` | `CudaDotContract.*` / `CudaDotTest.*`：`dot` 分派、转置组合、链式与表达式操作数 |
+
+---
+
+## 10. RoPE 缓存的并发填充（L 形补齐 + 发布/订阅）
+
+RoPE 的旋转块 `[[cosθ, -sinθ], [sinθ, cosθ]]` 只跟 `(特征对 i, 位置 m, d)` 有关，
+所以整张表按需算、算过就存：`mat_RoPE_t` 持有 `mat_cache_t`，行是特征二维对、列是位置展开的 2×2 块。
+
+麻烦在于**它不归某一个头所有**：`rope_registry_t<val_type>` 是按 `(d, layout)` 索引的**进程级单例**，
+而 `mat_mha_t` 的每个头都在 `#pragma omp parallel for` 里跑，于是「哪些格子已经算过」这件事
+既要不重复计算（否则每加一个位置就重算整张表），又必须在并发下成立。
+
+### 不变量
+
+> **缓存自称已填充的矩形 `[0, m_filled_rows) × [0, m_filled_cols)` 里，不允许存在从未被写过的格子。**
+
+这不是洁癖：`mat_t` 的存储来自 `new val_type[...]` 且分配后 `memset` 清零，没写过的格子读出来是 0.0，
+不崩、不报错，只是那块 2×2 旋转矩阵变成全 0 —— **对应特征对被静默清零**，误差随层数放大。
+
+### 曾经的 bug（两个成因，同一个不变量）
+
+**1. 用「两个轴的 max」记账，而不是真写过的范围。** 旧 `init` 只在请求到的矩形里逐格跳过「已填」
+格子，最后把两个轴的上限各自取 max。于是这个序列会留下洞：
+
+```cpp
+rope.init(0, d, 0, 2);   // 高而窄：写了 [0,d) × [0,2)
+rope.init(0, 2, 0, 8);   // 矮而宽：只写了 [0,2) × [2,8)
+// 记账成了 (d, 8)，但 [2,d) × [2,8) 从没被遍历过 —— 却被记成已填
+```
+
+单线程时请求顺序是「只长列」（每次都只有列方向越界），不会踩到；多线程交错时，
+先来的可能是「宽而矮」再是「高」，洞就出现了 —— 这正是
+`LlamaAlignmentTest.RawHiddenStatesMatchLayerByLayer` **时好时坏**、且失败时逐层漂移的原因。
+
+**2. 补齐过程没有同步。** 判「够不够」读的两个 `int`（旧 `m_enable_rows/cols`）被多线程同时读写；
+更糟的是扩容会**替换底层存储**，而别人的 `mat_view_t` 正指着旧缓冲区。
+
+### 修法
+
+| 问题 | 现在 |
+|------|------|
+| 补齐范围不精确 | `fill_from_origin()` 只补**精确的 L 形带**：新来的行 × 全部列 + 老行 × 新来的列。只增不减，所以「补到哪」永远是一块完整矩形，不需要逐格判断 |
+| 并发补齐 | 整个「扩容 + 补齐」在 `m_fill_mutex` 内串行化；进锁后会**重读一次上限取 max**，两个线程同时走慢路径也不丢更新 |
+| 上限的可见性 | 上限改成 `std::atomic<int> m_filled_rows/cols`，写完再 `release`，读用 `acquire`。命中时走**完全无锁**的只读快路径（两次 acquire 读 + 一次 `raw_view`），所以读不是瓶颈 |
+| 扩容换存储 | 旧存储**不析构**，进 `m_retired` 退休（读者手里可能还攥着它的视图）。扩容按「至少 1.5 倍」（`EXPAND_SIZE` 保底）增长，所以退休总量收敛：在职 + 退休 ≤ 4 倍最终容量，不随扩容次数线性累积 |
+| 误用面 | 删掉 `mat_cache_t` 上「读一次顺手扩容+改记账」的惰性 `operator()` / `range`，只留 `grow_to`（容量）+ `cell`（写）+ `raw_view`（共享读，不改任何状态） |
+
+副作用与边界：**dynamic 模式现在也可以多线程共享**（原先头文件注释写的是「不安全」）；
+代价是扩容过的实例会多留一份旧存储。`static_fixed`（先 `reserve` 一次填满、运行期不写）不受影响，
+它的语义也依旧更严：越界直接抛 `std::out_of_range`，绝不在运行期扩容。
+
+### 单测
+
+`tests/test_rope_cache_race.cpp`（4 例，`RoPeCacheThreading.*`）：
+
+| 用例 | 钉住什么 |
+|------|----------|
+| `FilledRectangleHasNoUnwrittenCell` | 上面那个 init 序列留下的洞；与线程无关，**旧实现确定性失败** |
+| `ConcurrentExtentsMatchAnalyticValues` | 8 线程乱序请求不同矩形，每个块必须等于解析值 |
+| `ConcurrentFillMatchesSerialFill` | 整块矩形「并发 vs 串行」对拍（全量块，不只是抽样） |
+| `ReservedCacheIsSafeToReadConcurrently` | `static_fixed` 只读共享的对照组 |
+
+TSan 是这条不变量的关键证据。kernel 6.17 上 `-fsanitize=thread` 的二进制会撞
+「unexpected memory mapping」（ASLR / shadow 映射），要关掉随机化；`setarch -R` 需要
+`personality(2)`，在沙箱里会被拦，**要在普通 shell 里跑**：
+
+```bash
+GT=build-tsan/_deps/googletest-src/googletest/include
+g++ -std=c++20 -fsanitize=thread -g -O1 -fno-omit-frame-pointer \
+  -I. -I"$GT" -Itests tests/test_rope_cache_race.cpp \
+  build-tsan/lib/libgtest.a build-tsan/lib/libgtest_main.a -lpthread -o /tmp/tsan_rope
+setarch "$(uname -m)" -R /tmp/tsan_rope --gtest_filter='RoPeCacheThreading.*'
+```
+
+修前 / 修后的实测（同一份测试、同一套编译参数）：
+
+```
+修前：exit 66，25 处 WARNING: ThreadSanitizer: data race，FilledRectangleHasNoUnwrittenCell 失败
+      报点集中在 jas_RoPE_t.hpp 的 range()/init() 与 mat_cache_t::range()，还有直接落在存储上的读写竞争
+修后：exit 0，0 处告警，4 例全过
+```
+
+### 相关文件
+
+| 文件 | 作用 |
+|------|------|
+| `jas_RoPE_t.hpp` | `mat_cache_t`（容量 / `cell` / `raw_view` / 退休存储）+ `mat_RoPE_t`（`fill_from_origin` / `range` / `reserve`） |
+| `tests/test_rope_cache_race.cpp` | `RoPeCacheThreading.*`：填充不变量 + 并发回归 + TSan 复现入口 |
+| `jas_mha_t.hpp` | 各头并发调用 `m_rope->forward_at()`，缓存不变量在这里被真正用上 |
