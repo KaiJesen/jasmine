@@ -902,12 +902,63 @@ rope.init(0, 2, 0, 8);   // 矮而宽：只写了 [0,2) × [2,8)
 | 补齐范围不精确 | `fill_from_origin()` 只补**精确的 L 形带**：新来的行 × 全部列 + 老行 × 新来的列。只增不减，所以「补到哪」永远是一块完整矩形，不需要逐格判断 |
 | 并发补齐 | 整个「扩容 + 补齐」在 `m_fill_mutex` 内串行化；进锁后会**重读一次上限取 max**，两个线程同时走慢路径也不丢更新 |
 | 上限的可见性 | 上限改成 `std::atomic<int> m_filled_rows/cols`，写完再 `release`，读用 `acquire`。命中时走**完全无锁**的只读快路径（两次 acquire 读 + 一次 `raw_view`），所以读不是瓶颈 |
-| 扩容换存储 | 旧存储**不析构**，进 `m_retired` 退休（读者手里可能还攥着它的视图）。扩容按「至少 1.5 倍」（`EXPAND_SIZE` 保底）增长，所以退休总量收敛：在职 + 退休 ≤ 4 倍最终容量，不随扩容次数线性累积 |
+| 扩容换存储 | 旧存储**不析构**，进 `m_buffers` 退休（读者手里可能还攥着它的视图）。增长按 1.5 倍几何扩（见下），所以退休总量收敛：在职 + 退休 ≤ 3 倍最终容量，不随扩容次数线性累积 |
 | 误用面 | 删掉 `mat_cache_t` 上「读一次顺手扩容+改记账」的惰性 `operator()` / `range`，只留 `grow_to`（容量）+ `cell`（写）+ `raw_view`（共享读，不改任何状态） |
 
 副作用与边界：**dynamic 模式现在也可以多线程共享**（原先头文件注释写的是「不安全」）；
 代价是扩容过的实例会多留一份旧存储。`static_fixed`（先 `reserve` 一次填满、运行期不写）不受影响，
 它的语义也依旧更严：越界直接抛 `std::out_of_range`，绝不在运行期扩容。
+
+### 追加：增长路径的对象同一性（第二轮，内存口径修好之后才暴露）
+
+第一轮修完 TSan 是 **0 处告警**——因为当时构造函数预分配了 `1024×1024`（8 MiB），
+小规模用例**根本走不到扩容**，增长路径等于没被覆盖。把预分配去掉之后，
+`ConcurrentFillMatchesSerialFill` 变成**随机段错误**，TSan 给出的报点很干脆：
+
+```
+T2 写: mat_cache_t::ensure_capacity        ← fill_from_origin ← range
+T1 读: mat_t<double>::col_num()            ← mat_view_t::operator()   ← 早已取出的视图
+```
+
+根因不在锁，而在**对象同一性**：`mat_view_t` 里存的是 `mat_t*`，**每次取元素都重新解引用那个对象**
+（读它的 data 指针与维度）。旧实现把缓冲存成 `mat_cache_t` 的一个 `mat_t` 成员，扩容时原地 `= std::move(新缓冲)`——
+于是任何一个已经交出去的视图，在并发扩容下都会读到一个**正在被改写的对象**。这不是数值偏差，是 UB。
+
+修法是把它变成不变式：**对象一经发布就不再改动**。缓冲全部由 `m_buffers`（`vector<unique_ptr<mat_t>>`）持有，
+当前的那个由 `std::atomic<mat_t*> m_cur` 指过去；扩容 = 拷进**新对象** + `release` 换指针，
+读方一次 `acquire` 载入指针后，拿到的维度与 data 就都稳定了（写方只写「已发布范围之外」的格子，
+与读者读的格子不重叠）。这也让「退休」从「防 use-after-free」升级成「保证读者看到的是一个完整的旧对象」。
+
+### 内存口径：`EXPAND_SIZE` 这个下限是反的
+
+同一轮顺手修掉的第二个问题：`mat_cache_t` 原本一出生就 `mat_cache(EXPAND_SIZE, EXPAND_SIZE)`，
+而 `ensure_capacity` 又用 `m_cache.row_num() + EXPAND_SIZE` 保底。RoPE 表的**行数是 `d_head`**
+（几个到上百个），给它加一个 1024 的下限，等于每次都为小维度白分配 1024 行。TinyLlama（`d_head=64`）
+量出来的差别：
+
+| 场景（`d_head=64`，2048 位置） | 改前 | 改后 |
+|------|------|------|
+| dynamic 惰性填充 | +32 MiB | +9 MiB（驻留 2 MiB + 退休 6 MiB） |
+| static 预留 | +2 MiB | +2 MiB（精确，退休 0） |
+
+32 MiB 正是那个「1024 行下限 × 4096 列 × 8 字节」。现在改成空对象起步 + 纯 1.5 倍几何增长
+（够用优先，其次 1.5 倍，避免逐位置增长时 O(n) 次重分配）。
+
+### 把预留真正接到推理路径上
+
+上面这些都属于「修好那条路径」；但**推理路径压根没走预留**：`mat_mha_t::set_param` 里
+`reserve_kv_cache(seq_len)` 与 `bind_rope()` 并排，而 `bind_rope()` 的 `max_seq_len` 默认 0，
+`rope_registry_t` 又默认 `dynamic` —— 两个条件都不成立，`reserve()` 一次都不会调。
+`set_rope_cache_mode` / `reserve_rope` / `bind_rope(max_seq_len)` 这三个 API 全仓只在测试里出现过。
+
+现在补上 `mat_mha_t::reserve_rope_cache(max_seq)`（经 `llama_model_t::reserve_rope_cache` 下沉到各层），
+`llama_chat` 在 `reserve_kv_cache(max_context)` 旁边一行调用。几个刻意的选择：
+
+- **不改全局默认模式**，只对拿到的那一个共享条目 `set_cache_mode`——注册中心按 `(d_head, layout)` 共享，
+  改全局默认会波及同进程里其它维度的用法。
+- **预留长度单调取 max**，且已就位就早返回——否则上层逐层调下来时，`reserve()` 会重置记账并整表重填 `n_layers` 遍。
+- 没有 RoPE 的模型（GPT-2 那类绝对位置）调它是**无操作**，不是抛异常。
+- 越界抛 `std::out_of_range`：这是把「上下文上限」从注释变成可检查的不变量。
 
 ### 单测
 
@@ -937,13 +988,26 @@ setarch "$(uname -m)" -R /tmp/tsan_rope --gtest_filter='RoPeCacheThreading.*'
 ```
 修前：exit 66，25 处 WARNING: ThreadSanitizer: data race，FilledRectangleHasNoUnwrittenCell 失败
       报点集中在 jas_RoPE_t.hpp 的 range()/init() 与 mat_cache_t::range()，还有直接落在存储上的读写竞争
-修后：exit 0，0 处告警，4 例全过
+第一轮修后：exit 0，0 处告警，4 例全过
+      —— 但这时预分配还在，增长路径没被跑到，所以这个「0」是有水分的
+第二轮（去掉预分配 + 原子换指针）：exit 0，0 处告警，4 例全过，
+      且此时 ConcurrentFillMatchesSerialFill 真的在走扩容；修前它是随机段错误（60 次重复 0 失败）
+```
+
+复现命令（段错误那条也可以用 ASan，但它是时序相关、不一定每次撞上，TSan 是更稳的裁判）：
+
+```bash
+# 抓时序：重复跑，任何一次非 0 都是回归
+for i in $(seq 1 60); do ./build/tests/unit_tests --gtest_filter='RoPeCacheThreading.*' || echo "FAILED at $i"; done
 ```
 
 ### 相关文件
 
 | 文件 | 作用 |
 |------|------|
-| `jas_RoPE_t.hpp` | `mat_cache_t`（容量 / `cell` / `raw_view` / 退休存储）+ `mat_RoPE_t`（`fill_from_origin` / `range` / `reserve`） |
+| `jas_RoPE_t.hpp` | `mat_cache_t`（`m_buffers` + `m_cur` 原子指针 / `cell` / `raw_view` / 退休存储）+ `mat_RoPE_t`（`fill_from_origin` / `range` / `reserve`） |
 | `tests/test_rope_cache_race.cpp` | `RoPeCacheThreading.*`：填充不变量 + 并发回归 + TSan 复现入口 |
-| `jas_mha_t.hpp` | 各头并发调用 `m_rope->forward_at()`，缓存不变量在这里被真正用上 |
+| `tests/test_rope.cpp` | `RoPE.ReserveRopeCache*`：预留的长度/模式/越界/单调性/无 RoPE 时无操作 |
+| `tests/test_llama_weights.cpp` | `LlamaStructure.ReservedRopeCacheKeepsOutputIdenticalAndFailsFast`：预留后的数值必须与惰性填充**逐位一致** |
+| `jas_mha_t.hpp` | 各头并发调用 `m_rope->forward_at()`；`reserve_rope_cache()` 在这里切换模式并预留 |
+| `examples/llama_chat.cpp` | 推理路径唯一的调用点（`reserve_kv_cache` 旁边） |

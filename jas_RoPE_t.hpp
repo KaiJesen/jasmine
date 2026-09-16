@@ -17,8 +17,10 @@ namespace jasmine {
 
 /**
  * dynamic: 按需扩容 —— 补齐与扩容都在锁内完成，且判「已填充」的范围永远是一个
- *          真被写满的矩形，因此可以多线程共享（读路径只做两次 acquire 读，不加锁）。
- *          代价是扩容时旧存储不释放（已交给别人的视图还指着它），见 mat_cache_t::m_retired。
+ *          真被写满的矩形；扩容是「拷进新对象 + 原子换指针」，已发布的缓冲对象
+ *          不再改动，所以读者拿到的视图在并发扩容下依然稳定（读路径只做两次
+ *          acquire 读 + 一次指针 acquire 读，不加锁）。
+ *          代价是扩容时旧对象不释放（已交给别人的视图还指着它），见 mat_cache_t::m_buffers。
  * static_fixed: 预先 reserve 一次填满，运行期不写、不扩容，最强约束。
  */
 enum class rope_cache_mode
@@ -56,25 +58,53 @@ template<typename val_type>
 class mat_cache_t
 {
 private:
-    mat_t<val_type> m_cache;
-    int m_cache_rows;
+    /**
+     * 所有缓冲对象：当前的一个 + 退休的若干。所有权都在这里。
+     *
+     * 为什么不是「一个 mat_t 成员，扩容时原地换掉它」：
+     * mat_view_t 里存的是 `mat_t*`，**每次取元素都会重新解引用那个对象**
+     * （读它的 data 指针与维度，见 jas_mat_view_t.hpp）。于是只要扩容原地替换了
+     * 那个成员，任何一个已经交出去的视图在并发扩容下就会读到一个正在被改写的
+     * 对象 —— 这不是「值偏差」，是 UB：实测会段错误，TSan 报在
+     * `mat_t::col_num()`（读者）与 `ensure_capacity()`（写者）之间。
+     * （之前之所以看不见：构造函数预分配了 1024×1024，小规模用例压根走不到扩容。）
+     *
+     * 现在的约定是「对象一经发布就不再改动」：
+     *   扩容 = 拷进一个新对象，再把 m_cur 原子换过去；
+     *   旧对象留在 m_buffers 里不析构，已经发出去的视图继续有效。
+     * 于是读者只需一次 acquire 载入指针，之后拿到的维度与 data 都是稳定的；
+     * 写者只写「已发布范围之外」的格子，与读者读的格子不重叠，故无数据竞争。
+     *
+     * 代价是内存：扩容按 1.5 倍几何增长，退休总量收敛 —— 在职 + 退休 ≤ 3 倍最终容量。
+     */
+    std::vector<std::unique_ptr<mat_t<val_type>>> m_buffers;
+    /** 当前缓冲对象。读方用 acquire，写方（持锁）用 relaxed */
+    std::atomic<mat_t<val_type>*> m_cur;
+
+    int m_cache_rows;      // 写方记账：grow_to 扩到过的范围
     int m_cache_cols;
     rope_cache_mode m_mode;
 
-    /**
-     * 扩容时退休的旧存储。缓存在多线程间共享，读者拿到的 mat_view_t 指向缓冲区，
-     * 出了锁还会继续用 —— 扩容时若析构旧缓冲区就是 use-after-free。
-     *
-     * 代价是内存：扩容按「至少 1.5 倍」（EXPAND_SIZE 保底）增长，所以退休总量收敛
-     * ——在职 + 退休 ≤ 4 倍最终容量，不会随扩容次数线性累积。
-     */
-    std::vector<std::unique_ptr<mat_t<val_type>>> m_retired;
+    mat_t<val_type>* cache_write()
+    {
+        return m_cur.load(std::memory_order_relaxed);
+    }
 
-    static constexpr int EXPAND_SIZE = 1024;
+    mat_t<val_type>* cache_read() const
+    {
+        return m_cur.load(std::memory_order_acquire);
+    }
+
+    void install(std::unique_ptr<mat_t<val_type>> fresh)
+    {
+        m_buffers.push_back(std::move(fresh));
+        m_cur.store(m_buffers.back().get(), std::memory_order_release);
+    }
 
     void ensure_capacity(int rows, int cols)
     {
-        if (rows <= m_cache.row_num() && cols <= m_cache.col_num())
+        mat_t<val_type>* cur = cache_write();
+        if (rows <= cur->row_num() && cols <= cur->col_num())
             return;
 
         if (m_mode == rope_cache_mode::static_fixed)
@@ -83,32 +113,30 @@ private:
                 "RoPE static cache capacity exceeded; call reserve() with a larger max_seq_len");
         }
 
-        int new_rows = m_cache.row_num();
-        if (rows > m_cache.row_num())
-            new_rows = std::max(rows, std::max(m_cache.row_num() + EXPAND_SIZE,
-                                               m_cache.row_num() * 3 / 2));
-        int new_cols = m_cache.col_num();
-        if (cols > m_cache.col_num())
-            new_cols = std::max(cols, std::max(m_cache.col_num() + EXPAND_SIZE,
-                                               m_cache.col_num() * 3 / 2));
+        // 纯几何增长：够用就行，其次按 1.5 倍扩（避免逐位置增长时 O(n) 次重分配）。
+        // 刻意不设「绝对行/列数下限」——RoPE 的行数是 d_head，几个到上百个，
+        // 给它加个 1024 的下限等于每次都为小维度白分配 1024 行：
+        // d_head=4 时是 8 MiB 对 32 KB 的差别（这就是之前构造函数预分配
+        // EXPAND_SIZE×EXPAND_SIZE 的代价，也与「精确预留」的目标正好相反）。
+        int new_rows = cur->row_num();
+        if (rows > new_rows)
+            new_rows = std::max(rows, cur->row_num() * 3 / 2);
+        int new_cols = cur->col_num();
+        if (cols > new_cols)
+            new_cols = std::max(cols, cur->col_num() * 3 / 2);
 
-        mat_t<val_type> new_cache(new_rows, new_cols);
-        for (int i = 0; i < m_cache.row_num(); ++i)
-        {
-            for (int j = 0; j < m_cache.col_num(); ++j)
-            {
-                new_cache(i, j) = m_cache(i, j);
-            }
-        }
-        m_retired.emplace_back(std::make_unique<mat_t<val_type>>(std::move(m_cache)));
-        m_cache = std::move(new_cache);
+        auto fresh = std::make_unique<mat_t<val_type>>(new_rows, new_cols);
+        for (int i = 0; i < cur->row_num(); ++i)
+            for (int j = 0; j < cur->col_num(); ++j)
+                (*fresh)(i, j) = (*cur)(i, j);
+        install(std::move(fresh));
     }
 
 public:
     mat_cache_t()
-        : m_cache(EXPAND_SIZE, EXPAND_SIZE), m_cache_rows(0), m_cache_cols(0),
-          m_mode(rope_cache_mode::dynamic)
+        : m_cache_rows(0), m_cache_cols(0), m_mode(rope_cache_mode::dynamic)
     {
+        install(std::make_unique<mat_t<val_type>>());   // 空对象起步，不预分配
     }
 
     void set_mode(rope_cache_mode mode)
@@ -121,8 +149,8 @@ public:
         return m_mode;
     }
 
-    int capacity_rows() const { return m_cache.row_num(); }
-    int capacity_cols() const { return m_cache.col_num(); }
+    int capacity_rows() const { return cache_read()->row_num(); }
+    int capacity_cols() const { return cache_read()->col_num(); }
     int logical_rows() const { return m_cache_rows; }
     int logical_cols() const { return m_cache_cols; }
 
@@ -135,11 +163,9 @@ public:
         if (m_mode == rope_cache_mode::static_fixed)
         {
             // 静态模式允许在 reserve 时（一次性）分配/重分配
-            if (rows != m_cache.row_num() || cols != m_cache.col_num())
-            {
-                m_retired.emplace_back(std::make_unique<mat_t<val_type>>(std::move(m_cache)));
-                m_cache = mat_t<val_type>(rows, cols);
-            }
+            mat_t<val_type>* cur = cache_write();
+            if (rows != cur->row_num() || cols != cur->col_num())
+                install(std::make_unique<mat_t<val_type>>(rows, cols));
             m_cache_rows = 0;
             m_cache_cols = 0;
             return;
@@ -162,27 +188,45 @@ public:
     /** 写入用：容量已由 grow_to 保证，这里不做扩容、不改记账 */
     val_type& cell(int row, int col)
     {
-        return m_cache(row, col);
+        return (*cache_write())(row, col);
     }
 
     /**
      * 共享读用：不加锁、不改任何状态，直接给视图。
      * 调用方（mat_RoPE_t）必须自己保证 [row, row+rows) × [col, col+cols) 已经写满。
+     *
+     * 这里只做一次 acquire 载入当前对象——之后视图解引用的就是这个对象，
+     * 而对象一经发布不再改动（扩容是换新对象），所以并发扩容不会让视图读到半个对象。
      */
     mat_view_t<mat_t<val_type>> raw_view(int row, int col, int rows, int cols)
     {
-        return m_cache.view(row, col, rows, cols);
+        return cache_read()->view(row, col, rows, cols);
     }
 
     /** 只读视图：不扩容，越界抛异常（供 static 热路径） */
     mat_view_t<mat_t<val_type>> range_readonly(int row, int col, int rows, int cols) const
     {
-        if (row + rows > m_cache_rows || col + cols > m_cache_cols)
+        mat_t<val_type>* cur = cache_read();
+        if (row + rows > cur->row_num() || col + cols > cur->col_num())
         {
-            throw std::out_of_range("RoPE cache range out of initialized region");
+            throw std::out_of_range("RoPE cache range out of capacity");
         }
-        // const_cast：view 需要非 const mat 引用，但调用方承诺只读
-        return const_cast<mat_t<val_type>&>(m_cache).view(row, col, rows, cols);
+        return cur->view(row, col, rows, cols);
+    }
+
+    /** 已退休（非当前）缓冲对象占用的字节数；static 预留路径应当为 0（不经历扩容） */
+    std::size_t retired_bytes() const
+    {
+        mat_t<val_type>* cur = cache_read();
+        std::size_t total = 0;
+        for (const auto& m : m_buffers)
+        {
+            if (m.get() == cur)
+                continue;
+            total += static_cast<std::size_t>(m->row_num())
+                   * static_cast<std::size_t>(m->col_num()) * sizeof(val_type);
+        }
+        return total;
     }
 
     void reset_logical()
@@ -268,6 +312,12 @@ public:
     int max_seq_len() const
     {
         return m_max_seq_len;
+    }
+
+    /** 退休存储占用的字节数；static 预留路径应当为 0（不经历扩容） */
+    std::size_t retired_bytes() const
+    {
+        return m_cache.retired_bytes();
     }
 
     /**
@@ -513,6 +563,18 @@ public:
     void reserve(int max_seq_len)
     {
         m_rope.reserve(max_seq_len);
+    }
+
+    /** static 模式下已预留的序列长；dynamic 或未预留时为 0 */
+    int cache_max_seq_len() const
+    {
+        return m_rope.max_seq_len();
+    }
+
+    /** 扩容时退休的旧存储字节数（static 预留路径应为 0） */
+    std::size_t cache_retired_bytes() const
+    {
+        return m_rope.retired_bytes();
     }
 
     mat_t<val_type> forward(input_type const& x)

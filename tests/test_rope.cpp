@@ -134,6 +134,83 @@ TEST(RoPE, MhaHeadsShareRegistryRope)
     reg.clear();
 }
 
+/**
+ * reserve_rope_cache 把共享条目从「惰性扩容」钉成「预留 + 只读」。
+ *
+ * 这条路径过去只是 API（库里没人调），于是推理一直跑惰性填充。现在它被 llama_chat
+ * 显式启用，所以这里把三件事钉死：模式真的切了、预留长度真的生效、越界是抛异常
+ * 而不是默默扩容（后者正是「上下文上限」从注释变成可检查不变量的关键）。
+ */
+TEST(RoPE, ReserveRopeCachePinsSharedEntryToStatic)
+{
+    auto& reg = rope_registry_t<double>::instance();
+    reg.clear();
+
+    mat_mha_t<mat_t<double>, nadam_t> mha(2, 8, false, 2); // d_head = 4
+    ASSERT_TRUE(reg.contains(4));
+    auto rope = reg.get(4);
+    ASSERT_NE(rope, nullptr);
+    EXPECT_EQ(rope->cache_mode(), rope_cache_mode::dynamic); // 默认仍是惰性填充
+
+    mha.reserve_rope_cache(16);
+
+    EXPECT_EQ(rope->cache_mode(), rope_cache_mode::static_fixed);
+    EXPECT_EQ(rope->cache_max_seq_len(), 16);
+    EXPECT_EQ(rope->cache_retired_bytes(), 0u); // 预留路径不经历扩容，没有退休存储
+
+    // 预留范围内可用（位置 13..15 落在 [0, 16) 内）
+    mat_t<double> x(4, 3, 0.0);
+    EXPECT_NO_THROW(rope->forward_at(x, 13));
+    // 越界：位置 16 需要第 17 个位置，早失败而不是扩容
+    EXPECT_THROW(rope->forward_at(mat_t<double>(4, 1, 0.0), 16), std::out_of_range);
+
+    reg.clear();
+}
+
+/** 预留长度取单调最大值，且重复调用不会退化成「每次重填一遍」 */
+TEST(RoPE, ReserveRopeCacheIsMonotoneAndRefillsCorrectly)
+{
+    auto& reg = rope_registry_t<double>::instance();
+    reg.clear();
+
+    mat_mha_t<mat_t<double>, nadam_t> mha(2, 8, false, 2); // d_head = 4
+    mha.reserve_rope_cache(12);
+    auto rope = reg.get(4);
+    ASSERT_NE(rope, nullptr);
+    EXPECT_EQ(rope->cache_max_seq_len(), 12);
+
+    // 先来的大长度不会被后来的小长度缩掉
+    mha.reserve_rope_cache(4);
+    EXPECT_EQ(rope->cache_max_seq_len(), 12);
+    EXPECT_EQ(rope->cache_mode(), rope_cache_mode::static_fixed);
+
+    // 单调扩上去；static 扩容会换一次存储（退休旧缓冲），所以这里验证的是内容仍然正确
+    mha.reserve_rope_cache(20);
+    EXPECT_EQ(rope->cache_max_seq_len(), 20);
+
+    RoPE_net_t<mat_t<double>> dyn(4);
+    mat_t<double> x(4, 1, 1.0);
+    ExpectNearMat(dyn.forward_at(x, 19), rope->forward_at(x, 19), 1e-12);
+    ExpectNearMat(dyn.forward_at(x, 0), rope->forward_at(x, 0), 1e-12);
+
+    reg.clear();
+}
+
+/** 没有 RoPE 的模型（GPT-2 那种绝对位置）调它应当是无操作，而不是抛异常 */
+TEST(RoPE, ReserveRopeCacheIsNoOpWithoutRope)
+{
+    auto& reg = rope_registry_t<double>::instance();
+    reg.clear();
+
+    mat_mha_t<mat_t<double>, nadam_t> mha(2, 8, false, 2); // d_head = 4
+    mha.set_use_rope(false);
+    EXPECT_NO_THROW(mha.reserve_rope_cache(64));
+
+    EXPECT_THROW(mha.reserve_rope_cache(0), std::invalid_argument);
+
+    reg.clear();
+}
+
 TEST(RoPE, BackwardIsTransposeRotation)
 {
     // d=2, seq=2: position m=1 uses φ=1, R = [[c,-s],[s,c]], backward applies R^T
