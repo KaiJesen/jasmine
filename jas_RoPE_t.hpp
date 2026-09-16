@@ -2,9 +2,10 @@
 #define __JAS_ROPE_HPP__
 
 #include <cmath>
+#include <map>
 #include <memory>
 #include <stdexcept>
-#include <unordered_map>
+#include <utility>
 #include "jas_mat_view_t.hpp"
 #include "jas_mat_express_t.hpp"
 
@@ -19,6 +20,30 @@ enum class rope_cache_mode
     dynamic,
     static_fixed
 };
+
+/**
+ * RoPE 的特征配对约定：θ_i = m / 10000^(2i/d) 两种约定完全一致，
+ * 区别只在于「第 i 个旋转角作用在哪两个特征上」。
+ *
+ * - interleaved：作用于第 (2i, 2i+1) 对特征（原始 RoPE 论文 / GPT-NeoX 写法），
+ *   也是本仓库既有的实现，保持默认以兼容已有模型与测例。
+ * - half_split ：作用于第 (i, i + d/2) 对特征（GPT-J 写法），
+ *   HuggingFace 的 `LlamaRotaryEmbedding` + `rotate_half` 用的就是它。
+ *
+ * 注意：位置 m = 0 时旋转恒为恒等变换，两种约定输出完全相同，
+ * 因此只比对单 token、位置 0 的输出无法区分二者；多 token 序列上必须显式指定。
+ * 导出 LLaMA 系权重（HF 实现）时必须选 half_split。
+ */
+enum class rope_pair_layout
+{
+    interleaved = 0,
+    half_split = 1
+};
+
+inline const char* rope_pair_layout_name(rope_pair_layout layout)
+{
+    return layout == rope_pair_layout::half_split ? "half_split" : "interleaved";
+}
 
 // 一个可以变动的缓存矩阵，用于RoPE的计算
 template<typename val_type>
@@ -304,12 +329,103 @@ class RoPE_net_t
 private:
     using val_type = typename input_type::ele_type;
     mat_RoPE_t<val_type> m_rope;
+    rope_pair_layout m_layout = rope_pair_layout::interleaved;
+
+    /** 既有实现：旋转第 (2i, 2i+1) 对特征。列 j 用位置 start_pos + j。 */
+    template <typename in_t>
+    mat_t<val_type> interleaved_rotate_at(in_t const& x, int start_pos)
+    {
+        int seq_len = x.col_num();
+        int d_model = x.row_num();
+        mat_t<val_type> ret(d_model, seq_len);
+        // 外层：序列位置；内层：特征二维对。缓存每 2×2 块共用 θ = m / 10000^(2i/d)
+        for (int j = 0; j < seq_len; ++j)
+        {
+            const int m = start_pos + j;
+            for (int i = 0; i < d_model / 2; ++i)
+            {
+                auto ret_view = ret.view(i * 2, j, 2, 1);
+                auto input_view = x.view(i * 2, j, 2, 1);
+                auto rope_mat = m_rope.forward_unite(i, m);
+                ret_view.assign(rope_mat.dot(input_view));
+            }
+        }
+        return ret;
+    }
+
+    /** 既有实现的反向：按 2×2 旋转矩阵的转置旋转回来。 */
+    template <typename in_t>
+    mat_t<val_type> interleaved_backward(in_t const& delta)
+    {
+        int seq_len = delta.col_num();
+        int d_model = delta.row_num();
+        mat_t<val_type> ret(d_model, seq_len);
+        for (int m = 0; m < seq_len; ++m)
+        {
+            for (int i = 0; i < d_model / 2; ++i)
+            {
+                auto delta_view = delta.view(i * 2, m, 2, 1);
+                auto ret_view = ret.view(i * 2, m, 2, 1);
+                auto rope_mat = m_rope.forward_unite(i, m);
+                ret_view.assign(rope_mat.t().dot(delta_view));
+            }
+        }
+        return ret;
+    }
+
+    /**
+     * half_split 与 interleaved 只差一个「特征行重排」：
+     * half_split 的第 (i, i + d/2) 两个特征，正对应 interleaved 的第 (2i, 2i+1) 两个特征，
+     * 而且两者的角 θ_i 定义完全相同。所以把行搬成 interleaved 顺序 → 复用既有旋转 → 搬回去，
+     * 就得到 half_split 的结果（搬运不改变任何 θ）。
+     */
+    mat_t<val_type> gather_to_interleaved(input_type const& x)
+    {
+        const int d = x.row_num(), seq_len = x.col_num(), half = d / 2;
+        mat_t<val_type> out(d, seq_len);
+        for (int j = 0; j < seq_len; ++j)
+        {
+            for (int i = 0; i < half; ++i)
+            {
+                out(i * 2, j) = x(i, j);
+                out(i * 2 + 1, j) = x(i + half, j);
+            }
+        }
+        return out;
+    }
+
+    mat_t<val_type> scatter_from_interleaved(const mat_t<val_type>& y)
+    {
+        const int d = y.row_num(), seq_len = y.col_num(), half = d / 2;
+        mat_t<val_type> out(d, seq_len);
+        for (int j = 0; j < seq_len; ++j)
+        {
+            for (int i = 0; i < half; ++i)
+            {
+                out(i, j) = y(i * 2, j);
+                out(i + half, j) = y(i * 2 + 1, j);
+            }
+        }
+        return out;
+    }
+
 public:
     RoPE_net_t(int const& d_model) : m_rope(d_model) {}
 
     void set_param(int const& d_model)
     {
         m_rope.set_d(d_model);
+    }
+
+    /** 选择特征配对约定，见 rope_pair_layout。改变了要重新 bind_rope/预热。 */
+    void set_pair_layout(rope_pair_layout layout)
+    {
+        m_layout = layout;
+    }
+
+    rope_pair_layout pair_layout() const
+    {
+        return m_layout;
     }
 
     void set_cache_mode(rope_cache_mode mode)
@@ -340,7 +456,6 @@ public:
      */
     mat_t<val_type> forward_at(input_type const& x, int start_pos)
     {
-        int seq_len = x.col_num();
         int d_model = x.row_num();
         if (d_model != m_rope.get_d())
         {
@@ -349,43 +464,29 @@ public:
         if (start_pos < 0)
             throw std::invalid_argument("RoPE forward_at start_pos must be >= 0");
 
-        mat_t<val_type> ret(d_model, seq_len);
-        // 外层：序列位置；内层：特征二维对。缓存每 2×2 块共用 θ = m / 10000^(2i/d)
-        for (int j = 0; j < seq_len; ++j)
+        if (m_layout == rope_pair_layout::half_split)
         {
-            const int m = start_pos + j;
-            for (int i = 0; i < d_model / 2; ++i)
-            {
-                auto ret_view = ret.view(i * 2, j, 2, 1);
-                auto input_view = x.view(i * 2, j, 2, 1);
-                auto rope_mat = m_rope.forward_unite(i, m);
-                ret_view.assign(rope_mat.dot(input_view));
-            }
+            auto permuted = gather_to_interleaved(x);
+            return scatter_from_interleaved(interleaved_rotate_at(permuted, start_pos));
         }
-        return ret;
+        return interleaved_rotate_at(x, start_pos);
     }
 
     mat_t<val_type> backward(const mat_t<val_type>& delta)
     {
         // 反向传播，与正向传播相反，顺时针将误差旋转回来
-        int seq_len = delta.col_num();
         int d_model = delta.row_num();
         if (d_model != m_rope.get_d())
         {
             throw std::runtime_error("Input dimension does not match RoPE dimension");
         }
-        mat_t<val_type> ret(d_model, seq_len);
-        for (int m = 0; m < seq_len; ++m)
+        if (m_layout == rope_pair_layout::half_split)
         {
-            for (int i = 0; i < d_model / 2; ++i)
-            {
-                auto delta_view = delta.view(i * 2, m, 2, 1);
-                auto ret_view = ret.view(i * 2, m, 2, 1);
-                auto rope_mat = m_rope.forward_unite(i, m);
-                ret_view.assign(rope_mat.t().dot(delta_view));
-            }
+            // 正向是 S·R·G，G/S 互为逆置换，故反向为 S·R^T·G（同一个搬运方向）
+            auto permuted = gather_to_interleaved(delta);
+            return scatter_from_interleaved(interleaved_backward(permuted));
         }
-        return ret;
+        return interleaved_backward(delta);
     }
 
     template<typename>
@@ -409,6 +510,7 @@ public:
         std::stringstream ss;
         ss << print_indent(indent) << "RoPE_net_t:(d_model:" << m_rope.get_d()
            << ", cache:" << (m_rope.cache_mode() == rope_cache_mode::static_fixed ? "static" : "dynamic")
+           << ", layout:" << rope_pair_layout_name(m_layout)
            << ")";
         return ss.str();
     }
@@ -446,13 +548,15 @@ public:
     rope_cache_mode default_mode() const { return m_default_mode; }
     int default_max_seq() const { return m_default_max_seq; }
 
-    /** 获取（或创建）维度为 d 的 RoPE；可选预热 max_seq_len */
-    rope_ptr get(int d, int max_seq_len = 0)
+    /** 获取（或创建）维度为 d、配对约定为 layout 的 RoPE；可选预热 max_seq_len */
+    rope_ptr get(int d, int max_seq_len = 0,
+                 rope_pair_layout layout = rope_pair_layout::interleaved)
     {
         if (d <= 0 || d % 2 != 0)
             throw std::invalid_argument("RoPE registry d must be positive even");
 
-        auto it = m_pool.find(d);
+        const auto key = std::make_pair(d, static_cast<int>(layout));
+        auto it = m_pool.find(key);
         if (it != m_pool.end())
         {
             if (max_seq_len > 0)
@@ -461,18 +565,19 @@ public:
         }
 
         auto rope = std::make_shared<rope_net_type>(d);
+        rope->set_pair_layout(layout);
         rope->set_cache_mode(m_default_mode);
         const int reserve_len = max_seq_len > 0 ? max_seq_len : m_default_max_seq;
         if (m_default_mode == rope_cache_mode::static_fixed || max_seq_len > 0)
             rope->reserve(reserve_len);
 
-        m_pool.emplace(d, rope);
+        m_pool.emplace(key, rope);
         return rope;
     }
 
-    bool contains(int d) const
+    bool contains(int d, rope_pair_layout layout = rope_pair_layout::interleaved) const
     {
-        return m_pool.find(d) != m_pool.end();
+        return m_pool.find(std::make_pair(d, static_cast<int>(layout))) != m_pool.end();
     }
 
     void clear()
@@ -488,7 +593,7 @@ public:
 private:
     rope_registry_t() = default;
 
-    std::unordered_map<int, rope_ptr> m_pool;
+    std::map<std::pair<int, int>, rope_ptr> m_pool;
     rope_cache_mode m_default_mode = rope_cache_mode::dynamic;
     int m_default_max_seq = 1024;
 };

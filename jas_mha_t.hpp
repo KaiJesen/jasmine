@@ -346,6 +346,7 @@ private:
     int m_d_kv;             // K/V 投影输出宽度 = m_num_kv_heads * m_d_head（GQA 下 < d_model）
     bool m_mask = false;
     bool m_use_rope = true;   // false = 绝对位置模型（GPT-2），Q/K 不做 RoPE
+    rope_pair_layout m_rope_layout = rope_pair_layout::interleaved;
 
     // 前向缓存，供 backward 切分梯度
     mat_t<val_type> m_q_full, m_k_full, m_v_full;
@@ -530,14 +531,31 @@ public:
         return m_output_proj.forward(vconcat(head_outputs));
     }
 
-    /** 显式绑定/刷新各头的 RoPE（同 d_head 共享注册中心条目） */
+    /** 显式绑定/刷新各头的 RoPE（同 d_head + 同配对约定共享注册中心条目） */
     void bind_rope(int max_seq_len = 0)
     {
         std::shared_ptr<RoPE_net_t<mat_t<val_type>>> rope;
         if (m_use_rope && m_d_head > 0 && m_d_head % 2 == 0)
-            rope = rope_registry_t<val_type>::instance().get(m_d_head, max_seq_len);
+            rope = rope_registry_t<val_type>::instance().get(m_d_head, max_seq_len, m_rope_layout);
         for (auto& head : m_heads)
             head.set_rope(rope);
+    }
+
+    /**
+     * 选择 RoPE 的特征配对约定（见 rope_pair_layout）。
+     * 导出 HF LLaMA 系权重时必须用 half_split；jasmine 原生训练保持 interleaved。
+     */
+    void set_rope_pair_layout(rope_pair_layout layout)
+    {
+        if (m_rope_layout == layout)
+            return;
+        m_rope_layout = layout;
+        bind_rope();
+    }
+
+    rope_pair_layout pair_layout() const
+    {
+        return m_rope_layout;
     }
 
     /**
@@ -575,6 +593,9 @@ public:
     int d_head() const { return m_d_head; }
     /** K/V 投影输出宽度 = num_kv_heads() * d_head() */
     int d_kv() const { return m_d_kv; }
+    /** 单个 Q 头（测试/自省用，可查其绑定的 RoPE 等） */
+    head_type& head(int i) { return m_heads.at(static_cast<std::size_t>(i)); }
+    const head_type& head(int i) const { return m_heads.at(static_cast<std::size_t>(i)); }
 
     mat_t<val_type> forward(const input_type& input)
     {
