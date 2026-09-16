@@ -18,3 +18,12 @@ target_link_libraries(gpt2_chat PRIVATE jasmine_headers)
 
 add_executable(llama_chat llama_chat.cpp)
 target_link_libraries(llama_chat PRIVATE jasmine_headers)
+
+if(JASMINE_USE_CUDA)
+  add_executable(cuda_fused_demo cuda_fused_demo.cu)
+  target_link_libraries(cuda_fused_demo PRIVATE jasmine_headers jasmine_cuda_headers)
+  set_target_properties(cuda_fused_demo PROPERTIES
+    CUDA_STANDARD 20
+    CUDA_STANDARD_REQUIRED ON
+  )
+endif()

@@ -558,9 +558,10 @@ auto tree = make_mat().dot(b); // 同上：临时矩阵作为接收者
 
 | 操作数 | 存储方式 | 语义 |
 |--------|----------|------|
-| 标量 | `mat_t<T>` 按值 | 包成 1×1，与矩阵共用 `row_num`/`col_num`/`operator()` |
+| 标量 | `scalar_leaf_t<T>` 按值 | 1×1 的 POD（见下方"设备扩展"一节），与矩阵共用 `row_num`/`col_num`/`operator()` |
 | 非标量**左值** | `T const&` | **借引用，零拷贝**。调用方保证它比表达式活得久 |
 | 非标量**右值** | `T` 按值 | **拥有**。右值就是临时量，必须拥有 |
+| **设备叶子** | `T` 按值 | 即使传的是左值也按值拥有（见 `operand_owned_by_value`） |
 
 配套的三条实现约定：
 
@@ -601,11 +602,30 @@ ASAN_OPTIONS=detect_leaks=0 ./build-asan/tests/unit_tests --gtest_filter='-Llama
 （`detect_leaks=0` 是因为在 `ptrace` 环境下 LeakSanitizer 会直接 fatal；
 `LlamaAlignmentTest` 需要 4.2 GiB 权重且耗时很长，按需单独跑。）
 
+### 设备扩展（CUDA 分支新增）
+
+同一套存储策略被 CUDA 后端原样复用，只加了两样东西：
+
+1. **标量存储从 `mat_t` 换成 `scalar_leaf_t`**。原来是「包成 1×1 的 `mat_t`」，但 `mat_t`
+   用 `new[]` 拿内存、`m_data` 指向**主机地址** —— 表达式一旦上设备，设备端解引用它必崩。
+   换成只含一个值的 POD 之后主机设备语义一致，也省掉了每次的分配与 `%` 取模。
+2. **`operand_owned_by_value` 定制点**，让设备叶子即使以具名左值出现也按值拥有。
+   设备端不存在"主机对象的地址"，所以引用在那里毫无意义，必须拷贝薄壳。
+
+`JAS_HD`（CUDA 下展开为 `__host__ __device__`，否则为空）只加在 `row_num` / `col_num` /
+`operator()` / `work()` 上；`std::exp` / `std::max` 在设备端不可用这类差异都在
+`jas_cuda_compat.hpp` 里收口（`device_exp` / `device_max`）。
+`device_evaluable` 沿类型树递归传播，启动 kernel 前 `static_assert` 拦下主机表达式。
+
+`tests/test_cuda_fused.cu` 覆盖这些契约（编译期断言 + 运行期对拍）。细节见 `CUDA.md`。
+
 ### 相关文件
 
 | 文件 | 作用 |
 |------|------|
-| `jas_mat_express_t.hpp` | `storage_of` / `storage_type` 存储策略；各表达式节点与运算符；`mat_dot_t` |
+| `jas_mat_express_t.hpp` | `storage_of` / `storage_type` 存储策略；`scalar_leaf_t`；各表达式节点与运算符；`mat_dot_t` |
 | `jas_mat_concepts.hpp` | `is_caculable`（判标量前 `remove_cvref`） |
-| `jas_mat_t.hpp` / `jas_mat_view_t.hpp` | `.dot()` 的 ref-qualified 声明 |
+| `jas_mat_t.hpp` / `jas_mat_view_t.hpp` | `.dot()` 的 ref-qualified 声明；访问器的 `JAS_HD` 标注 |
+| `jas_cuda_compat.hpp` | `JAS_HD`、设备安全数学、`device_evaluable` 探测 |
 | `tests/test_expression_lifetime.cpp` | `ExpressionLifetime.*`：值类别契约 + 生命周期回归 |
+| `tests/test_cuda_fused.cu` | `CudaEnvironment.*` / `CudaDeviceTest.*`：设备契约 + 融合/GEMM 对拍 |

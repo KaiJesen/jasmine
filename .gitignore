@@ -1,6 +1,7 @@
 # Build
 build/
 build-asan/
+build-cuda/
 cmake-build-*/
 *.o
 *.a
