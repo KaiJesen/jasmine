@@ -15,3 +15,6 @@ target_link_libraries(gpt2_generate PRIVATE jasmine_headers)
 
 add_executable(gpt2_chat gpt2_chat.cpp)
 target_link_libraries(gpt2_chat PRIVATE jasmine_headers)
+
+add_executable(llama_chat llama_chat.cpp)
+target_link_libraries(llama_chat PRIVATE jasmine_headers)

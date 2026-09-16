@@ -219,6 +219,137 @@ REPL 内命令：
 
 对齐机制与踩坑记录见 [`doc/SMALL_MODEL_REPRO_CHECKLIST.md`](doc/SMALL_MODEL_REPRO_CHECKLIST.md)。
 
+## LLaMA / TinyLlama-Chat 推理对齐（加载开源权重）
+
+加载 HuggingFace 的 LLaMA 系权重（以 `TinyLlama-1.1B-Chat-v1.0` 验证），在 jasmine 里做
+因果前向 + KV-cache 生成，并与 HF 的逐层 hidden / logits 对齐。**推理 only**。
+
+与 GPT-2 的差异（同一套 `mat_mha_t` / 基础设施，只换模型类与导出脚本）：
+
+| | GPT-2 | TinyLlama-1.1B-Chat |
+|---|---|---|
+| 位置编码 | 绝对 `wpe`（`set_use_rope(false)`） | RoPE，**`half_split` 配对** |
+| Norm | Post-norm LayerNorm + `ln_f` | Pre-norm **RMSNorm** |
+| FFN | `gelu_new` 两层 | **SwiGLU** 三投影 |
+| 注意力 | MHA | **GQA**（32 Q / 4 KV） |
+| 线性层 bias | 有（`lm_head` 显式置 0） | **全部无 bias** |
+| `lm_head` | 与 `wte` 绑定 | **不绑定**（untied） |
+| 输入构造 | 裸文本续写 | **`apply_chat_template`**（ SentencePiece，`enc(a)+enc(b) ≠ enc(a+b)`） |
+
+### 1. 导出权重
+
+```bash
+# 约 4.2 GiB；同时 dump 两条 golden：裸文本续写 + chat 模板序列
+python tools/export_llama.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --out build/tinyllama_weights.bin \
+    --golden-prompt "The capital of France is" \
+    --golden-chat "What is the capital of France?"
+```
+
+脚本会：校验模型可支持性（`rope_theta` 必须 10000、无 bias、无 RoPE scaling、激活必须是 silu）、
+按 HF 的 `[out, in]` 直接存（LLaMA 的 `nn.Linear` 无 Conv1D 转置）、`k_proj/v_proj` 不复制，
+并用 forward hook 抓取 23 个阶段（embed + 22 层 block，**pre-`ln_f`**）作为逐层黄金值。
+
+### 2. 逐层 / logits / KV-cache / chat 模板对齐
+
+```bash
+./build/tests/unit_tests --gtest_filter='Llama*'
+
+# 指定权重文件（否则按 ctest 工作目录下的默认名字自动搜索）
+JASMINE_LLAMA_WEIGHTS=build/tinyllama_weights.bin \
+    ./build/tests/unit_tests --gtest_filter='LlamaAlignmentTest.*'
+```
+
+未找到权重文件时 `LlamaAlignmentTest` 会 `GTEST_SKIP()`，CI 不依赖大文件。
+
+| 测试 | 比对对象 | 容差 |
+|------|----------|------|
+| `RawHiddenStatesMatchLayerByLayer` | 23 个阶段逐层 hidden | `1e-3` |
+| `RawGoldenLogitsMatch` | 末层 logits + 每位置 argmax | `1e-3` / argmax 完全一致 |
+| `KVCacheDecodeMatchesGolden` | KV-cache 逐步解码的每步 logits | `1e-3` |
+| `PrefillMatchesGoldenLastPosition` | `prefill()` 末位 logits（demo 实走路径） | `1e-3` |
+| `ChatTemplateLogitsMatch` | `apply_chat_template` 序列的 logits | `1e-3` |
+
+实测：全部 `max_abs_diff ≤ 3.1e-5`，即 float32 参考值自身的舍入噪声量级（jasmine 侧是 double）；
+top-5 逐位相同。容差取 `1e-3` 是为了留足跨平台/BLAS 归约顺序余量，同时足以拦住结构性错误
+（下面那个 RoPE 坑会造成 O(1) 偏差）。
+
+### 3. 交互式对话 demo（`llama_chat`）
+
+```bash
+./build/examples/llama_chat build/tinyllama_weights.bin
+```
+
+- 输入按 **`apply_chat_template`** 渲染（由 `tools/llama_tokenizer_server.py` 的 `M` 操作提供）
+- 会话命令：`/help` `/context` `/reset` `/exit`
+- 常用参数：`--max-new` `--temperature` `--top-k` `--top-p` `--greedy` `--seed` `--system` `--max-context`
+- KV cache 跨轮复用：把当前 messages 渲染成规范 token 序列，与已有 cache 比**公共前缀**，
+  相同则只喂新增 token，不同则整体重建；超 `--max-context` 时丢弃最早轮次
+- tokenizer 服务脚本定位有兜底（按 `:exe` 目录逐级向上找 `tools/`），从 `build/` 里跑也行
+
+实测（greedy）：`What is the capital of France?` → `The capital of France is Paris.`；
+多轮上下文正确累积（66 → 93 → 141 token），第二轮能引用第一轮内容。
+24 GB 内存机器上权重加载约 25 秒（一次性），之后每 token 约 0.3 秒。
+
+### ⚠️ 这个坑最贵：RoPE 特征配对约定
+
+θ_i = m / 10000^(2i/d) 在两种约定下**完全一致**，区别只在于第 i 个角作用在哪两个特征上：
+
+- `interleaved`：`(2i, 2i+1)` —— 原论文 / GPT-NeoX，jasmine 原生实现与默认值
+- `half_split`：`(i, i + d/2)` —— GPT-J / **HuggingFace LLaMA**（`rotate_half`）
+
+接 TinyLlama 时最初沿用了原生约定，结果**除位置 0 以外所有位置的 logits 都差 O(1)**
+（逐层 hidden `max_abs_diff` 达 7.17）。之所以难查，是因为**位置 0 完全正确**：
+那里旋转矩阵退化为单位阵，任何配对约定都对得上 —— 于是很容易反过来怀疑
+attention / softmax / 权重加载。
+
+定位手法（可复用）：把 HF 的 `apply_rotary_pos_emb` monkeypatch 成本仓库的交错配对，
+logits 立刻与自己的输出**逐位吻合**，从而证明差异**只**在配对约定。
+
+```python
+def apply_rotary_interleaved(q, k, cos, sin, unsqueeze_dim=1):
+    D = q.shape[-1]; half = D // 2
+    c = cos[..., :half].unsqueeze(unsqueeze_dim)   # HF 的 cos/sin 是全维（两半重复）
+    s = sin[..., :half].unsqueeze(unsqueeze_dim)
+    def rot(x):
+        xp = x.unflatten(-1, (-1, 2))
+        x0, x1 = xp[..., 0], xp[..., 1]
+        return torch.stack([x0 * c - x1 * s, x0 * s + x1 * c], dim=-1).flatten(-2)
+    return rot(q), rot(k)
+```
+
+处理：新增 `rope_pair_layout` 枚举，默认 `interleaved`（既有模型与 119 个测例行为不变），
+LLaMA 在 `jas_llama_t.hpp` 里显式设 `half_split`；RoPE 注册表 key 从 `d` 改为 `(d, layout)`，
+避免同维度不同约定互相复用。
+
+**回归测试**（这组别删，它们就是钉这个坑的）：
+
+```bash
+./build/tests/unit_tests --gtest_filter='RoPE.*'
+```
+
+| 测试 | 钉住什么 |
+|------|----------|
+| `RoPE.HalfSplitPairsOffsetFeatures` | `(i, i+d/2)` 配对的独立公式逐元素比对 |
+| `RoPE.LayoutsAgreeAtPositionZeroOnly` | **位置 0 两种约定必须相同、位置 ≥1 必须不同**（即上面那个陷阱本身） |
+| `RoPE.BackwardIsAdjointForBothLayouts` | `<forward(x), δ> == <x, backward(δ)>`，两种约定都成立 |
+| `RoPE.RegistrySeparatesPairLayouts` | 注册表按 `(d, layout)` 分开，不复用 |
+| `RoPE.MhaPropagatesPairLayoutToHeads` | `set_rope_pair_layout` 真的换掉了每个头绑定的 RoPE |
+
+### 相关文件（LLaMA）
+
+| 文件 | 作用 |
+|------|------|
+| `jas_llama_t.hpp` | `llama_model_t`：pre-norm RMSNorm + RoPE(half_split) + GQA + SwiGLU，无 bias、untied head |
+| `jas_weight_io.hpp` | `load_llama` 名字映射 + `llama_config_t` / `read_llama_config` |
+| `jas_RoPE_t.hpp` | `rope_pair_layout`（`interleaved` / `half_split`）+ 按 `(d, layout)` 共享的注册表 |
+| `tools/export_llama.py` | HF → jasmine 权重导出（含可支持性校验与黄金值） |
+| `tools/llama_tokenizer_server.py` | 常驻 tokenizer 服务（`E`/`D`/`M`/`V`，`M` = apply_chat_template） |
+| `tests/test_llama_weights.cpp` | 结构 / 加载 / 黄金对齐单测 |
+| `tests/test_rope.cpp` | RoPE 基础 + **配对约定回归** |
+| `examples/llama_chat.cpp` | 交互式对话 REPL（LLaMA 系） |
+| `examples/chat_common.hpp` | GPT-2 与 LLaMA 共用的 REPL 基础设施（颜色 / base64 / 流式 / tokenizer 客户端） |
+
 ## 6. 门控 FFN（SwiGLU）：容器与激活
 
 对齐 LLaMA 系模型需要 SwiGLU。拆成两块：**激活** `silu_net_t` + **门控容器**

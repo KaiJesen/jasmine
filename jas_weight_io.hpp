@@ -12,6 +12,7 @@
 
 #include "jas_mat_t.hpp"
 #include "jas_gpt2_t.hpp"
+#include "jas_llama_t.hpp"
 
 namespace jasmine {
 
@@ -111,6 +112,20 @@ public:
 
     bool has(std::string const& name) const { return m_index.count(name) > 0; }
     std::size_t size() const { return m_index.size(); }
+
+    /**
+     * 释放底层数据区（保留索引）。大模型（如 TinyLlama 的 float32 权重约 4.4GB）在
+     * read_into 全部读完之后没必要继续占内存 —— 加载完成后调用即可把这部分还给系统。
+     * 释放后再调 read_into 会抛异常。
+     */
+    void release()
+    {
+        std::vector<char>().swap(m_blob);
+        m_data_start = 0;
+    }
+
+    /** 数据区是否已被 release() 释放 */
+    bool released() const { return m_blob.empty(); }
 
     entry_t const& entry(std::string const& name) const
     {
@@ -310,6 +325,104 @@ inline gpt2_config_t read_gpt2_config(weight_file_t const& wf)
     cfg.d_ff = wf.read_scalar<double>("cfg.d_ff");
     cfg.vocab = wf.read_scalar<double>("cfg.vocab");
     cfg.n_pos = wf.read_scalar<double>("cfg.n_pos");
+    return cfg;
+}
+
+/**
+ * 按 LLaMA 张量命名把权重写入模型。
+ *
+ * 命名约定（均为 jasmine 原生布局；LLaMA 的 Linear 权重本就是 [out, in]，
+ * 导出时**不需要转置**，这是与 GPT-2 的 Conv1D 最大的不同）：
+ *   wte.weight                    [d_model, vocab]（embed_tokens 转置而来）
+ *   h.{i}.ln_1.weight             [d_model, 1]  （input_layernorm，RMSNorm 无 bias）
+ *   h.{i}.attn.q.weight           [d_model, d_model]
+ *   h.{i}.attn.k.weight           [n_kv_heads*d_head, d_model]   ← GQA 天生窄
+ *   h.{i}.attn.v.weight           [n_kv_heads*d_head, d_model]
+ *   h.{i}.attn.out.weight         [d_model, d_model]
+ *   h.{i}.ln_2.weight             [d_model, 1]  （post_attention_layernorm）
+ *   h.{i}.mlp.gate.weight         [d_ff, d_model]
+ *   h.{i}.mlp.up.weight           [d_ff, d_model]
+ *   h.{i}.mlp.down.weight         [d_model, d_ff]
+ *   ln_f.weight                   [d_model, 1]  （model.norm）
+ *   lm_head.weight                [vocab, d_model]（仅在不绑定权重时存在）
+ *
+ * 没有任何 .bias 张量（LLaMA 系无线性层偏置）；模型侧对应 bias 由
+ * llama_model_t::zero_all_biases() 置零。
+ */
+template <typename model_type>
+void load_llama(model_type& model, weight_file_t const& wf)
+{
+    wf.read_into("wte.weight", model.wte().weight());
+
+    for (int i = 0; i < model.n_layers(); ++i)
+    {
+        const std::string p = "h." + std::to_string(i) + ".";
+        auto& attn = model.attn(i);
+
+        wf.read_into(p + "ln_1.weight", model.ln_1(i).gama());
+        wf.read_into(p + "attn.q.weight", attn.q_proj().weight());
+        wf.read_into(p + "attn.k.weight", attn.k_proj().weight());
+        wf.read_into(p + "attn.v.weight", attn.v_proj().weight());
+        wf.read_into(p + "attn.out.weight", attn.out_proj().weight());
+
+        wf.read_into(p + "ln_2.weight", model.ln_2(i).gama());
+        wf.read_into(p + "mlp.gate.weight", model.mlp_gate(i).weight());
+        wf.read_into(p + "mlp.up.weight", model.mlp_up(i).weight());
+        wf.read_into(p + "mlp.down.weight", model.mlp_down(i).weight());
+    }
+
+    wf.read_into("ln_f.weight", model.ln_f().gama());
+
+    // 绑定权重的变体不导出 lm_head.weight，导出侧已在文件中省略（见 export_llama.py）
+    if (wf.has("lm_head.weight"))
+        wf.read_into("lm_head.weight", model.lm_head().weight());
+    else
+        model.tie_word_embeddings();
+
+    // LLaMA 没有线性层 bias；置零是加载流程的一部分，漏掉会让 logits 整体偏移
+    model.finalize_after_load();
+}
+
+template <typename model_type>
+void load_llama(model_type& model, std::string const& path)
+{
+    weight_file_t wf;
+    wf.load(path);
+    load_llama(model, wf);
+}
+
+/** 从权重文件里的 cfg.* 标量读出 LLaMA 结构参数 */
+struct llama_config_t
+{
+    int n_layers = 1;
+    int n_heads = 1;
+    int n_kv_heads = 0;     // 0 => 等于 n_heads
+    int d_model = 1;
+    int d_ff = 0;
+    int vocab = 1;
+    int n_pos = 1;
+    double rms_eps = 1e-5;
+    double rope_theta = 10000.0;
+    bool tied = false;
+};
+
+inline llama_config_t read_llama_config(weight_file_t const& wf)
+{
+    llama_config_t cfg;
+    cfg.n_layers = wf.read_scalar<double>("cfg.n_layers");
+    cfg.n_heads = wf.read_scalar<double>("cfg.n_heads");
+    cfg.n_kv_heads = wf.has("cfg.n_kv_heads")
+        ? static_cast<int>(wf.read_scalar<double>("cfg.n_kv_heads")) : 0;
+    cfg.d_model = wf.read_scalar<double>("cfg.d_model");
+    cfg.d_ff = wf.read_scalar<double>("cfg.d_ff");
+    cfg.vocab = wf.read_scalar<double>("cfg.vocab");
+    cfg.n_pos = wf.read_scalar<double>("cfg.n_pos");
+    if (wf.has("cfg.rms_eps"))
+        cfg.rms_eps = wf.read_scalar<double>("cfg.rms_eps");
+    if (wf.has("cfg.rope_theta"))
+        cfg.rope_theta = wf.read_scalar<double>("cfg.rope_theta");
+    if (wf.has("cfg.tie_word_embeddings"))
+        cfg.tied = wf.read_scalar<double>("cfg.tie_word_embeddings") > 0.5;
     return cfg;
 }
 

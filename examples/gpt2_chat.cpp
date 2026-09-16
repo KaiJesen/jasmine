@@ -36,30 +36,22 @@
 
 #include <algorithm>
 #include <cctype>
-#include <csignal>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <fstream>
 #include <iostream>
-#include <iterator>
-#include <optional>
 #include <random>
 #include <sstream>
-#include <stdexcept>
 #include <string>
 #include <vector>
-
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 #include "jas_gpt2_t.hpp"
 #include "jas_updator_t.hpp"
 #include "jas_weight_io.hpp"
+#include "chat_common.hpp"
 #include "gpt2_generate.hpp"
 
 using namespace jasmine;
+using namespace jasmine_chat;
 
 namespace
 {
@@ -67,290 +59,6 @@ namespace
 template <typename val_type>
 using chat_upr_tpl = cache_updator_t<val_type, nadam_t>;
 using chat_model_t = gpt2_model_t<mat_t<double>, chat_upr_tpl>;
-
-// ---------------------------------------------------------------------------
-// ANSI 颜色
-// ---------------------------------------------------------------------------
-struct palette_t
-{
-    bool on = true;
-    const char* dim()   const { return on ? "\033[2m" : ""; }
-    const char* bold()  const { return on ? "\033[1m" : ""; }
-    const char* cyan()  const { return on ? "\033[36m" : ""; }
-    const char* green() const { return on ? "\033[32m" : ""; }
-    const char* red()   const { return on ? "\033[31m" : ""; }
-    const char* reset() const { return on ? "\033[0m" : ""; }
-};
-
-// ---------------------------------------------------------------------------
-// base64（与 tokenizer 服务协议配套；文本走 base64 以免任何转义/编码问题）
-// ---------------------------------------------------------------------------
-std::string base64_encode(const std::string& in)
-{
-    static const char* tbl =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out;
-    out.reserve(((in.size() + 2) / 3) * 4);
-    std::size_t i = 0;
-    while (i + 2 < in.size())
-    {
-        const unsigned v = (static_cast<unsigned char>(in[i]) << 16) |
-                           (static_cast<unsigned char>(in[i + 1]) << 8) |
-                           static_cast<unsigned char>(in[i + 2]);
-        out += tbl[(v >> 18) & 63];
-        out += tbl[(v >> 12) & 63];
-        out += tbl[(v >> 6) & 63];
-        out += tbl[v & 63];
-        i += 3;
-    }
-    const std::size_t rem = in.size() - i;
-    if (rem == 1)
-    {
-        const unsigned v = static_cast<unsigned char>(in[i]) << 16;
-        out += tbl[(v >> 18) & 63];
-        out += tbl[(v >> 12) & 63];
-        out += "==";
-    }
-    else if (rem == 2)
-    {
-        const unsigned v = (static_cast<unsigned char>(in[i]) << 16) |
-                           (static_cast<unsigned char>(in[i + 1]) << 8);
-        out += tbl[(v >> 18) & 63];
-        out += tbl[(v >> 12) & 63];
-        out += tbl[(v >> 6) & 63];
-        out += '=';
-    }
-    return out;
-}
-
-std::string base64_decode(const std::string& in)
-{
-    auto val = [](char c) -> int {
-        if (c >= 'A' && c <= 'Z') return c - 'A';
-        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-        if (c >= '0' && c <= '9') return c - '0' + 52;
-        if (c == '+') return 62;
-        if (c == '/') return 63;
-        return -1;
-    };
-    std::string out;
-    int buf = 0, bits = 0;
-    for (char c : in)
-    {
-        if (c == '=' || c == '\n' || c == '\r') continue;
-        const int v = val(c);
-        if (v < 0) continue;
-        buf = (buf << 6) | v;
-        bits += 6;
-        if (bits >= 8)
-        {
-            bits -= 8;
-            out += static_cast<char>((buf >> bits) & 0xFF);
-        }
-    }
-    return out;
-}
-
-// ---------------------------------------------------------------------------
-// 流式输出的增量拼接
-//
-// GPT-2 是 byte-level BPE：一个多字节字符可能跨多个 token。**不能**逐 token 调
-// decode —— HF 的 decode 对不完整的字节序列会输出 U+FFFD（EF BF BD），原始字节就
-// 丢了，终端上表现为 "I��m" 且与全量 decode 结果不一致。
-//
-// 正确做法：每步都对「到目前为止的全部 token」重新 decode，然后
-//   1) 只输出相对上次已输出内容的新增部分；
-//   2) 掐掉末尾的 U+FFFD —— 它可能只是某个字符的前半截，等下一个 token 补齐。
-//      （若模型真的输出了 U+FFFD，下一步会因为不再位于末尾而照常输出，不会丢。）
-// 代价是每步重解一次整个序列，max_new 只有几十，可接受。
-// ---------------------------------------------------------------------------
-constexpr char kReplacementChar[] = "\xef\xbf\xbd";   // U+FFFD
-constexpr std::size_t kReplacementLen = 3;
-
-/** 返回 s 中「可以安全输出」的前缀长度（抹掉末尾的 U+FFFD） */
-std::size_t stable_prefix_len(const std::string& s)
-{
-    std::size_t stable = s.size();
-    while (stable >= kReplacementLen &&
-           s.compare(stable - kReplacementLen, kReplacementLen, kReplacementChar) == 0)
-        stable -= kReplacementLen;
-    return stable;
-}
-
-/** 把 s 相对 already_printed 的新增且稳定的部分写出去；返回新的 already_printed */
-std::string emit_increment(const std::string& s, const std::string& already_printed)
-{
-    const std::size_t stable = stable_prefix_len(s);
-    if (stable <= already_printed.size()) return already_printed;
-    if (s.compare(0, already_printed.size(), already_printed) != 0)
-        return already_printed;             // 不该发生；保守起见不输出
-    std::fwrite(s.data() + already_printed.size(), 1, stable - already_printed.size(), stdout);
-    std::fflush(stdout);
-    return s.substr(0, stable);
-}
-
-// ---------------------------------------------------------------------------
-// 常驻 tokenizer 子进程（fork/exec + 双向管道）
-// ---------------------------------------------------------------------------
-class tokenizer_client_t
-{
-public:
-    tokenizer_client_t(const std::string& python_cmd,
-                       const std::string& script,
-                       const std::string& model)
-    {
-        int in_pipe[2];     // parent writes -> child stdin
-        int out_pipe[2];    // child stdout -> parent reads
-        if (::pipe(in_pipe) != 0 || ::pipe(out_pipe) != 0)
-            throw std::runtime_error("pipe() failed");
-
-        m_pid = ::fork();
-        if (m_pid < 0)
-            throw std::runtime_error("fork() failed");
-
-        if (m_pid == 0)
-        {
-            // 子进程
-            ::dup2(in_pipe[0], STDIN_FILENO);
-            ::dup2(out_pipe[1], STDOUT_FILENO);
-            ::close(in_pipe[0]); ::close(in_pipe[1]);
-            ::close(out_pipe[0]); ::close(out_pipe[1]);
-            ::execlp(python_cmd.c_str(), python_cmd.c_str(), script.c_str(),
-                     "--model", model.c_str(), static_cast<char*>(nullptr));
-            std::fprintf(stderr, "failed to exec %s\n", python_cmd.c_str());
-            ::_exit(127);
-        }
-
-        ::close(in_pipe[0]);
-        ::close(out_pipe[1]);
-        m_wfd = in_pipe[1];
-        m_out = ::fdopen(out_pipe[0], "r");
-        if (m_out == nullptr)
-            throw std::runtime_error("fdopen() failed");
-
-        // 握手：等 "ready <vocab> <n_pos>"
-        std::string line = read_line();
-        std::istringstream hs(line);
-        std::string tag;
-        hs >> tag;
-        if (tag == "ready")
-        {
-            hs >> m_vocab >> m_n_pos;
-        }
-        else
-        {
-            // 服务端把错误放在 base64 里报回来
-            std::string b64;
-            hs >> b64;
-            throw std::runtime_error("tokenizer server failed: " +
-                                     (b64.empty() ? line : base64_decode(b64)));
-        }
-    }
-
-    ~tokenizer_client_t()
-    {
-        if (m_wfd >= 0)
-        {
-            const std::string q = "Q\n";
-            ssize_t ignored = ::write(m_wfd, q.data(), q.size());
-            (void)ignored;
-            ::close(m_wfd);
-        }
-        if (m_out) { if (::fclose(m_out) != 0) { /* ignore */ } }
-        if (m_pid > 0) ::waitpid(m_pid, nullptr, 0);
-    }
-
-    tokenizer_client_t(const tokenizer_client_t&) = delete;
-    tokenizer_client_t& operator=(const tokenizer_client_t&) = delete;
-
-    int vocab_size() const { return m_vocab; }
-    int n_pos() const { return m_n_pos; }
-
-    std::vector<int> encode(const std::string& text)
-    {
-        request("E " + base64_encode(text));
-        std::istringstream rs(m_last);
-        std::string tag;
-        rs >> tag;
-        if (tag != "ok")
-            throw std::runtime_error("encode failed: " + m_last);
-        std::vector<int> ids;
-        int id;
-        while (rs >> id) ids.push_back(id);
-        return ids;
-    }
-
-    std::string decode(const std::vector<int>& ids)
-    {
-        std::string payload = "D";
-        for (int id : ids)
-            payload += " " + std::to_string(id);
-        request(payload);
-        std::istringstream rs(m_last);
-        std::string tag, b64;
-        rs >> tag >> b64;
-        if (tag != "ok")
-            throw std::runtime_error("decode failed: " + m_last);
-        return base64_decode(b64);
-    }
-
-private:
-    std::string read_line()
-    {
-        char* buf = nullptr;
-        std::size_t cap = 0;
-        const ssize_t n = ::getline(&buf, &cap, m_out);
-        std::string line = (n >= 0 && buf) ? std::string(buf, static_cast<std::size_t>(n)) : std::string();
-        std::free(buf);
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
-            line.pop_back();
-        return line;
-    }
-
-    void request(const std::string& line)
-    {
-        const std::string req = line + "\n";
-        std::size_t off = 0;
-        while (off < req.size())
-        {
-            const ssize_t n = ::write(m_wfd, req.data() + off, req.size() - off);
-            if (n <= 0)
-                throw std::runtime_error("tokenizer pipe write failed");
-            off += static_cast<std::size_t>(n);
-        }
-        m_last = read_line();
-        if (m_last.empty())
-            throw std::runtime_error("tokenizer server closed the pipe");
-    }
-
-    pid_t m_pid = -1;
-    int m_wfd = -1;
-    FILE* m_out = nullptr;
-    int m_vocab = 0;
-    int m_n_pos = 1024;
-    std::string m_last;
-};
-
-// ---------------------------------------------------------------------------
-// 从权重 manifest（<weights>.json）里读模型名
-// ---------------------------------------------------------------------------
-std::string read_model_from_manifest(const std::string& weights_path)
-{
-    std::ifstream in(weights_path + ".json");
-    if (!in) return {};
-    const std::string text((std::istreambuf_iterator<char>(in)),
-                           std::istreambuf_iterator<char>());
-    const std::string key = "\"model\"";
-    auto pos = text.find(key);
-    if (pos == std::string::npos) return {};
-    pos = text.find(':', pos);
-    if (pos == std::string::npos) return {};
-    pos = text.find('"', pos);
-    if (pos == std::string::npos) return {};
-    const auto end = text.find('"', pos + 1);
-    if (end == std::string::npos) return {};
-    return text.substr(pos + 1, end - pos - 1);
-}
 
 // ---------------------------------------------------------------------------
 // 生成参数
@@ -647,10 +355,7 @@ int main(int argc, char** argv)
             {
                 // 收尾：把之前为等补全而扣下的尾巴（含可能的收尾 U+FFFD）一并输出，
                 // 与全量 decode 的结果保持一致
-                const std::string full = tokenizer.decode(reply);
-                if (full.size() > printed.size())
-                    std::fwrite(full.data() + printed.size(), 1,
-                                full.size() - printed.size(), stdout);
+                emit_remainder(tokenizer.decode(reply), printed);
             }
 
             std::printf("\n%s[%zu new tokens, %zu in context]%s\n\n",

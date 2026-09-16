@@ -16,6 +16,7 @@ add_executable(unit_tests
   test_gated.cpp
   test_gqa.cpp
   test_rms_norm.cpp
+  test_llama_weights.cpp
 )
 
 target_link_libraries(unit_tests

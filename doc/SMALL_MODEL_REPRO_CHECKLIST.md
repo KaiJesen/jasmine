@@ -12,9 +12,13 @@
 ## 0 — 范围与成功标准
 
 - [x] **选定参考模型**
-  - 本阶段选定 **GPT-2**（`distilgpt2` 6 层 → `gpt2` 12 层两条都验证过）
-  - 词表 50257、`d_model=768`、`n_heads=12`、`d_ff=3072`、`n_pos=1024`
-  - 绝对位置（`wpe`）、Pre-norm + 末尾 `ln_f`、`gelu_new`、无 GQA
+  - **GPT-2 系**（`distilgpt2` 6 层 → `gpt2` 12 层两条都验证过）
+    - 词表 50257、`d_model=768`、`n_heads=12`、`d_ff=3072`、`n_pos=1024`
+    - 绝对位置（`wpe`）、Post-norm LN + 末尾 `ln_f`、`gelu_new`、无 GQA
+  - **LLaMA 系**（`TinyLlama-1.1B-Chat-v1.0`）—— 与 GPT-2 的差异正好覆盖另一套配方
+    - 词表 32000（SentencePiece）、`d_model=2048`、`n_heads=32`、`n_kv_heads=4`（GQA）、
+      `d_ff=5632`、`n_layers=22`、`n_pos=2048`
+    - **RoPE**（无 `wpe`）、**Pre-norm RMSNorm**、**SwiGLU** FFN、**全连接层无 bias**、`lm_head` 不与 embedding 绑定
 - [x] **成功标准（至少一条）**
   - **从零训**：固定小语料上 loss 稳定下降，生成可读（可过拟合验证）—— 见 §5，未做
   - **加载权重**：与参考实现同输入 id 时，logits / 隐层在约定容差内（黄金对齐）—— **已完成**
@@ -48,12 +52,13 @@
   - eps 可通过 `set_param(d_model, eps)` 配置（对齐开源权重时要读模型 config：LLaMA 系 1e-5 / 1e-6 都有）
   - 反向 = LayerNorm 的反向**删掉 `mean(g)` 那一项**，σ 换成 rms
   - 验收：`RmsNorm.*`（13 例，含数值梯度 + PyTorch float64 基准 + "均值项必须删对"的反向断言）
-- [ ] **SwiGLU FFN**
+- [x] **SwiGLU FFN**
   - [x] 门控容器 `gated_net_t<gate, up>`：两分支共享输入、**逐元素乘**汇合
   - [x] `silu_net_t`（`x⊙σ(x)`，含解析梯度）
   - [x] `gated_ffn_branches_t<val_type, updator, act>`：换激活即得 GEGLU / ReGLU
-  - [ ] 接入 LLaMA 系模型；完整 FFN = `gated(...) → down_proj`
-  - 验收：`Gated.*`（11 例，含数值梯度 + PyTorch 端到端对撞）、`tools/verify_swiglu.py`
+  - [x] 接入 LLaMA 系模型；完整 FFN = `gated(gate, up) → down_proj`（`jas_llama_t.hpp`）
+  - 验收：`Gated.*`（11 例，含数值梯度 + PyTorch 端到端对撞）、`tools/verify_swiglu.py`、
+    `LlamaAlignmentTest.RawHiddenStatesMatchLayerByLayer`（接进模型后逐层对黄金值）
 - [x] **GQA / MQA**
   - 实现方式：**参数化 `mat_mha_t`**，新增尾置参数 `n_kv_heads`（默认 0 ⇒ 等于 `num_heads`）
     - `n_kv_heads == n_heads` → 经典 MHA（与旧实现逐位一致，现有 119 例全绿）
@@ -113,6 +118,13 @@ Tokenizer **不在** embedding 内：文本 → **离散 id**；embedding 只做
   - 验收：`Gpt2Structure.RopeCanBeDisabled`
 - [x] **与参考模型位置约定一致**
   - RoPE 侧：base `θ`、是否 NTK/YaRN、最大长度需与参考一致
+  - **RoPE 侧：特征配对约定**（`rope_pair_layout`，见下方「踩过的坑」里最贵的那个）
+    - `interleaved`：第 i 个角作用在 `(2i, 2i+1)`（原论文 / GPT-NeoX；jasmine 原生默认）
+    - `half_split`：第 i 个角作用在 `(i, i+d/2)`（GPT-J / **HF LLaMA**，`rotate_half`）
+    - 两种约定在 **位置 0 输出完全相同**（旋转退化为恒等），只有多 token 序列才暴露差异
+    - LLaMA 系一律 `half_split`：`mat_mha_t::set_rope_pair_layout()`，`jas_llama_t.hpp` 中已设
+    - 验收：`RoPE.HalfSplitPairsOffsetFeatures`、`RoPE.LayoutsAgreeAtPositionZeroOnly`、
+      `RoPE.BackwardIsAdjointForBothLayouts`、`RoPE.RegistrySeparatesPairLayouts`
   - **绝对位置侧（GPT-2）**：`wte(ids) + wpe(pos)`，pos 为 0..T-1；`forward_one` 用显式 `pos` 取 `wpe`
   - 验收：`Gpt2Structure.AbsolutePositionChangesOutput` + `Gpt2AlignmentTest.GoldenLogitsMatch`
 
@@ -138,22 +150,34 @@ Tokenizer **不在** embedding 内：文本 → **离散 id**；embedding 只做
 从零训可不做；**数值复现已有权重**则必须：
 
 - [x] **参数名与 shape 对照表**
-  - HF 名 → jasmine 名的完整映射见 `jas_weight_io.hpp` 的 `load_gpt2` 注释
-  - `transformer.wte`→`wte.weight`（转置）、`h.{i}.attn.c_attn`→`attn.{q,k,v}.{weight,bias}`（拆 fused）
-  - `h.{i}.attn.c_proj`→`attn.out`、`h.{i}.mlp.c_fc/c_proj`→`mlp.fc/proj`、`ln_1/ln_2/ln_f`
+  - HF 名 → jasmine 名的完整映射见 `jas_weight_io.hpp` 的 `load_gpt2` / `load_llama` 注释
+  - GPT-2：`transformer.wte`→`wte.weight`（转置）、`h.{i}.attn.c_attn`→`attn.{q,k,v}.{weight,bias}`（拆 fused）
+  - GPT-2：`h.{i}.attn.c_proj`→`attn.out`、`h.{i}.mlp.c_fc/c_proj`→`mlp.fc/proj`、`ln_1/ln_2/ln_f`
+  - LLaMA：`model.embed_tokens`→`wte`、`model.layers.{i}.self_attn.{q,o}_proj`→`attn.{q,out}`、
+    `k_proj/v_proj`→`attn.{k,v}`（GQA 下本就是 `n_kv_heads*d_head` 行，**不复制**）、
+    `mlp.{gate,up,down}_proj`→`mlp_{gate,up,down}`、`input_layernorm/post_attention_layernorm`→`ln_1/ln_2`、
+    `model.norm`→`ln_f`、`lm_head`→`lm_head`
 - [x] **布局约定**
-  - Conv1D `[in, out]` → 转置为 `[out, in]`（jasmine `weight_net_t` 是 `y = Wx`）
-  - LayerNorm 1-D `[d]` → 列向量 `[d, 1]`；`wte [V, d]` → `[d, V]`
+  - GPT-2 Conv1D `[in, out]` → 转置为 `[out, in]`（jasmine `weight_net_t` 是 `y = Wx`）
+  - LayerNorm / RMSNorm 1-D `[d]` → 列向量 `[d, 1]`；`wte [V, d]` → `[d, V]`
   - QKV fused 拆分：转置后按行切 `[0:d]=q, [d:2d]=k, [2d:3d]=v`
+  - **LLaMA 无 bias**：`nn.Linear` 默认无 bias，导出不产 bias tensor；
+    `llama_model_t::init_weight` 里 `zero_all_biases()` 兜底（否则 `reinit` 会重新随机出 bias）
+  - **LLaMA `lm_head` 不绑定**：TinyLlama 是 untied；三处偏差（gate/up/down、q/k/v/o）都要按 HF 的 `[out, in]` 直接存
 - [x] **加载器**
   - `jas_weight_io.hpp`：单文件「文本索引 + 二进制 float32」，`read_into` 校验 shape 后写入
-  - 导出脚本 `tools/export_gpt2.py` 负责所有布局换算（C++ 侧不做转置）
-  - 验收：`Gpt2WeightIo.*`（含 shape 不符 / 缺 tensor / magic 错误的拒绝路径）
+  - 导出脚本 `tools/export_gpt2.py` / `tools/export_llama.py` 负责所有布局换算（C++ 侧不做转置）
+  - 大模型（TinyLlama 4.2 GiB）加载后须 `release()` 释放原始 blob，否则 float64 模型 + blob 双份常驻
+  - 验收：`Gpt2WeightIo.*`、`LlamaLoad.*`（含 shape 不符 / 缺 tensor / magic 错误的拒绝路径）
 - [x] **前向黄金对齐**
   - 导出时同时 dump HF 的 `golden.hidden.{i}`（逐层）与 `golden.logits`
   - 验收：`Gpt2AlignmentTest.HiddenStatesMatchLayerByLayer`（逐层定位）、
     `GoldenLogitsMatch`（含 argmax 序列一致）、`KVCacheDecodeMatchesGolden`
+  - 验收（LLaMA）：`LlamaAlignmentTest.{RawHiddenStatesMatchLayerByLayer, RawGoldenLogitsMatch,
+    KVCacheDecodeMatchesGolden, PrefillMatchesGoldenLastPosition, ChatTemplateLogitsMatch}`
   - 实测 distilgpt2：逐层 max_abs_diff ≤ 6e-4，greedy 生成 26 token 与 HF 完全一致
+  - 实测 TinyLlama-1.1B（double 对 float32 参考）：23 个阶段（embed + 22 层）逐层与 logits
+    全位置 `max_abs_diff ≤ 3e-5`，即 float32 参考值本身的舍入噪声量级；top-5 逐位相同
 - [x] **（可选）反传不对齐也可**
   - 推理复现只需 forward；训练复现再对梯度（`gelu_net_t::backward` 已补，GPT-2 模型类暂无）
 
@@ -178,6 +202,16 @@ Tokenizer **不在** embedding 内：文本 → **离散 id**；embedding 只做
   - `/reset /context /params /set` 运行中可调参；支持 raw / chat 两种模板
   - 不变量由 `Gpt2Structure.MultiTurnCacheMatchesFullForward` 守住
     （跨轮复用 cache 的 logits ≡ 整段一次 forward）
+- [x] **交互式对话 REPL（LLaMA 系）**（`examples/llama_chat.cpp`）
+  - 与 GPT-2 共用 `examples/chat_common.hpp`：ANSI 颜色、base64、流式增量、tokenizer 客户端
+  - 输入构造走 **`apply_chat_template`**（由 `tools/llama_tokenizer_server.py` 的 `M` 操作提供）：
+    SentencePiece 下 `enc(a)+enc(b) != enc(a+b)`，模板必须整段交给 tokenizer 渲染
+  - 上下文管理：`render_prompt`（当前 messages → 规范 token 序列）→ 与已有 KV cache 比前缀 →
+    相同则只喂新增 token，不同则整体重建；超 `--max-context` 时丢弃最早轮次
+  - 采样支持 temperature / top-k / **top-p（nucleus）**；`/context` 显示 token 占用
+  - 脚本定位有兜底（`:exe` 目录逐级向上找 `tools/`），从 `build/` 里跑也能找到服务脚本
+  - 不变量由 `LlamaStructure.MultiTurnCacheMatchesFullForward`、
+    `LlamaAlignmentTest.ChatTemplateLogitsMatch` 守住
 
 ---
 
@@ -233,6 +267,43 @@ argmax 全位置一致，greedy 生成逐 token 与 HF 完全相同。
 两侧输入因此完全相同——所以采样模式下这条检查依然有效（采样时两侧 RNG 不同，
 逐 token 比对本就不可能一致，此时脚本会明确标注 N/A 而不误报）。
 
+### LLaMA / TinyLlama-Chat 推理对齐（完整闭环）
+
+```bash
+# 1. 导出权重 + HF 黄金值（首次需下载，约 4.2 GiB；两条 golden：裸文本续写 + chat 模板）
+python tools/export_llama.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --out build/tinyllama_weights.bin \
+    --golden-prompt "The capital of France is" \
+    --golden-chat "What is the capital of France?"
+
+# 2. 逐层 / logits / KV-cache / chat 模板四条对齐单测（权重缺失时自动 skip）
+./build/tests/unit_tests --gtest_filter='Llama*'
+
+# 3. RoPE 配对约定等基础设施回归（这组是当初踩坑的地方，别删）
+./build/tests/unit_tests --gtest_filter='RoPE.*'
+
+# 4. 交互式对话（在终端里聊；tokenizer 服务脚本会自动定位）
+./build/examples/llama_chat build/tinyllama_weights.bin
+
+# 5. 会话里可用：/help /context /reset /exit
+```
+
+实测（TinyLlama-1.1B-Chat，double 对 float32 HF 参考）：23 个阶段逐层 + logits 全位置
+`max_abs_diff ≤ 3.1e-5`（= 参考值 float32 舍入噪声量级），top-5 逐位相同；
+chat 模板序列（22 token）同样对齐；多轮对话上下文正确累积（66 → 93 → 141 token）且第二轮能引用第一轮内容。
+
+跨模型对照（同一套代码，只换 `jas_*_t.hpp` 与导出脚本）：
+
+| | GPT-2 / distilgpt2 | TinyLlama-1.1B-Chat |
+|---|---|---|
+| 位置编码 | 绝对 `wpe`（`set_use_rope(false)`） | RoPE `half_split` |
+| Norm | Post-norm LN + `ln_f` | Pre-norm RMSNorm |
+| FFN | `gelu_new` 两层 | SwiGLU 三投影 |
+| 注意力 | MHA | GQA（32 Q / 4 KV） |
+| bias | 有（`lm_head` 置 0） | 全部无 bias |
+| `lm_head` | 与 `wte` 绑定 | 不绑定 |
+| 黄金对齐 | 逐层 ≤ 6e-4 | 逐层 ≤ 3.1e-5 |
+
 ---
 
 ## 建议实施顺序
@@ -245,16 +316,16 @@ argmax 全位置一致，greedy 生成逐 token 与 HF 完全相同。
                 → 小语料真训 / 报告
 ```
 
-已完成到「加载开源权重 + logits 黄金对齐」（GPT-2 / distilgpt2，见 §8）；
-LLaMA 系的四块积木 —— **RMSNorm / RoPE / GQA / SwiGLU** —— 现已全部就绪且各自单测通过，
-剩余：用它们拼出 LLaMA 系模型（`jas_llama_t.hpp` + 导出/加载脚本 + 逐层对齐）
-与从零训练配方（§5）。
+已完成到「加载开源权重 + logits 黄金对齐」（GPT-2 / distilgpt2 与 LLaMA / TinyLlama-1.1B-Chat，见 §8）；
+LLaMA 系的四块积木 —— **RMSNorm / RoPE / GQA / SwiGLU** —— 已拼进 `jas_llama_t.hpp` 并逐层对齐，
+对话 demo（`examples/llama_chat.cpp`）可玩。
+剩余：从零训练配方（§5）。
 
 ---
 
 ## 已具备（勿重复造轮子）
 
-- [x] 因果 MHA（含 GQA / MQA 参数化）、RoPE(Q/K，可开关)、LayerNorm / **RMSNorm**、FFN(ReLU)
+- [x] 因果 MHA（含 GQA / MQA 参数化）、RoPE(Q/K，可开关 + **两种配对约定**)、LayerNorm / **RMSNorm**、FFN(ReLU)
 - [x] `decoder_only_t`（无 cross-attn）
 - [x] Embedding / CE / pad·position mask
 - [x] 推理 KV cache（`forward_one`）
@@ -263,8 +334,10 @@ LLaMA 系的四块积木 —— **RMSNorm / RoPE / GQA / SwiGLU** —— 现已�
 - [x] 门控容器 `gated_net_t` + `silu_net_t` + `gated_ffn_branches_t`（SwiGLU / GEGLU / ReGLU 骨架）
 - [x] GQA / MQA（`mat_mha_t` 的 `n_kv_heads` 参数化，注意力核零改动）
 - [x] RMSNorm（`rms_norm_net_t`，eps 可配）
-- [x] 权重加载器（`jas_weight_io.hpp`）+ GPT-2 导出脚本 + 黄金对齐单测
+- [x] **LLaMA 系模型 `jas_llama_t.hpp`**：Pre-norm RMSNorm + `half_split` RoPE + GQA + SwiGLU，无 bias、`lm_head` 不绑定
+- [x] 权重加载器（`jas_weight_io.hpp`）：`load_gpt2` / `load_llama` + 两个导出脚本 + 黄金对齐单测
 - [x] KV-cache 生成 demo（`examples/gpt2_generate.*`）
+- [x] 共用 REPL 基础设施（`examples/chat_common.hpp`）+ 两个可玩对话 demo（GPT-2 / TinyLlama-Chat）
 
 ---
 
@@ -290,6 +363,12 @@ LLaMA 系的四块积木 —— **RMSNorm / RoPE / GQA / SwiGLU** —— 现已�
 | `backward` 依赖 `forward` 留下的头内缓存 | 若在 `forward_one`（推理路径）之后调用 `backward`，`attend_cached` 不填 `m_v`、`m_softmax.m_output` 也只有单步形状 → `inner dimensions do not match` | 训练前向与推理前向不可混用后接反向：先 `forward`（整段）再 `backward`；`clear_kv_cache()` 之后才走 `forward_one` |
 | 从 LayerNorm 抄反向实现给 RMSNorm | 会**多留一个 `mean(g)` 项**（LayerNorm 减均值带来的），解析梯度与数值梯度差约 1.0 —— 训练能跑但方向系统性偏 | RMSNorm 反向 = LayerNorm 反向去掉 `sum(g)/d` 那一项；`RmsNorm.BackwardOmitsCenteringTermLestItBeWrong` 双向钉住 |
 | 用 HF 的 `LlamaRMSNorm` 输出当 float64 基准 | 该类内部 `.to(torch.float32)`，即使传 float64，输出也与精确解差约 1e-7 | 基准取 float64 定义式（jasmine 是 double）；已核实差值恰为该精度转换 |
+| **RoPE 特征配对约定与 HF LLaMA 不一致** | **最贵的一个坑**：jasmine 原生按 `(2i, 2i+1)` 配对，HF LLaMA 按 `(i, i+d/2)`。逐层 hidden 与 logits 全部对不上（`max_abs_diff` 达 7.17），但**位置 0 完全正确**（那里旋转是恒等变换），所以极易误判成「attention/softmax/权重加载有问题」去乱查 | 新增 `rope_pair_layout`（`interleaved` / `half_split`），默认保持原生行为；LLaMA 显式用 `half_split`。定位手法：把 HF 的 `apply_rotary_pos_emb` monkeypatch 成本仓库的交错配对，logits 立刻与自己的输出逐位吻合 → 证明差异**只**在配对约定 |
+| 只比对单 token / 位置 0 的输出来验证位置编码 | 位置 0 是恒等变换，**任何**配对约定、任何 base θ 都对得上，等于没验 | 位置编码必须用 **≥2 个 token** 且带非零相对距离的序列验证；`RoPE.LayoutsAgreeAtPositionZeroOnly` 专门钉住这个陷阱 |
+| RoPE 注册表只按维度 `d` 建 key | 同一 `d` 上不同配对约定会共用同一份 RoPE，`half_split` 被静默降级成 `interleaved` | 注册表 key 改为 `(d, layout)`；`RoPE.RegistrySeparatesPairLayouts` 守住 |
+| LLaMA 的 `nn.Linear` 无 bias，但 `init_weight` 会 `reinit` 出随机 bias | `set_param` 里清零无效（随后 `init_weight` 又随机化），`LlamaStructure.AllBiasesAreZero` 失败 | 在 `llama_model_t::init_weight` 末尾统一 `zero_all_biases()`，与调用顺序无关 |
+| `transformers>=5` 的 `apply_chat_template(..., return_tensors='pt')` 返回 `BatchEncoding` | 直接取 `.shape` 抛 `AttributeError`（`ids.shape[1]` 报错，看着像 tokenizer 坏了） | 统一用 `as_batch_ids()` 兜一层：优先 `.input_ids`，兼容张量/列表两种返回 |
+| 4.2 GiB 权重文件与 float64 模型同时常驻 | 加载后整模型 double ≈ 8.8 GB，再加原始 blob 4.4 GB，小内存机器会 OOM | `weight_file_t::release()` 在 `read_into` 完成后释放 blob；大模型加载路径必须调用 |
 
 ---
 
