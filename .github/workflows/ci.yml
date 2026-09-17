@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    name: Host build and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DJASMINE_BUILD_BENCH=OFF
+
+      - name: Build
+        run: cmake --build build -j 2 --target unit_tests
+
+      - name: Test
+        run: ./build/tests/unit_tests --gtest_brief=1
+
+      - name: Check acceptance script syntax
+        run: bash -n scripts/a800_acceptance.sh
+
+  cuda-compile:
+    name: CUDA 12.8 sm_80 compile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container:
+      image: nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git libopenblas-dev ca-certificates
+          rm -rf /var/lib/apt/lists/*
+
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build-cuda -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
+          -DCUDAToolkit_ROOT=/usr/local/cuda
+          -DJASMINE_USE_CUDA=ON
+          -DJASMINE_CUDA_ARCHITECTURES=80
+          -DJASMINE_BUILD_TESTS=ON
+          -DJASMINE_BUILD_BENCH=OFF
+          -DJASMINE_BUILD_EXAMPLES=ON
+
+      - name: Build CUDA tests
+        run: cmake --build build-cuda -j 2 --target cuda_tests

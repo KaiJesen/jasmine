@@ -1,4 +1,4 @@
-# Jasmine `cuda-backend` A800 验收包
+# Jasmine CUDA 后端 A800 验收指南
 
 > 包修订 `r5`：修正压力 GEMM 的测试输入。原输入存在严重正负抵消，host BLAS 与 cuBLAS 的正常 FP32 求和顺序差异会超过 1e-3，并非 TF32 导致。
 >
@@ -21,7 +21,12 @@
 
 ## 0. 版本基线
 
-本包由以下已知环境交叉构建并生成 `sm_80` 代码：
+本指南对应已经合并到 `main` 的 CUDA 后端源码树。当前源码基线：
+
+- branch: `main`
+- merge commit: `c203bcc`（`Merge pull request #1 from KaiJesen/cuda-backend`）
+
+包内预编译 `sm_80` 二进制的历史构建基线：
 
 - branch: `cuda-backend`
 - commit: `3bfd77d394c3`
@@ -38,6 +43,7 @@
 ```bash
 tar -xzf jasmine-cuda-backend-a800-3bfd77d394c3.tar.gz
 cd jasmine-cuda-backend-a800-3bfd77d394c3
+# 如果使用后续重新生成的包，请替换为实际文件名和目录名。
 ```
 
 ## 2. 先做环境检查
@@ -62,7 +68,7 @@ ldd --version | head -1
 1. `nvidia-smi` 能看到 A800，且驱动状态正常；
 2. `nvidia-smi` 显示的 driver CUDA version 与将要使用的 CUDA Toolkit runtime 兼容；
 3. `nvcc --list-gpu-arch` 包含 `compute_80`；
-4. C++ 编译器满足本分支要求（GCC 13+ / Clang 16+）；
+4. C++ 编译器满足项目要求（GCC 13+ / Clang 16+）；
 5. CMake >= 3.16。
 
 若 `nvcc` 不在 PATH 中：
