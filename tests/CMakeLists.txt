@@ -29,3 +29,35 @@ target_link_libraries(unit_tests
 
 include(GoogleTest)
 gtest_discover_tests(unit_tests)
+
+# CUDA 后端测试单独一个可执行文件：设备代码必须由 nvcc 编译，
+# 和纯 CPU 的 unit_tests 混在一个目标里会把整个目标拖成 CUDA 目标。
+if(JASMINE_USE_CUDA)
+  add_executable(cuda_tests
+    test_cuda_fused.cu
+    test_cuda_reduce.cu
+    test_cuda_dot.cu
+    test_cuda_kv_cache.cu
+    test_cuda_rope.cu
+    test_cuda_backward.cu
+    test_cuda_attention.cu
+    test_cuda_precision.cu
+    test_cuda_mha.cu
+    test_cuda_llama.cu
+  )
+
+  target_link_libraries(cuda_tests
+    PRIVATE
+      jasmine_headers
+      jasmine_cuda_headers
+      GTest::gtest_main
+  )
+
+  # 让 gtest 的测试发现也走 nvcc 目标所需的设置
+  set_target_properties(cuda_tests PROPERTIES
+    CUDA_STANDARD 20
+    CUDA_STANDARD_REQUIRED ON
+  )
+
+  gtest_discover_tests(cuda_tests)
+endif()

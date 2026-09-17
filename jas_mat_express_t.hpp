@@ -12,12 +12,24 @@
 #include "jas_mat_concepts.hpp"
 #include "jas_mat_view_t.hpp"
 #include "jas_mat_gemm.hpp"
+#include "jas_cuda_compat.hpp"
 
 namespace jasmine {
 
 template<typename lval_type, typename rval_type>
 requires is_matrix<lval_type> && is_matrix<rval_type>
 auto dot(lval_type&& lval, rval_type&& rval);
+
+/**
+ * 定制点：某些操作数类型必须【按值拥有】，即便调用方传进来的是左值。
+ *
+ * 目前只有设备叶子（`dev_mat_t`）需要它。理由是设备叶子本质上就是个「设备指针 + 维度」
+ * 的薄壳，拷贝代价只是一个指针；而更关键的是，表达式树最终要作为 kernel 参数
+ * **按值**传进设备，引用在设备端毫无意义 —— 设备的栈上不可能有主机对象的地址。
+ * 所以设备叶子必须在建树那一刻就被拷进树里。
+ */
+template <typename T>
+inline constexpr bool operand_owned_by_value = false;
 
 /**
  * 表达式操作数的存储方式，按【值类别】决定：
@@ -36,20 +48,77 @@ auto dot(lval_type&& lval, rval_type&& rval);
  * 仍然存在的边界：左值操作数、以及"视图所引用的矩阵"，其生命周期依旧由调用方负责。
  * 前者是有意为之（否则每次构造表达式都要深拷贝整块矩阵），后者见下方 mat_view_t 的说明。
  */
+/**
+ * 标量操作数的叶子：1×1 的 POD。
+ *
+ * 原来标量是包成 `mat_t` 存的，但那是个**主机独占**的类型 —— `mat_t` 用 `new[]`
+ * 拿内存、`m_data` 指向主机地址。一旦表达式要上设备，设备端解引用主机指针就是段错误。
+ * 换成这个只含一个值的 POD 之后，主机和设备看到的是同一份语义，也没有任何分配。
+ *
+ * 它同时暴露 `device_evaluable`，于是含标量的表达式（`(a + b) * 2.0`）也能上设备。
+ */
+template <typename T>
+struct scalar_leaf_t
+{
+    using ele_type = T;
+    T m_val{};
+
+    static constexpr bool device_evaluable = true;
+
+    // 需要一个从标量的隐式转换：表达式节点按【存储类型】取参，构造函数收到的还是裸标量
+    JAS_HD scalar_leaf_t() = default;
+    JAS_HD scalar_leaf_t(T v) : m_val(v) {}
+
+    JAS_HD int row_num() const { return 1; }
+    JAS_HD int col_num() const { return 1; }
+    JAS_HD T operator()(int, int) const { return m_val; }
+};
+
 template <typename T, bool is_scalar>
 struct storage_of;
 template <typename T>
 struct storage_of<T, true>
 {
-    using type = mat_t<std::remove_cvref_t<T>>;
+    using type = scalar_leaf_t<std::remove_cvref_t<T>>;
 };
 template <typename T>
 struct storage_of<T, false>
 {
-    using type = std::conditional_t<std::is_lvalue_reference_v<T>,
-                                    std::remove_cvref_t<T> const&,   // 左值：借引用
-                                    std::remove_cvref_t<T>>;         // 右值：按值拥有
+    using raw_type = std::remove_cvref_t<T>;
+
+    /**
+     * 该操作数是否必须按值拥有。
+     *
+     *  - `operand_owned_by_value`：设备叶子（`dev_mat_t` 等）即使作为左值也必须拷进树里。
+     *  - `is_device_evaluable_v`：设备**表达式节点**同理，这条是后补的、也是必需的。
+     *
+     * 后者曾经被漏掉，导致一个只在设备上才暴露的 bug：`softmax_rows(x)` 这类接口形参是
+     * `Expr const&`，于是 `x` 是【左值】，被按引用借进派生出的子树里。树本身能编译、能拷贝、
+     * `is_trivially_copyable` 也为真（含引用成员的类是平凡可拷贝的！），
+     * 但 kernel 参数是**按值搬到设备上**的 —— 搬过去的是那个【主机栈地址】，
+     * 设备端一解引用就 cudaErrorIllegalAddress。
+     *
+     * 主机端没有这个问题，因为求值和数据在同一块栈上。所以规则是分层的：
+     * 主机树可以放心借引用（零拷贝，这正是表达式模板省下临时量的关键），
+     * 设备树必须自持。而「整棵树是否要上设备」正好由 `device_evaluable` 逐层传播给出。
+     */
+    static constexpr bool owned_by_value =
+        operand_owned_by_value<raw_type> || is_device_evaluable_v<raw_type>;
+
+    // 左值且无需按值拥有 → 借引用（零拷贝）；否则按值拥有
+    using type = std::conditional_t<
+        std::is_lvalue_reference_v<T> && !owned_by_value, raw_type const&, raw_type>;
 };
+
+/**
+ * 表达式树是否「自持」：所有操作数都按值拥有，树里不含任何引用成员。
+ *
+ * 这是设备求值的硬性前提（原因见上面 `owned_by_value` 的说明）。用一个代理指标探测：
+ * 含引用成员（或 const 成员）的类，隐式拷贝赋值会被删除。
+ * 对本项目的表达式节点足够精确 —— 它们的成员只有操作数存储。
+ */
+template <typename T>
+inline constexpr bool is_self_contained_v = std::is_copy_assignable_v<T>;
 
 template <typename T>
 using storage_type = typename storage_of<
@@ -66,6 +135,13 @@ public:
     using derived_type = tpl<lval_type, rval_type>;
     using ele_type = std::common_type_t<lval_base_type, rval_base_type>;
 
+    /**
+     * 整棵子树是否可以在设备上求值。
+     * 两个操作数都能，这个节点就能；指示器靠类型递归传播，无需给节点逐个登记。
+     */
+    static constexpr bool device_evaluable =
+        is_device_evaluable_v<lval_storage_type> && is_device_evaluable_v<rval_storage_type>;
+
     // 形参直接取「存储类型」而不是 lval_type/rval_type：
     //  - 左值操作数 → 形参是 `T const&`，只是再绑一次引用，不拷贝
     //  - 右值操作数 → 形参是 `T`（值），配合 std::forward 就是移动构造，不深拷贝临时量
@@ -76,14 +152,14 @@ public:
     {
     }
 
-    int row_num() const
+    JAS_HD int row_num() const
     {
-        return std::max(m_left.row_num(), m_right.row_num());
+        return detail::device_max(m_left.row_num(), m_right.row_num());
     }
 
-    int col_num() const
+    JAS_HD int col_num() const
     {
-        return  std::max(m_left.col_num(), m_right.col_num());
+        return detail::device_max(m_left.col_num(), m_right.col_num());
     }
 
     std::tuple<int, int> shape() const
@@ -91,7 +167,7 @@ public:
         return std::make_tuple(row_num(), col_num());
     }
 
-    auto operator()(int i, int j) const
+    JAS_HD auto operator()(int i, int j) const
     {
         return static_cast<
                 tpl<lval_type, rval_type> const*
@@ -179,7 +255,7 @@ public:
     {
     }
 
-    auto work(lval_base_type i, rval_base_type j) const
+    JAS_HD auto work(lval_base_type i, rval_base_type j) const
     {
         return i > j;
     }
@@ -217,7 +293,7 @@ public:
     {
     }
 
-    auto work(lval_base_type i, rval_base_type j) const
+    JAS_HD auto work(lval_base_type i, rval_base_type j) const
     {
         return i < j;
     }
@@ -256,7 +332,7 @@ public:
     {
     }
 
-    auto work(lval_base_type i, rval_base_type j) const
+    JAS_HD auto work(lval_base_type i, rval_base_type j) const
     {
         return i + j;
     }
@@ -323,7 +399,7 @@ public:
     {
     }
 
-    auto work(lval_base_type i, rval_base_type j) const
+    JAS_HD auto work(lval_base_type i, rval_base_type j) const
     {
         return i - j;
     }
@@ -361,7 +437,7 @@ public:
     {
     }
 
-    auto work(lval_base_type i, rval_base_type j) const
+    JAS_HD auto work(lval_base_type i, rval_base_type j) const
     {
         return i * j;
     }
@@ -400,7 +476,7 @@ public:
     {
     }
 
-    auto work(lval_base_type i, rval_base_type j) const
+    JAS_HD auto work(lval_base_type i, rval_base_type j) const
     {
         return i / j;
     }
@@ -429,18 +505,21 @@ public:
     using val_base_type = typename std::decay_t<val_storage_type>::ele_type;
     using ele_type = val_base_type;
 
+    /** 整棵子树是否可以在设备上求值（见二元基类同名成员） */
+    static constexpr bool device_evaluable = is_device_evaluable_v<val_storage_type>;
+
     // 与二元基类同理：形参取存储类型，左值零拷贝、右值移入（见 storage_type 的说明）
     mat_express_1_param_stable_t(val_storage_type val)
         : m_val(std::move(val))
     {
     }
 
-    int row_num() const
+    JAS_HD int row_num() const
     {
         return m_val.row_num();
     }
 
-    int col_num() const
+    JAS_HD int col_num() const
     {
         return m_val.col_num();
     }
@@ -450,7 +529,7 @@ public:
         return std::make_tuple(row_num(), col_num());
     }
 
-    auto operator()(int i, int j) const
+    JAS_HD auto operator()(int i, int j) const
     {
         return static_cast<tpl<val_type> const*>(this)->work(m_val(i, j));
     }
@@ -525,9 +604,9 @@ public:
     {
     }
 
-    auto work(val_base_type i) const
+    JAS_HD auto work(val_base_type i) const
     {
-        return std::exp(i);
+        return detail::device_exp(i);
     }
 
     static std::string type_name()
@@ -568,9 +647,10 @@ public:
     {
     }
 
-    auto work(val_base_type i) const
+    JAS_HD auto work(val_base_type i) const
     {
-        return 1.0 / (1.0 + std::exp(-i));
+        // 1 / (1 + exp(-x))；复用设备安全的 exp
+        return 1.0 / (1.0 + detail::device_exp(-i));
     }
 
     static std::string type_name()
@@ -789,6 +869,16 @@ public:
     // 这里原来把引用写死在成员上，绕过了存储策略，是 `auto e = a.t().dot(b);` 悬垂的来源。
     using lval_storage_type = storage_type<lval_type>;
     using rval_storage_type = storage_type<rval_type>;
+
+    /**
+     * 矩阵乘**刻意不标 `device_evaluable`**（显式写出来，免得日后有人"顺手"补上）。
+     *
+     * 它的 `operator()` 是让每个输出元素自己走一遍 K 循环，融进逐元素 kernel 会丢掉
+     * 全部访存复用。设备端走 `cuda::matmul` / `dev_mat_t::dot`（立即 cuBLAS），
+     * 见 jas_cuda_gemm.hpp。这个 false 让「误用」在编译期就变成构建错误。
+     */
+    static constexpr bool device_evaluable = false;
+
 private:
     lval_storage_type m_lval;
     rval_storage_type m_rval;
@@ -802,12 +892,12 @@ public:
         }
     }
 
-    int row_num() const
+    JAS_HD int row_num() const
     {
         return m_lval.row_num();
     }
 
-    int col_num() const
+    JAS_HD int col_num() const
     {
         return m_rval.col_num();
     }
@@ -817,7 +907,7 @@ public:
         return std::make_tuple(row_num(), col_num());
     }
 
-    auto operator()(int i, int j) const
+    JAS_HD auto operator()(int i, int j) const
     {
         ele_type s = 0.;
         for (int k = 0; k < m_lval.col_num(); ++k)
@@ -874,6 +964,20 @@ public:
         return m;
     }
 };
+
+/**
+ * 判断某个类型是不是 `mat_dot_t` 节点。
+ *
+ * 设备端做重载分流时要用：`.dot()` 在主机端产出这个节点，在设备端则**不**产出它
+ * （设备端立即落成 cuBLAS，见 jas_cuda_gemm.hpp）。有了这个 trait 就能在编译期
+ * 把「两种语义」分别断言出来，而不是写死 receiver 的引用类别去比类型。
+ */
+template <typename T>
+struct is_mat_dot : std::false_type {};
+template <typename lval_type, typename rval_type>
+struct is_mat_dot<mat_dot_t<lval_type, rval_type>> : std::true_type {};
+template <typename T>
+inline constexpr bool is_mat_dot_v = is_mat_dot<std::remove_cvref_t<T>>::value;
 
 template<typename lval_type, typename rval_type>
 requires is_matrix<lval_type> && is_matrix<rval_type>

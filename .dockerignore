@@ -1,0 +1,12 @@
+.git
+.github
+build/
+build-*/
+cmake-build-*/
+dist/
+*.o
+*.a
+*.so
+matrix_test
+unit_tests
+cuda_tests

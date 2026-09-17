@@ -8,6 +8,7 @@
 #include <iostream>
 
 #include "jas_mat_utility.hpp"
+#include "jas_cuda_compat.hpp"
 
 namespace jasmine {
 
@@ -253,27 +254,27 @@ public:
         destroy();
     }
 
-    bool is_scalar() const noexcept
+    JAS_HD bool is_scalar() const noexcept
     {
         return m_scalar;
     }
 
-    bool row_first() const noexcept
+    JAS_HD bool row_first() const noexcept
     {
         return m_row_first;
     }
 
-    val_type* data() noexcept
+    JAS_HD val_type* data() noexcept
     {
         return m_data;
     }
 
-    const val_type* data() const noexcept
+    JAS_HD const val_type* data() const noexcept
     {
         return m_data;
     }
 
-    int row_num() const noexcept
+    JAS_HD int row_num() const noexcept
     {
         if (m_row_first)
             return m_dims[1];
@@ -281,7 +282,7 @@ public:
             return m_dims[0];
     }
 
-    int col_num() const noexcept
+    JAS_HD int col_num() const noexcept
     {
         if (m_row_first)
             return m_dims[0];
@@ -316,7 +317,7 @@ public:
         }
     }
 
-    val_type& operator()(int r, int c) noexcept
+    JAS_HD val_type& operator()(int r, int c) noexcept
     {
         int i = r % row_num();
         int j = c % col_num();
@@ -326,7 +327,7 @@ public:
             return m_data[j * m_dims[0] + i];
     }
 
-    const val_type& operator()(int r, int c) const noexcept
+    JAS_HD const val_type& operator()(int r, int c) const noexcept
     {
         int i = r % row_num();
         int j = c % col_num();

@@ -3,6 +3,7 @@
 #include "jas_mat_concepts.hpp"
 #include "jas_mat_t.hpp"
 #include "jas_mat_utility.hpp"
+#include "jas_cuda_compat.hpp"
 
 namespace jasmine {
 
@@ -27,7 +28,7 @@ public:
         m_col_size = (col_size == -1) ? m_mat.col_num() - col_offset : col_size;
     }
 
-    inline val_type operator()(int row, int col) const noexcept
+    inline JAS_HD val_type operator()(int row, int col) const noexcept
     {
         if (m_transposed)
         {
@@ -40,7 +41,7 @@ public:
         }
     }
 
-    inline val_type& operator()(int row, int col) noexcept
+    inline JAS_HD val_type& operator()(int row, int col) noexcept
     {
         if (m_transposed)
         {
@@ -64,7 +65,7 @@ public:
         }
     }
 
-    inline int row_num() const noexcept
+    inline JAS_HD int row_num() const noexcept
     {
         if (m_transposed)
             return m_col_size;
@@ -72,7 +73,7 @@ public:
             return m_row_size;
     }
 
-    inline int col_num() const noexcept
+    inline JAS_HD int col_num() const noexcept
     {
         if (m_transposed)
             return m_row_size;
