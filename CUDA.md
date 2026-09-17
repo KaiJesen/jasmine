@@ -945,8 +945,9 @@ cmake --build build -j && ./build/tests/unit_tests
 
 # CUDA 后端
 cmake --build build-cuda -j
-./build-cuda/tests/cuda_tests                    # 快，不发热
-JASMINE_CUDA_STRESS=1 ./build-cuda/tests/cuda_tests   # 含算力型用例
+JASMINE_CUDA_STRESS=0 ./build-cuda/tests/cuda_tests   # 强制快跑
+JASMINE_CUDA_STRESS=1 ./build-cuda/tests/cuda_tests   # 强制含算力型用例
+# sm_80+ 默认执行算力型用例；无风扇 P4 默认跳过。
 ```
 
 `cuda_tests` 覆盖：

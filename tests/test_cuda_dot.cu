@@ -41,6 +41,11 @@ constexpr int kHotCelsius = 80;
 
 int gpu_temperature_c()
 {
+    // Thermal control is only needed on the fanless P4 development card.
+    // A800 and other well-cooled sm_80+ targets should not emit temperature spam.
+    if (jasmine::cuda::device_info().compute_capability() != 61)
+        return -1;
+
     FILE* pipe = ::popen("nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null", "r");
     if (pipe == nullptr)
         return -1;

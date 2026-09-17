@@ -43,6 +43,11 @@ constexpr int kHotCelsius = 80;
 /** 读 GPU 结温。用 nvidia-smi 而不是 NVML，免得多引一个链接依赖。 */
 int gpu_temperature_c()
 {
+    // Thermal control is only needed on the fanless P4 development card.
+    // A800 and other well-cooled sm_80+ targets should not emit temperature spam.
+    if (jasmine::cuda::device_info().compute_capability() != 61)
+        return -1;
+
     FILE* pipe = ::popen("nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null", "r");
     if (pipe == nullptr)
         return -1;
@@ -59,7 +64,12 @@ int gpu_temperature_c()
 bool stress_enabled()
 {
     const char* v = std::getenv("JASMINE_CUDA_STRESS");
-    return v != nullptr && std::strcmp(v, "1") == 0;
+    if (v != nullptr)
+        return std::strcmp(v, "1") == 0;
+
+    // The 4096^2 and 256^3 cases are tiny on A800/Ampere, but need an explicit
+    // opt-in on the fanless P4 development card.
+    return cuda::device_info().compute_capability() >= 80;
 }
 
 /** 确定性地填一个矩阵，避免依赖随机数（两侧必须是同一份输入）。 */
@@ -70,6 +80,21 @@ mat_t<T> make_host(int rows, int cols, T base)
     for (int i = 0; i < rows; ++i)
         for (int j = 0; j < cols; ++j)
             m(i, j) = base + T(0.5) * i - T(0.25) * j + T(0.125) * (i % 7) - T(0.0625) * (j % 5);
+    return m;
+}
+
+/**
+ * 压力 GEMM 专用的良态输入：所有元素为正，避免“巨大正项 + 巨大负项
+ * 抵消后得到小数”把 FP32 求和顺序差异放大到容差之外。
+ */
+template <typename T>
+mat_t<T> make_well_conditioned_host(int rows, int cols, T base)
+{
+    mat_t<T> m(rows, cols);
+    for (int i = 0; i < rows; ++i)
+        for (int j = 0; j < cols; ++j)
+            m(i, j) = base + T(0.001) * (i % 17) + T(0.002) * (j % 13)
+                      + T(0.0005) * ((i + j) % 7);
     return m;
 }
 
@@ -153,7 +178,8 @@ TEST(CudaEnvironment, DeviceIsVisible)
     const auto& info = cuda::device_info();
     std::printf("        设备: %s\n", info.to_string().c_str());
     EXPECT_GT(info.sm_count, 0);
-    EXPECT_EQ(info.compute_capability(), 61) << "本机应为 Tesla P4 (Pascal, sm_61)";
+    EXPECT_GE(info.compute_capability(), 61)
+        << "设备算力低于 sm_61，当前 CUDA 后端不支持";
 }
 
 TEST(CudaEnvironment, DeviceLeafIsAKernelPassablePod)
@@ -510,13 +536,15 @@ TEST_F(CudaDeviceTest, LargeGemmMatchesHostWhenStressEnabled)
     if (!stress_enabled())
         GTEST_SKIP() << "默认跳过（GEMM 是真正吃算力的用例）。需要时设 JASMINE_CUDA_STRESS=1";
 
-    // 256³ 对 P4 来说仍是很短的一瞬，但比其他用例重，单独归到压力组
+    // 256³ 对 P4 来说仍是很短的一瞬，但比其他用例重，单独归到压力组。
+    // 使用正数输入：原来的行列线性项会制造超过 1e4 量级的抵消，
+    // 使 host/cuBLAS 的正常 FP32 求和顺序差异也超过 1e-3 相对容差。
     const int n = 256;
-    auto ha = make_host<float>(n, n, 0.01f);
-    auto hb = make_host<float>(n, n, 0.02f);
+    auto ha = make_well_conditioned_host<float>(n, n, 0.5f);
+    auto hb = make_well_conditioned_host<float>(n, n, 0.25f);
     dev_matrix_t<float> da(n, n, ha), db(n, n, hb);
 
     auto ref = ha.dot(hb).clone();
     auto got = cuda::gemm_to_host(da.leaf(), db.leaf());
-    expect_matrices_match_f32(got, ref, 1e-3f, "大 GEMM");
+    expect_matrices_match_f32(got, ref, 1e-4f, "大 GEMM");
 }

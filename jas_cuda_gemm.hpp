@@ -296,8 +296,18 @@ void gemm(const dev_mat_t<T>& A, const dev_mat_t<T>& B, const dev_mat_t<T>& C,
         const cublasOperation_t opB = B.transposed() ? CUBLAS_OP_T : CUBLAS_OP_N;
 
         if constexpr (std::is_same_v<T, float>)
-            JAS_CUBLAS_CHECK(cublasSgemm(cublas_handle(), opB, opA, N, M, K, &alpha, B.m_data, ldb,
-                                         A.m_data, lda, &beta, C.m_data, ldc));
+        {
+            // cublasSgemm 在 Ampere+ 上仍可能选择 TF32；math mode 不应作为
+            // 唯一保险。显式传 _PEDANTIC compute type，确保输入不被降到 TF32。
+            // tf32 模式则显式传 FAST_TF32，行为与 gemm_math_mode() 保持一致。
+            const cublasComputeType_t compute =
+                gemm_math_mode() == gemm_math::tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32
+                                                    : CUBLAS_COMPUTE_32F_PEDANTIC;
+            JAS_CUBLAS_CHECK(cublasGemmEx(
+                cublas_handle(), opB, opA, N, M, K, &alpha, B.m_data, CUDA_R_32F, ldb,
+                A.m_data, CUDA_R_32F, lda, &beta, C.m_data, CUDA_R_32F, ldc, compute,
+                CUBLAS_GEMM_DEFAULT));
+        }
         else
             JAS_CUBLAS_CHECK(cublasDgemm(cublas_handle(), opB, opA, N, M, K, &alpha, B.m_data, ldb,
                                          A.m_data, lda, &beta, C.m_data, ldc));

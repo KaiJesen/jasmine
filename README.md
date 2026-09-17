@@ -80,8 +80,9 @@ Common configuration options:
 ```bash
 cmake -S . -B build-cuda -DJASMINE_USE_CUDA=ON
 cmake --build build-cuda -j
-./build-cuda/tests/cuda_tests                        # fast, no heat
-JASMINE_CUDA_STRESS=1 ./build-cuda/tests/cuda_tests  # includes compute-heavy cases (4096² fused, 256³ GEMM)
+JASMINE_CUDA_STRESS=0 ./build-cuda/tests/cuda_tests  # force fast mode
+JASMINE_CUDA_STRESS=1 ./build-cuda/tests/cuda_tests  # force compute-heavy cases
+# sm_80+ targets run the stress cases by default; the fanless P4 does not.
 ```
 
 Usage overview (full details in [`CUDA.md`](CUDA.md)):
