@@ -1852,3 +1852,46 @@ set_updator/set_lr` 全部走链 —— 与库里其它网络完全一致的构�
   ASan 的 `-fsanitize=address` 在 -O2 下仍能报 use-after-scope；
   (c) 二分更大的 TU 组合（例如 `test_rbm.cpp` + 所有新增测试 + `test_net.cpp`），
   找出触发条件最小的集合。
+
+
+### 15.5 第二轮排查：从「缓存被清空」收窄到「mat_t 头被写坏」
+
+接着 15.4 继续，用「加探针 + 在 test 侧分点观察」的方式把范围压到一句话能说清：
+
+1. **不是对象副本**：在 test 侧打印 `&dbn` / `&dbn.get<2>()`，与库内 `weight_net_t::forward` /
+   `backward` 打印的 `this` 对比 —— **三处地址完全一致**（同一对象、同一成员）。
+2. **不是 forward 被调用多次**：给 `weight_net_t::forward` 加计数器，整个用例里
+   `head.forward` 只被调用 **1 次**（`#1 in=(4,3)`），且 store 之后 `m_input=(4,3) valid=1`。
+3. **清空发生在 `dbn.backward(...)` 内部**：在 test 侧分点观察（`dbg_input_valid()` 临时探针）——
+   ```
+   [W] after chain forward      head cache valid=1 (4,3)
+   [W] after ExpectShape(logits) head cache valid=1 (4,3)
+   [W] after ExpectShape(head)   head cache valid=1 (4,3)
+   [W] before ce.backward        head cache valid=1 (4,3)
+   [A] ce.backward -> (3,3)
+   [W] after  ce.backward        head cache valid=1 (4,3)   ← 手工单独调 CE 反向不会清它
+   ... 随后 dbn.backward(labels)
+   [L] head.backward this=<同一地址> delta=(3,3) m_input=(0,0) valid=0   ← 进链反向之后才空
+   ```
+   即：手工调用 `ce_loss_t::backward` **不会**动分类头的缓存，但同一条链上的 `dbn.backward` 会在
+   调 `head.backward` 之前把它变成 `(0,0)`（连 `m_data` 都没了 → `valid()==false`）。
+4. **`m_input` 的地址没变**（同一个 `mat_t` 对象），变化的只是它的**内容（维度 + 数据指针）** ——
+   也就是说 `mat_t` 的**头部被写了**，而不是"换了个对象"。
+
+由此得到的结论：**这属于内存破坏类问题（把 `mat_t` 的维度/指针字段写坏了），不是逻辑分支错误。**
+ASan（`-O1`）没有报错并不矛盾：`-fsanitize=address` **不检测对象内部/相邻栈变量之间的越界写**，
+而 `m_input` 正是嵌在 tuple 里的栈对象。
+
+**下一步（按性价比排序）**：
+1. **在 `weight_net_t` 里给 `m_input` 旁边加一个 canary 成员**（`std::uint64_t m_canary = 0xDEADBEEF`），
+   在 forward/backward 各检查一次 —— 如果 canary 被打掉，就直接证明是相邻越界写，并能用二分法定位是
+   哪一层/哪个更新的写入越界；
+2. 用 **`-O2 -fsanitize=address`** 重编**完整** `unit_tests`（保留优化，布局接近 Release），
+   并把 `Dbn.FullChainBackward` 临时取消 skip 触发一次；
+3. 换 `valgrind --tool=memcheck`（能抓栈上相邻写）跑那一个用例 —— 本机没装也能用 `-static` 版试；
+4. 若都无果：把 DBN 的监督微调从"整链 backward"改成"逐层显式 backward"（demo 里就是这么驱动也正常），
+   绕过这条路径并把问题记录在案。
+
+**目前状态**：护栏（`weight_net_t::backward` 检查前向缓存 + delta 形状）已保留，报错信息明确；
+`Dbn.FullChainBackward` 仍以 `GTEST_SKIP` + 精确症状记录；`examples/mnist_dbn.cpp` 在独立二进制里
+端到端正常（预训练 + 微调到 68%）。

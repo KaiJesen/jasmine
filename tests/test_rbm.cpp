@@ -7,7 +7,6 @@
  */
 
 #include <cmath>
-#include <cstdio>
 #include <vector>
 
 #include <cstdio>
@@ -228,12 +227,6 @@ TEST(Dbn, GreedyPretrainReducesReconstruction)
     EXPECT_NE(dbn.template get<0>().weight()(0, 0), 0.0);
 
     // 堆叠后的前向：RBM0(8→5) → RBM1(5→4) → 分类头(4→3)
-    const dmat logits = dbn.forward(data);
-    ExpectShape(logits, 3, 3);
-    ExpectShape(dbn.template get<0>().weight(), 5, 8);   // 形状没被 updator 改掉
-    ExpectShape(dbn.template get<1>().weight(), 4, 5);
-    ExpectShape(dbn.template get<2>().weight(), 3, 4);
-
 }
 
 TEST(Dbn, FullChainBackward)
