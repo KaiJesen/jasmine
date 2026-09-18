@@ -23,6 +23,10 @@ target_link_libraries(llama_chat PRIVATE jasmine_headers)
 add_executable(mnist_conv mnist_conv.cpp)
 target_link_libraries(mnist_conv PRIVATE jasmine_headers)
 
+# MNIST + DBN（RBM 静态堆叠）：逐层 CD 预训练 + 监督微调
+add_executable(mnist_dbn mnist_dbn.cpp)
+target_link_libraries(mnist_dbn PRIVATE jasmine_headers)
+
 if(JASMINE_USE_CUDA)
   add_executable(cuda_fused_demo cuda_fused_demo.cu)
   target_link_libraries(cuda_fused_demo PRIVATE jasmine_headers jasmine_cuda_headers)

@@ -25,6 +25,7 @@ add_executable(unit_tests
   test_dropout.cpp
   test_adamw.cpp
   test_cls_token.cpp
+  test_rbm.cpp
   test_gqa.cpp
   test_rms_norm.cpp
   test_llama_weights.cpp

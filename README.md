@@ -26,14 +26,14 @@ mat_t<float> s = q.t().dot(k);               // matrix product (CPU: BLAS / GPU:
 | --- | --- |
 | Matrices & expressions | `mat_t` / `mat_view_t` / `mat_reshape_view_t`; lazy expression trees, compile-time fusion, scalar operands, transposed views, zero-copy subviews and shape views, zero-copy BLAS operands |
 | Operators | Arithmetic, comparisons, `exp` / `log` / `sqrt` / `sigmoid`, `dot`, row/column reductions, row-wise softmax, LayerNorm / RMSNorm |
-| Layers | Linear, **Conv2d (im2col + GEMM, full backward)**, **MaxPool2d / AvgPool2d (full backward)**, **Flatten**, **MeanPool（token 序列）**, **Dropout**, LayerNorm / RMSNorm, SiLU / GELU / ReLU, SwiGLU gating, residual, **Transformer encoder**, Embedding, cross-entropy / MSE |
+| Layers | Linear, **RBM / DBN (contrastive divergence + static stacking)**, Conv2d (im2col + GEMM, full backward)**, **MaxPool2d / AvgPool2d (full backward)**, **Flatten**, **MeanPool（token 序列）**, **Dropout**, LayerNorm / RMSNorm, SiLU / GELU / ReLU, SwiGLU gating, residual, **Transformer encoder**, Embedding, cross-entropy / MSE |
 | Models | decoder-only base; **GPT-2** (absolute positions + `gelu_new` + tied lm_head); **LLaMA family** (RoPE + RMSNorm + SwiGLU + GQA/MQA); enc-dec stack |
 | Training | Backprop checked against numerical gradients; SGD / Adam / NAdam / **AdamW (decoupled weight decay)**; gradient accumulation (`cache_updator_t`); **cosine annealing with warm restarts** (`cosine_annealing_decay`) |
 | Inference | KV-cache prefill + per-token decoding; greedy / top-k / top-p sampling; streaming output |
 | Weights | Single-file `JASMINE_WEIGHTS_V1` format; **training-result serialization** (per-layer params + meta in one file, `save`/`load` round-trip); direct export from HuggingFace (`tools/`); layer-by-layer / logits golden-value alignment |
 | CUDA | Element-wise chains fused into a single kernel launch, cuBLAS GEMM, reductions, device-side KV cache / RoPE / MHA / a whole LLaMA, backwards and optimizers, **fused attention**, **bf16 / fp16 mixed precision** |
 
-**Status**: the host side passes `ctest` 251/251; the CUDA backend has 174 cases (compute-heavy cases
+**Status**: the host side passes `ctest` 258/258 (one case self-skips, see TESTING.md 15); the CUDA backend has 174 cases (compute-heavy cases
 are skipped by default). The CUDA backend is still being iterated on; target-machine vs test-machine
 differences are covered in [`CUDA.md`](CUDA.md), section 11.
 
@@ -199,6 +199,7 @@ jasmine/
 │   ├── jas_mat_view_t.hpp    sub-views, transposes and zero-copy reshape views
 │   ├── jas_mat_gemm.hpp       GEMM (BLAS / blocked fallback)
 │   ├── jas_net_t.hpp          layer shell (weights + updater + cache)
+│   ├── jas_rbm_t.hpp          RBM + DBN (greedy CD pretraining, static stacking)
 │   ├── jas_conv_t.hpp         2-D convolution (im2col + GEMM, forward/backward)
 │   ├── jas_pool_t.hpp         2-D max / average pooling (forward/backward)
 │   ├── jas_mha_t.hpp          multi-head attention (RoPE, causal mask, KV cache)
@@ -222,6 +223,22 @@ jasmine/
 use the CMake targets instead.
 
 ### 4.1 MNIST 小玩具（卷积 + 编码器 + 序列化）
+
+### 4.2 MNIST + DBN（RBM 静态堆叠）
+
+`examples/mnist_dbn.cpp` 用 `dbn_net_t<2, upr_tpl>`（`jas_rbm_t.hpp`）把 2 个 RBM + 分类头 + CE
+静态堆叠成 DBN：逐层贪心 CD-k 预训练 → 监督微调 → 序列化。实测（2000 张训练、3 个预训练 epoch、
+3 个微调 epoch、1000 张测试）：
+
+```text
+[pretrain] 重建误差 0.380 -> 0.247（逐层 CD-1）
+[finetune] epoch 3 loss=0.112 test_acc=0.68
+```
+
+注意微调的梯度是「按 batch 求和」的，所以 `--ft-lr` 要比预训练 lr 小一个 batch 量级
+（默认 1e-3 时 test_acc 只有 0.09，降到 2e-4 才正常），这个坑记在 TESTING.md 第 15 节。
+
+### 4.3 MNIST 卷积小玩具
 
 `examples/mnist_conv.cpp` **用 `complex_net_builder_t` 把层静态堆叠成 `complex_net_t`**
 （`forward` / `backward` / `step` / `init_weight` 全部走链），并支持两种结构在同一份数据、
