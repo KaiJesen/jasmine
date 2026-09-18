@@ -1946,3 +1946,46 @@ build-check/  CXX_FLAGS =            -std=gnu++20 … -fopenmp       ← 通过�
    （怀疑点集中在 CE 反向里那几个临时 `mat_t`）；
 4. 兜底方案（可立即采用）：DBN 的监督微调改成**逐层显式 backward**（`examples/mnist_dbn.cpp` 那种
    驱动方式在 Release 下也正常），绕开 `complex_net_t::backward` 这条路径，并保留问题记录。
+
+### 15.7 结案：根因是「匿名命名空间里同名别名模板」导致的 ODR/COMDAT 冲突
+
+**问题解决。** 15.4–15.6 三轮排查的最后一步是这样定案的：
+
+**决定性证据**：在 `weight_net_t::forward` 与 `::backward` 里各打印一次 `sizeof(*this)`：
+
+```text
+[SZ] forward:  this=0x…f38 &m_input=0x…0d8 sizeof(*this)=448 type=weight_net_t<mat_t<double>, _GLOBAL__N_1::upr_tpl>
+[SZ] backward: this=0x…f38 &m_input=0x…0c8 sizeof(*this)=432 type=weight_net_t<mat_t<double>, _GLOBAL__N_1::upr_tpl>
+```
+
+**同一个名字、同一个 `this`，却有两套布局**（差 16 字节 = 两个 updator × 8 字节，正是 `adamw_t` 的
+`m_weight_decay`）。这不是越界写，而是 **ODR 违规**：
+
+- 多个测试/示例文件都在**匿名命名空间**里写了同名的别名模板
+  `template <typename T> using upr_tpl = cache_updator_t<T, ???>;`，
+  **有的用 `adamw_t`、有的用 `sgd_t`/`nadam_t`**（5 个文件、2 种不同目标）；
+- GCC 对匿名命名空间的 mangle 一律是 `_GLOBAL__N_1`，**两个 TU 里的 `upr_tpl` 因此 mangle 成同一个符号**，
+  于是 `weight_net_t<mat_t<double>, upr_tpl>` 在链接期被视为**同一个实例**；
+- 这个类模板的成员函数是内联（vague linkage/COMDAT），链接器只保留**其中一份**，
+  而对象却是由各自的头文件版本构造出来的 → **一份代码 + 另一份布局** → 成员偏移错位
+  （`m_input` 偏了 0x10）→ 前向缓存读到别处、canary 被覆盖、`delta.dot(m_input.t())` 报维度不符。
+
+**验证与修复**：把 `test_rbm.cpp` 里的别名改成唯一名字后，两处 `sizeof` 立刻一致（都是 448）、
+`&m_input` 同一地址、整链反向通过。随后把 tests/ 与 examples/ 里所有同类匿名命名空间别名按用途
+重命名（`adamw_upr_tpl` / `test_flatten_upr_tpl` / …），并清掉全部临时探针。
+
+**规则（写给以后的自己）**：**不要在不同 TU 的匿名命名空间里用同一个名字命名别名模板**，
+尤其是它们的目标类型不同的时候——mangle 会撞车而产生 ODR 违规。按「目标 updator」命名
+（`adamw_upr_tpl`、`sgd_upr_tpl`），或者把它放进具名 struct/namespace。
+
+**这一类 bug 的特征**（值得记住）：
+- 单独编译某个 TU 正常，链接进大二进制才炸；
+- 与优化级别、链接顺序相关，换目录/换构建类型表现不同（本次就是这样反复误导排查方向）；
+- **ASan 抓不到**（不是越界写，而是"两份合法代码被错误合并"）；
+- `-fno-strict-aliasing` 无效；
+- 症状可以是"数据看起来被写坏了"（canary 被覆盖），容易被误判成越界。
+
+**收尾时保留的改动**：`weight_net_t::backward` 的护栏（前向缓存有效 + delta 形状检查，
+给出明确错误信息）——正是它把这条 ODR bug 从"难懂的 dot 维度报错"变成可读信息的开端。
+
+**结果**：`ctest` **258/258 通过，0 失败，无 skip**；`Dbn.FullChainBackward` 不再是 skip 用例。

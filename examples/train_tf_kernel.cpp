@@ -7,12 +7,12 @@
 
 using namespace jasmine;
 template <typename val_type>
-using upr_tpl = cache_updator_t<val_type, nadam_t>;
+using train_tf_kernel_upr_tpl = cache_updator_t<val_type, nadam_t>;
 
 int main()
 {
     using val_type = double;
-    using tf_type = transformer_kernel_t<val_type, upr_tpl>;
+    using tf_type = transformer_kernel_t<val_type, train_tf_kernel_upr_tpl>;
     using net_type = complex_net_builder_t<val_type>
         ::push_back_impl<tf_type>
         ::push_back_staticnet<mse_loss_t>

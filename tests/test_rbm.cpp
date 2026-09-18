@@ -24,7 +24,7 @@ namespace
 using dmat = mat_t<double>;
 using rbm_t = rbm_net_t<dmat, sgd_t>;
 using val_type_t = double;
-template <typename T> using upr_tpl = cache_updator_t<T, adamw_t>;
+template <typename T> using adamw_upr_tpl = cache_updator_t<T, adamw_t>;
 } // namespace
 
 TEST(Rbm, HiddenProbabilityIsSigmoidOfLinearTerm)
@@ -198,7 +198,7 @@ TEST(Rbm, ConceptsAndReinit)
 TEST(Dbn, GreedyPretrainReducesReconstruction)
 {
     // DBN = 2 个 RBM 静态堆叠 + 分类头；容器 {n_visible, n_hidden1, n_hidden2, n_class}
-    dbn_net_t<2, upr_tpl> dbn;
+    dbn_net_t<2, adamw_upr_tpl> dbn;
     dbn.reinit(std::vector<int>{8, 5, 4, 3});
     ExpectShape(dbn.template get<0>().weight(), 5, 8);
     ExpectShape(dbn.template get<1>().weight(), 4, 5);
@@ -253,9 +253,8 @@ TEST(Dbn, FullChainBackward)
     // 单独编译本文件、或整包在无优化下编译都通过。失败时分类头的前向缓存 m_input
     // 在 backward 时已被写坏（dims/指针被覆盖），排查详见 TESTING.md 15.6。
     // 这里 skip，避免让 Release 套件带着一个未定位的失败；断言保留，修好后删掉这一行即可。
-    GTEST_SKIP() << "整链反向在 Release(-O3) 完整二进制里失败（优化相关的 UB，待定位，见 TESTING.md 15.6）";
 
-    dbn_net_t<2, upr_tpl> dbn;
+    dbn_net_t<2, adamw_upr_tpl> dbn;
     dbn.reinit(std::vector<int>{8, 5, 4, 3});
     dbn.set_updator(0.01);
 

@@ -18,7 +18,7 @@
  *     fc d_model→10 → CE
  *
  * 注意这里的 encoder 是**库里的 encoder_t**（Transformer encoder，双向自注意力），
- * 拼进链里时是 `push_back_impl<encoder_t<double, upr_tpl>>`：它本身就是由
+ * 拼进链里时是 `push_back_impl<encoder_t<double, mnist_conv_upr_tpl>>`：它本身就是由
  * residual / MHA / LayerNorm / FFN 堆出来的，只是入口形状要用 `set_param(层数, 头数, d_model, d_ff, seq_len)` 给。
  *
  * 三条链都用 complex_net_builder_t 静态堆叠，训练/评估/序列化代码完全共用：
@@ -60,7 +60,7 @@ using dmat = mat_t<double>;
 /** 梯度累加器 + AdamW：batch 个样本的梯度平均后再更新一次（库里现成的 mini-batch 机制），
  *  AdamW 的解耦权重衰减用来做正则（见 jas_updator_t.hpp） */
 template <typename val_type>
-using upr_tpl = cache_updator_t<val_type, adamw_t>;
+using mnist_conv_upr_tpl = cache_updator_t<val_type, adamw_t>;
 
 namespace
 {
@@ -176,45 +176,45 @@ template <bool two_conv>
 using cnn_chain_t = std::conditional_t<
     two_conv,
     complex_net_builder_t<double>
-        ::push_back_updatable<conv2d_net_t, upr_tpl>   // 0
+        ::push_back_updatable<conv2d_net_t, mnist_conv_upr_tpl>   // 0
         ::push_back_staticnet<relu_net_t>              // 1
         ::push_back_staticnet<pool2d_net_t>            // 2
-        ::push_back_updatable<conv2d_net_t, upr_tpl>   // 3
+        ::push_back_updatable<conv2d_net_t, mnist_conv_upr_tpl>   // 3
         ::push_back_staticnet<relu_net_t>              // 4
         ::push_back_staticnet<pool2d_net_t>            // 5
         ::push_back_staticnet<flatten_net_t>           // 6
-        ::push_back_updatable<weight_net_t, upr_tpl>   // 7
+        ::push_back_updatable<weight_net_t, mnist_conv_upr_tpl>   // 7
         ::push_back_staticnet<relu_net_t>              // 8
         ::push_back_staticnet<dropout_net_t>           // 9 dropout（正则）
-        ::push_back_updatable<weight_net_t, upr_tpl>   // 10
+        ::push_back_updatable<weight_net_t, mnist_conv_upr_tpl>   // 10
         ::push_back_staticnet<ce_loss_t>               // 11
         ::type,
     complex_net_builder_t<double>
-        ::push_back_updatable<conv2d_net_t, upr_tpl>   // 0
+        ::push_back_updatable<conv2d_net_t, mnist_conv_upr_tpl>   // 0
         ::push_back_staticnet<relu_net_t>              // 1
         ::push_back_staticnet<pool2d_net_t>            // 2
         ::push_back_staticnet<flatten_net_t>           // 3
-        ::push_back_updatable<weight_net_t, upr_tpl>   // 4
+        ::push_back_updatable<weight_net_t, mnist_conv_upr_tpl>   // 4
         ::push_back_staticnet<relu_net_t>              // 5
         ::push_back_staticnet<dropout_net_t>           // 6 dropout（正则）
-        ::push_back_updatable<weight_net_t, upr_tpl>   // 7
+        ::push_back_updatable<weight_net_t, mnist_conv_upr_tpl>   // 7
         ::push_back_staticnet<ce_loss_t>               // 8
         ::type>;
 
 /** conv→relu→pool→(逐位置投影成 token)→Transformer encoder→mean pool→fc→ce */
 using trf_chain_t = complex_net_builder_t<double>
-    ::push_back_updatable<conv2d_net_t, upr_tpl>       // 0 conv 1→8
+    ::push_back_updatable<conv2d_net_t, mnist_conv_upr_tpl>       // 0 conv 1→8
     ::push_back_staticnet<relu_net_t>                  // 1
     ::push_back_staticnet<pool2d_net_t>                // 2 28→14   → [8, 196]
-    ::push_back_updatable<conv2d_net_t, upr_tpl>       // 3 conv 8→16
+    ::push_back_updatable<conv2d_net_t, mnist_conv_upr_tpl>       // 3 conv 8→16
     ::push_back_staticnet<relu_net_t>                  // 4
     ::push_back_staticnet<pool2d_net_t>                // 5 14→7    → [16, 49]（49 个 token）
-    ::push_back_updatable<weight_net_t, upr_tpl>       // 6 patch embedding: 16 → d_model，逐位置
-    ::push_back_updatable<cls_token_net_t, upr_tpl>    // 7 拼一个可学习的 CLS 向量
-    ::push_back_impl<encoder_t<double, upr_tpl>>       // 8 Transformer encoder（双向）
+    ::push_back_updatable<weight_net_t, mnist_conv_upr_tpl>       // 6 patch embedding: 16 → d_model，逐位置
+    ::push_back_updatable<cls_token_net_t, mnist_conv_upr_tpl>    // 7 拼一个可学习的 CLS 向量
+    ::push_back_impl<encoder_t<double, mnist_conv_upr_tpl>>       // 8 Transformer encoder（双向）
     ::push_back_staticnet<take_token_net_t>            // 9 取 CLS 那一列 → [d_model, 1]
     ::push_back_staticnet<dropout_net_t>               // 10 dropout（正则）
-    ::push_back_updatable<weight_net_t, upr_tpl>       // 11 分类头
+    ::push_back_updatable<weight_net_t, mnist_conv_upr_tpl>       // 11 分类头
     ::push_back_staticnet<ce_loss_t>                   // 12
     ::type;
 

@@ -24,7 +24,7 @@ namespace
 {
 using dmat = mat_t<double>;
 using flat_t = flatten_net_t<dmat>;
-template <typename T> using upr_tpl = cache_updator_t<T, sgd_t>;
+template <typename T> using test_flatten_upr_tpl = cache_updator_t<T, sgd_t>;
 } // namespace
 
 TEST(Flatten, ForwardIsRowMajorFlatten)
@@ -77,9 +77,9 @@ TEST(Flatten, ChainWithConvAndLinear)
 {
     // conv → flatten → fc 的静态层堆叠链：反向要能穿过 flatten 回到卷积
     using chain_t = complex_net_builder_t<double>
-        ::push_back_updatable<conv2d_net_t, upr_tpl>
+        ::push_back_updatable<conv2d_net_t, test_flatten_upr_tpl>
         ::push_back_staticnet<flatten_net_t>
-        ::push_back_updatable<weight_net_t, upr_tpl>
+        ::push_back_updatable<weight_net_t, test_flatten_upr_tpl>
         ::type;
 
     chain_t net;

@@ -5,7 +5,7 @@
  *   RBM 1：256 → 128（吃第 0 层的隐层概率，继续无监督预训练）
  *   分类头：128 → 10（监督微调时和上面的 RBM 一起反向传播）
  *
- * 这条链就是 `dbn_net_t<2, upr_tpl>`（`jas_rbm_t.hpp`）：2 个 RBM + weight_net + CE 全部由
+ * 这条链就是 `dbn_net_t<2, mnist_dbn_upr_tpl>`（`jas_rbm_t.hpp`）：2 个 RBM + weight_net + CE 全部由
  * `complex_net_builder_t` 静态堆叠而成，因此：
  *
  *     dbn.reinit({784, 256, 128, 10});       // 容器协议：每个 RBM / 分类头各消费一对数
@@ -34,7 +34,7 @@ using namespace jasmine;
 using dmat = mat_t<double>;
 
 template <typename val_type>
-using upr_tpl = cache_updator_t<val_type, adamw_t>;
+using mnist_dbn_upr_tpl = cache_updator_t<val_type, adamw_t>;
 
 namespace
 {
@@ -122,7 +122,7 @@ double evaluate(net_type& dbn, dataset_t const& d, std::size_t limit)
 }
 
 /** DBN 的序列化：每个 RBM 的 W/b/c + 分类头 + 元信息 */
-void save_dbn(dbn_net_t<2, upr_tpl> const& dbn, std::string const& path, int epochs, double acc)
+void save_dbn(dbn_net_t<2, mnist_dbn_upr_tpl> const& dbn, std::string const& path, int epochs, double acc)
 {
     weight_writer_t w;
     for (int layer = 0; layer < 2; ++layer)
@@ -147,7 +147,7 @@ void save_dbn(dbn_net_t<2, upr_tpl> const& dbn, std::string const& path, int epo
     w.write(path);
 }
 
-void load_dbn(dbn_net_t<2, upr_tpl>& dbn, std::string const& path, int& epochs, double& acc)
+void load_dbn(dbn_net_t<2, mnist_dbn_upr_tpl>& dbn, std::string const& path, int& epochs, double& acc)
 {
     weight_file_t wf;
     wf.load(path);
@@ -211,7 +211,7 @@ int main(int argc, char** argv)
     }
 
     // ---- 静态层堆叠出 DBN：RBM(784→256) → RBM(256→128) → 分类头(128→10) → CE ----
-    dbn_net_t<2, upr_tpl> dbn;
+    dbn_net_t<2, mnist_dbn_upr_tpl> dbn;
     dbn.reinit(std::vector<int>{kVisible, kHidden1, kHidden2, kClasses});
 
     g_random_engine.seed(seed);
@@ -290,7 +290,7 @@ int main(int argc, char** argv)
     {
         save_dbn(dbn, save_path, pretrain_epochs + finetune_epochs, acc);
         // 往返自检
-        dbn_net_t<2, upr_tpl> reloaded;
+        dbn_net_t<2, mnist_dbn_upr_tpl> reloaded;
         reloaded.reinit(std::vector<int>{kVisible, kHidden1, kHidden2, kClasses});
         int e = 0;
         double a = 0.0;

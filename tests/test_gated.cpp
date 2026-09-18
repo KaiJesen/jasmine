@@ -28,13 +28,13 @@ namespace
 {
 
 template<typename val_type>
-using upr_tpl = cache_updator_t<val_type, nadam_t>;
+using test_gated_upr_tpl = cache_updator_t<val_type, nadam_t>;
 
 using dmat = mat_t<double>;
 
 /** SwiGLU 的两条分支：gate = Linear→SiLU，up = Linear */
 template<typename val_type>
-using swiglu_branches_t = gated_ffn_branches_t<val_type, upr_tpl, silu_net_t>;
+using swiglu_branches_t = gated_ffn_branches_t<val_type, test_gated_upr_tpl, silu_net_t>;
 
 /** 同上但用纯 SGD，便于让 `weight_after == weight_before - grad` 直接读出梯度 */
 template<typename val_type>
@@ -294,7 +294,7 @@ TEST(Gated, ChainWithDownProjectionInsideComplexNet)
     // 验证容器能作为 complex_net 的一层参与 reinit / forward / backward / step
     using swiglu_ffn_t = complex_net_builder_t<double>
         ::template push_back_impl<swiglu_branches_t<double>>
-        ::template push_back_updatable<weight_net_t, upr_tpl>
+        ::template push_back_updatable<weight_net_t, test_gated_upr_tpl>
         ::type;
 
     const int d_model = 4, d_ff = 6, T = 3;
@@ -326,7 +326,7 @@ TEST(Gated, WorksAsResidualWrappedBlock)
     // LLaMA 的实际形态：residual(gated → down)，模型级访问器要能穿透 residual 与容器
     using swiglu_ffn_t = complex_net_builder_t<double>
         ::template push_back_impl<swiglu_branches_t<double>>
-        ::template push_back_updatable<weight_net_t, upr_tpl>
+        ::template push_back_updatable<weight_net_t, test_gated_upr_tpl>
         ::type;
     using res_t = residual_net_t<swiglu_ffn_t>;
 
@@ -357,7 +357,7 @@ TEST(Gated, EndToEndMatchesPyTorchSwiglu)
 
     swiglu_branches_t<double> gated;
     gated.reinit(std::vector<int>{d_model, d_ff});
-    weight_net_t<dmat, upr_tpl> down;
+    weight_net_t<dmat, test_gated_upr_tpl> down;
     down.reinit(std::vector<int>{d_ff, d_model});
 
     auto& gate_lin = gated.gate_branch().template get<0>();

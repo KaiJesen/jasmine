@@ -91,6 +91,8 @@ public:
     {
         // 前向缓存必须有效：否则 delta.dot(m_input.t()) 会抛出难懂的
         // "mat_dot_t: inner dimensions do not match"（见 TESTING.md 15.3 的排查记录）。
+        // 前向缓存必须有效：否则 delta.dot(m_input.t()) 会抛出难懂的
+        // "mat_dot_t: inner dimensions do not match"（见 TESTING.md 15.3 的排查记录）。
         if (!m_input.valid())
             throw std::runtime_error("weight_net_t::backward: forward cache is empty "
                                      "(forward must be called before backward, and the cache must not be cleared)");
