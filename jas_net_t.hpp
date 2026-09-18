@@ -1,12 +1,14 @@
 #ifndef __JAS_NET_T_HPP__
 #define __JAS_NET_T_HPP__
 
+#include <random>
 #include <string>
 #include <sstream>
 
 #include "jas_mat_t.hpp"
 #include "jas_mat_express_t.hpp"
 #include "jas_mat_storage.hpp"
+#include "jas_mat_init_t.hpp"      // g_random_engine（dropout 用）
 
 #include "jas_updator_t.hpp"
 
@@ -49,7 +51,12 @@ public:
     mat_t<val_type> forward(Src&& input)
     {
         detail::store_for_backward(m_input, std::forward<Src>(input));
-        return m_weight.dot(m_input) + m_bias;
+        // 偏置必须分两步加：`W.dot(x) + b` 会让 mat_add_t::clone() 逐元素求值，
+        // 每个输出元素自己去扫一遍 K，整次矩阵乘退回朴素循环、**碰不到 BLAS**。
+        // 实测（M=64,N=1024,K=288）：表达式 ~100ms，拆两句 7.2ms。详见 TESTING.md 第 11 节。
+        mat_t<val_type> out = m_weight.dot(m_input);
+        out += m_bias;
+        return out;
     }
 
     /** 无状态层：单列输入与整段 forward 相同 */
@@ -82,6 +89,15 @@ public:
     template <typename other_type>
     mat_t<val_type> backward(const other_type& delta)
     {
+        // 前向缓存必须有效：否则 delta.dot(m_input.t()) 会抛出难懂的
+        // "mat_dot_t: inner dimensions do not match"（见 TESTING.md 15.3 的排查记录）。
+        // 前向缓存必须有效：否则 delta.dot(m_input.t()) 会抛出难懂的
+        // "mat_dot_t: inner dimensions do not match"（见 TESTING.md 15.3 的排查记录）。
+        if (!m_input.valid())
+            throw std::runtime_error("weight_net_t::backward: forward cache is empty "
+                                     "(forward must be called before backward, and the cache must not be cleared)");
+        if (delta.row_num() != m_weight.row_num() || delta.col_num() != m_input.col_num())
+            throw std::runtime_error("weight_net_t::backward: delta shape mismatch");
         mat_t<val_type> delta_weight = delta.dot(m_input.t());
         auto delta_bias = hsum(delta);
         mat_t<val_type> ret = m_weight.t().dot(delta);
@@ -204,6 +220,462 @@ public:
     void step()
     {
         // 什么也不做
+    }
+};
+
+/**
+ * CLS token 层：给 token 序列前面**拼一个可学习的向量**（ViT 的做法）。
+ *
+ *     forward : [d_model, T] → [d_model, T+1]，第 0 列是学出来的 m_cls，其后是原样搬过来的 token
+ *     backward: 把 delta 的第 0 列作为 m_cls 的梯度交给 updator，其余列原样回传（[d_model, T]）
+ *
+ * 与 Transformer encoder 配合时，序列过完 encoder 后再用 `take_token_net_t(0)` 取回第 0 列
+ * 当作分类向量 —— 比「所有 token 取平均」多了一个可学习的聚合点。
+ *
+ * 形状由 `set_param(d_model)` 给（也可在首次 forward 时懒初始化），刻意不叫 `reinit`：
+ * 这样它在 `complex_net_t::reinit` 里不占容器槽位（与 layer_norm 同理）。
+ */
+template <typename input_type, template <typename> class updator_type>
+class cls_token_net_t
+{
+public:
+    using val_type = typename input_type::ele_type;
+private:
+    mat_t<val_type> m_cls;                  // [d_model, 1]
+    updator_type<val_type> m_updator;
+    mat_t<val_type> m_input;                // forward 缓存（列数用于 backward 校验）
+    int m_d_model = 0;
+
+public:
+    cls_token_net_t() = default;
+
+    void set_param(int const& d_model)
+    {
+        m_d_model = d_model;
+        m_cls = mat_t<val_type>(d_model, 1);
+        m_cls = val_type(0);                // CLS 向量从 0 起（与偏置一样，先不加偏置的偏置）
+    }
+
+    /** CLS 向量 [d_model, 1]；供权重加载器写入 */
+    mat_t<val_type>& token() { return m_cls; }
+    mat_t<val_type> const& token() const { return m_cls; }
+
+    template<typename... upr_arg_types>
+    void set_updator(upr_arg_types&&... args)
+    {
+        m_updator.set(std::forward<upr_arg_types>(args)...);
+    }
+
+    void set_lr(val_type lr) { m_updator.set_lr(lr); }
+
+    template<typename Src>
+    mat_t<val_type> forward(Src&& input)
+    {
+        detail::store_for_backward(m_input, std::forward<Src>(input));
+        if (m_d_model == 0)
+            set_param(m_input.row_num());
+        if (m_input.row_num() != m_d_model)
+            throw std::invalid_argument("cls_token_net_t::forward: input rows must equal d_model");
+
+        mat_t<val_type> out(m_d_model, m_input.col_num() + 1);
+        for (int i = 0; i < m_d_model; ++i)
+        {
+            out(i, 0) = m_cls(i, 0);                       // 拼在最前面
+            for (int t = 0; t < m_input.col_num(); ++t)
+                out(i, t + 1) = m_input(i, t);
+        }
+        return out;
+    }
+
+    template<typename Src>
+    mat_t<val_type> forward_one(Src&& input)
+    {
+        return forward(std::forward<Src>(input));
+    }
+
+    template <typename other_type>
+    mat_t<val_type> backward(const other_type& delta)
+    {
+        if (delta.row_num() != m_d_model || delta.col_num() != m_input.col_num() + 1)
+            throw std::runtime_error("cls_token_net_t::backward: delta shape mismatch");
+
+        mat_t<val_type> grad_cls(m_d_model, 1);
+        mat_t<val_type> out(m_d_model, m_input.col_num());
+        for (int i = 0; i < m_d_model; ++i)
+        {
+            grad_cls(i, 0) = delta(i, 0);
+            for (int t = 0; t < m_input.col_num(); ++t)
+                out(i, t) = delta(i, t + 1);               // 原 token 的梯度原样回传
+        }
+        m_updator.update(grad_cls, m_cls);
+        return out;
+    }
+
+    template<typename init_type>
+    void init_weight()
+    {
+        m_cls = val_type(0);        // CLS 向量固定零初始化（ViT 的常规做法）
+    }
+
+    void step() { m_updator.step(); }
+
+    std::string net_type(int const& indent = 0) const
+    {
+        std::stringstream ss;
+        ss << print_indent(indent) << "cls_token_net_t:(d_model:" << m_d_model << ")";
+        return ss.str();
+    }
+};
+
+/**
+ * 取第 `index` 列（默认第 0 列 = CLS / 首 token）作为输出：Transformer 分类头的前半段。
+ *
+ *     forward : [d_model, T] → [d_model, 1]（复制第 index 列）
+ *     backward: [d_model, 1] → [d_model, T]（只有第 index 列有梯度，其余为 0）
+ *
+ * 与 mean_pool_net_t 是同一位置的两种聚合方式：mean pool 用平均，这里用「某个 token 的表征」。
+ */
+template <typename input_type>
+class take_token_net_t
+{
+public:
+    using val_type = typename input_type::ele_type;
+private:
+    mat_t<val_type> m_input;
+    int m_index = 0;
+
+public:
+    take_token_net_t() = default;
+
+    void set_param(int const& index) { m_index = index; }
+    int index() const { return m_index; }
+
+    template <typename Src>
+    mat_t<val_type> forward(Src&& input)
+    {
+        detail::store_for_backward(m_input, std::forward<Src>(input));
+        if (m_index < 0 || m_index >= m_input.col_num())
+            throw std::out_of_range("take_token_net_t::forward: token index out of range");
+        mat_t<val_type> out(m_input.row_num(), 1);
+        for (int i = 0; i < out.row_num(); ++i)
+            out(i, 0) = m_input(i, m_index);
+        return out;
+    }
+
+    template <typename Src>
+    mat_t<val_type> forward_one(Src&& input)
+    {
+        return forward(std::forward<Src>(input));
+    }
+
+    template <typename other_type>
+    mat_t<val_type> backward(const other_type& delta)
+    {
+        if (delta.row_num() != m_input.row_num() || delta.col_num() != 1)
+            throw std::runtime_error("take_token_net_t::backward: delta must be [d_model, 1]");
+        mat_t<val_type> out(m_input.row_num(), m_input.col_num());
+        for (int i = 0; i < out.row_num(); ++i)
+            out(i, m_index) = delta(i, 0);
+        return out;
+    }
+
+    std::string net_type(int const& indent = 0) const
+    {
+        std::stringstream ss;
+        ss << print_indent(indent) << "take_token_net_t:(index:" << m_index << ")";
+        return ss.str();
+    }
+
+    template<typename init_type>
+    void init_weight()
+    {
+        // 无权重
+    }
+
+    void step()
+    {
+        // 无权重
+    }
+};
+
+/**
+ * Dropout 层（inverted dropout）。
+ *
+ *   forward : 每个元素以 keep = 1-p 的概率保留，保留下来的乘以 1/keep —— 这样输出的期望不变，
+ *             推理时直接恒等即可，不需要额外补偿（这就是 "inverted" 的含义）。
+ *   backward: delta ⊙ mask（forward 被丢掉的位置梯度为 0）
+ *
+ * 与 flatten / pool / mean_pool 一样是无参数静态层：没有 updator，`init_weight` / `step` 空实现，
+ * 也没有 `reinit`（不占 complex_net_t::reinit 的容器槽位）。
+ *
+ * **训练/推理开关是显式的**：`set_enabled(false)` 让 forward 变成恒等（评估/推理时用）。
+ * 之所以不做成「infer 时自动跳过」：那要求链上每一层都有 `forward_one`（本库的 `encoder_t`
+ * 没有），会限制它出现在哪些链里；显式开关最简单，也让评估路径一目了然，并且保持了
+ * 训练时前向的可复现性（随机数取自 `g_random_engine`）。
+ */
+template <typename input_type>
+class dropout_net_t
+{
+public:
+    // 公开：允许该层位于 complex_net 链首（complex_net_t 从首个成员取 val_type）
+    using val_type = typename input_type::ele_type;
+private:
+    val_type m_p = val_type(0);         // 丢弃概率
+    bool m_enabled = true;              // false = 恒等（评估/推理）
+    mat_t<val_type> m_input;            // forward 缓存
+    mat_t<val_type> m_mask;             // forward 缓存：保留处 = 1/(1-p)，丢弃处 = 0；空 = 恒等
+public:
+    dropout_net_t() = default;
+    explicit dropout_net_t(val_type const& p) : m_p(p) {}
+
+    void set_param(val_type const& p) { m_p = p; }
+    val_type drop_probability() const { return m_p; }
+    void set_enabled(bool const on) { m_enabled = on; }
+    bool enabled() const { return m_enabled; }
+
+    template <typename Src>
+    mat_t<val_type> forward(Src&& input)
+    {
+        detail::store_for_backward(m_input, std::forward<Src>(input));
+        const int rows = m_input.row_num();
+        const int cols = m_input.col_num();
+
+        if (!m_enabled || m_p <= val_type(0))
+        {
+            m_mask = mat_t<val_type>();                  // 标记为「恒等」
+            return m_input;
+        }
+        if (m_p >= val_type(1))
+            throw std::invalid_argument("dropout_net_t::forward: drop probability must be < 1");
+
+        const val_type keep = val_type(1) - m_p;
+        const val_type scale = val_type(1) / keep;
+        std::uniform_real_distribution<double> uni(0.0, 1.0);
+        mat_t<val_type> out(rows, cols);
+        m_mask = mat_t<val_type>(rows, cols);
+        for (int i = 0; i < rows; ++i)
+        {
+            for (int j = 0; j < cols; ++j)
+            {
+                const bool survive = uni(g_random_engine) < static_cast<double>(keep);
+                m_mask(i, j) = survive ? scale : val_type(0);
+                out(i, j) = m_input(i, j) * m_mask(i, j);
+            }
+        }
+        return out;
+    }
+
+    /** 无状态层：单列输入与整段 forward 相同 */
+    template <typename Src>
+    mat_t<val_type> forward_one(Src&& input)
+    {
+        return forward(std::forward<Src>(input));
+    }
+
+    template <typename other_type>
+    mat_t<val_type> backward(const other_type& delta)
+    {
+        if (delta.row_num() != m_input.row_num() || delta.col_num() != m_input.col_num())
+            throw std::runtime_error("dropout_net_t::backward: delta size does not match input size");
+        if (!m_mask.valid())                             // forward 是恒等 → 梯度原样回传
+            return mat_t<val_type>(delta);
+        mat_t<val_type> out(m_input.row_num(), m_input.col_num());
+        for (int i = 0; i < out.row_num(); ++i)
+            for (int j = 0; j < out.col_num(); ++j)
+                out(i, j) = delta(i, j) * m_mask(i, j);
+        return out;
+    }
+
+    std::string net_type(int const& indent = 0) const
+    {
+        std::stringstream ss;
+        ss << print_indent(indent) << "dropout_net_t:(p:" << m_p
+           << ", " << (m_enabled ? "train" : "eval") << ")";
+        return ss.str();
+    }
+
+    template<typename init_type>
+    void init_weight()
+    {
+        // 无权重
+    }
+
+    void step()
+    {
+        // 无权重
+    }
+};
+
+/**
+ * 序列均值池化层：把 [d_model, T] 的 token 序列压成 [d_model, 1]。
+ *
+ * 用途是 Transformer 分类头的前半段（encoder → **mean pool** → linear → CE）：对 T 个 token
+ * 取平均，得到一个与序列长度无关的向量。
+ *
+ * forward: out(i,0) = (1/T) * Σ_t input(i,t)
+ * backward: dL/dinput(i,t) = delta(i,0) / T —— 梯度平均分摊回每一列（与 mean 的定义一致）
+ *
+ * 与 flatten / pooling / relu 一样是无参数静态层：不持有 updator，`init_weight` / `step`
+ * 空实现，也没有 `reinit`（不占 complex_net_t::reinit 的容器槽位）。
+ */
+template <typename input_type>
+class mean_pool_net_t
+{
+public:
+    // 公开：允许该层位于 complex_net 链首（complex_net_t 从首个成员取 val_type）
+    using val_type = typename input_type::ele_type;
+private:
+    mat_t<val_type> m_input;    // forward 缓存（只需要列数，但保持与其它层一致的语义）
+
+public:
+    mean_pool_net_t() = default;
+
+    template <typename Src>
+    mat_t<val_type> forward(Src&& input)
+    {
+        detail::store_for_backward(m_input, std::forward<Src>(input));
+        const int rows = m_input.row_num();
+        const int cols = m_input.col_num();
+        mat_t<val_type> out(rows, 1);
+        for (int i = 0; i < rows; ++i)
+        {
+            val_type s = val_type(0);
+            for (int t = 0; t < cols; ++t)
+                s += m_input(i, t);
+            out(i, 0) = s / static_cast<val_type>(cols);
+        }
+        return out;
+    }
+
+    /** 无状态层：单列输入与整段 forward 相同 */
+    template <typename Src>
+    mat_t<val_type> forward_one(Src&& input)
+    {
+        return forward(std::forward<Src>(input));
+    }
+
+    template <typename other_type>
+    mat_t<val_type> backward(const other_type& delta)
+    {
+        if (delta.row_num() != m_input.row_num() || delta.col_num() != 1)
+            throw std::runtime_error("mean_pool_net_t::backward: delta must be [d_model, 1]");
+        const int cols = m_input.col_num();
+        mat_t<val_type> out(m_input.row_num(), cols);
+        for (int i = 0; i < out.row_num(); ++i)
+            for (int t = 0; t < cols; ++t)
+                out(i, t) = static_cast<val_type>(delta(i, 0)) / static_cast<val_type>(cols);
+        return out;
+    }
+
+    std::string net_type(int const& indent = 0) const
+    {
+        std::stringstream ss;
+        ss << print_indent(indent) << "mean_pool_net_t:(tokens:" << m_input.col_num() << ")";
+        return ss.str();
+    }
+
+    template<typename init_type>
+    void init_weight()
+    {
+        // 无权重
+    }
+
+    void step()
+    {
+        // 无权重
+    }
+};
+
+/**
+ * 展平层：把 [C, W] 的特征图按行优先展平成 [C*W, 1] 的单列向量，喂给全连接/编码器。
+ *
+ * 用途是 CNN 尾部「特征图 → 向量」这一步（conv→relu→pool→**flatten**→encoder）。
+ * 语义上就是 `reshape_view`，但它必须是一个**层**才能参与 `complex_net_t` 的静态层堆叠：
+ * forward 缓存输入形状、backward 把 [C*W, 1] 的梯度还原成 [C, W]。
+ *
+ * 与 relu / pooling 一样是无参数静态层：不持有 updator，`init_weight` / `step` 为空实现
+ * （`complex_net_t::init_weight` / `step` 会对所有成员无条件调用它们），也没有 `reinit`
+ * （形状由 `set_param` 给），所以不占用 `complex_net_t::reinit` 的容器槽位。
+ *
+ * 注意：本层按「单样本一列」的约定工作（T == 1），这与 conv/pool 只认单张图一致；
+ * 多列批处理请走 `cache_updator_t` 的梯度累加，而不是把多个样本塞进一列。
+ */
+template <typename input_type>
+class flatten_net_t
+{
+public:
+    // 公开：允许该层位于 complex_net 链首（complex_net_t 从首个成员取 val_type）
+    using val_type = typename input_type::ele_type;
+private:
+    mat_t<val_type> m_input;    // forward 缓存，backward 用它还原形状
+    int m_rows = 0;             // 期望的输入形状 [rows, cols]
+    int m_cols = 0;
+
+public:
+    flatten_net_t() = default;
+
+    /** 显式指定输入特征图形状（不指定则按首次 forward 的输入懒初始化） */
+    void set_param(int const& rows, int const& cols)
+    {
+        m_rows = rows;
+        m_cols = cols;
+    }
+
+    template <typename Src>
+    mat_t<val_type> forward(Src&& input)
+    {
+        if (m_rows == 0 || m_cols == 0)
+        {
+            m_rows = input.row_num();
+            m_cols = input.col_num();
+        }
+        if (input.row_num() != m_rows || input.col_num() != m_cols)
+            throw std::invalid_argument("flatten_net_t::forward: input must be [rows, cols] of set_param");
+
+        detail::store_for_backward(m_input, std::forward<Src>(input));
+        mat_t<val_type> out(m_rows * m_cols, 1);
+        for (int i = 0; i < m_rows; ++i)
+            for (int j = 0; j < m_cols; ++j)
+                out(i * m_cols + j, 0) = m_input(i, j);     // 行优先展平，与 conv/pool 的布局一致
+        return out;
+    }
+
+    /** 无状态层：单列输入与整段 forward 相同 */
+    template <typename Src>
+    mat_t<val_type> forward_one(Src&& input)
+    {
+        return forward(std::forward<Src>(input));
+    }
+
+    template <typename other_type>
+    mat_t<val_type> backward(const other_type& delta)
+    {
+        if (delta.row_num() != m_rows * m_cols || delta.col_num() != 1)
+            throw std::runtime_error("flatten_net_t::backward: delta must be [rows*cols, 1]");
+        mat_t<val_type> out(m_rows, m_cols);
+        for (int i = 0; i < m_rows; ++i)
+            for (int j = 0; j < m_cols; ++j)
+                out(i, j) = delta(i * m_cols + j, 0);
+        return out;
+    }
+
+    std::string net_type(int const& indent = 0) const
+    {
+        std::stringstream ss;
+        ss << print_indent(indent) << "flatten_net_t:(" << m_rows << "x" << m_cols
+           << " -> " << m_rows * m_cols << "x1)";
+        return ss.str();
+    }
+
+    template<typename init_type>
+    void init_weight()
+    {
+        // 无权重
+    }
+
+    void step()
+    {
+        // 无权重
     }
 };
 

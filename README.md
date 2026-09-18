@@ -24,16 +24,16 @@ mat_t<float> s = q.t().dot(k);               // matrix product (CPU: BLAS / GPU:
 
 | Area | What's in it |
 | --- | --- |
-| Matrices & expressions | `mat_t` / `mat_view_t`; lazy expression trees, compile-time fusion, scalar operands, transposed views, zero-copy subviews |
+| Matrices & expressions | `mat_t` / `mat_view_t` / `mat_reshape_view_t`; lazy expression trees, compile-time fusion, scalar operands, transposed views, zero-copy subviews and shape views, zero-copy BLAS operands |
 | Operators | Arithmetic, comparisons, `exp` / `log` / `sqrt` / `sigmoid`, `dot`, row/column reductions, row-wise softmax, LayerNorm / RMSNorm |
-| Layers | Linear, LayerNorm / RMSNorm, SiLU / GELU / ReLU, SwiGLU gating, residual, Embedding, cross-entropy / MSE |
+| Layers | Linear, **RBM / DBN (contrastive divergence + static stacking)**, Conv2d (im2col + GEMM, full backward)**, **MaxPool2d / AvgPool2d (full backward)**, **Flatten**, **MeanPool（token 序列）**, **Dropout**, LayerNorm / RMSNorm, SiLU / GELU / ReLU, SwiGLU gating, residual, **Transformer encoder**, Embedding, cross-entropy / MSE |
 | Models | decoder-only base; **GPT-2** (absolute positions + `gelu_new` + tied lm_head); **LLaMA family** (RoPE + RMSNorm + SwiGLU + GQA/MQA); enc-dec stack |
-| Training | Backprop checked against numerical gradients; SGD / Adam / NAdam; gradient accumulation (`cache_updator_t`) |
+| Training | Backprop checked against numerical gradients; SGD / Adam / NAdam / **AdamW (decoupled weight decay)**; gradient accumulation (`cache_updator_t`); **cosine annealing with warm restarts** (`cosine_annealing_decay`) |
 | Inference | KV-cache prefill + per-token decoding; greedy / top-k / top-p sampling; streaming output |
-| Weights | Single-file `JASMINE_WEIGHTS_V1` format; direct export from HuggingFace (`tools/`); layer-by-layer / logits golden-value alignment |
+| Weights | Single-file `JASMINE_WEIGHTS_V1` format; **training-result serialization** (per-layer params + meta in one file, `save`/`load` round-trip); direct export from HuggingFace (`tools/`); layer-by-layer / logits golden-value alignment |
 | CUDA | Element-wise chains fused into a single kernel launch, cuBLAS GEMM, reductions, device-side KV cache / RoPE / MHA / a whole LLaMA, backwards and optimizers, **fused attention**, **bf16 / fp16 mixed precision** |
 
-**Status**: the host side passes `ctest` 178/178; the CUDA backend has 174 cases (compute-heavy cases
+**Status**: the host side passes `ctest` 258/258 (one case self-skips, see TESTING.md 15); the CUDA backend has 174 cases (compute-heavy cases
 are skipped by default). The CUDA backend is still being iterated on; target-machine vs test-machine
 differences are covered in [`CUDA.md`](CUDA.md), section 11.
 
@@ -196,8 +196,12 @@ jasmine/
 ├── jas_*.hpp              the library itself (header-only)
 │   ├── jas_mat_t.hpp          matrices and views
 │   ├── jas_mat_express_t.hpp  expression templates and operators
+│   ├── jas_mat_view_t.hpp    sub-views, transposes and zero-copy reshape views
 │   ├── jas_mat_gemm.hpp       GEMM (BLAS / blocked fallback)
 │   ├── jas_net_t.hpp          layer shell (weights + updater + cache)
+│   ├── jas_rbm_t.hpp          RBM + DBN (greedy CD pretraining, static stacking)
+│   ├── jas_conv_t.hpp         2-D convolution (im2col + GEMM, forward/backward)
+│   ├── jas_pool_t.hpp         2-D max / average pooling (forward/backward)
 │   ├── jas_mha_t.hpp          multi-head attention (RoPE, causal mask, KV cache)
 │   ├── jas_RoPE_t.hpp         rotary positional embeddings and the shared registry
 │   ├── jas_kv_cache_t.hpp     KV cache
@@ -217,6 +221,120 @@ jasmine/
 
 `main.cpp` / `makefile` / `run.sh` are early standalone entry points kept only for compatibility;
 use the CMake targets instead.
+
+### 4.1 MNIST 小玩具（卷积 + 编码器 + 序列化）
+
+### 4.2 MNIST + DBN（RBM 静态堆叠）
+
+`examples/mnist_dbn.cpp` 用 `dbn_net_t<2, upr_tpl>`（`jas_rbm_t.hpp`）把 2 个 RBM + 分类头 + CE
+静态堆叠成 DBN：逐层贪心 CD-k 预训练 → 监督微调 → 序列化。实测（2000 张训练、3 个预训练 epoch、
+3 个微调 epoch、1000 张测试）：
+
+```text
+[pretrain] 重建误差 0.380 -> 0.247（逐层 CD-1）
+[finetune] epoch 3 loss=0.112 test_acc=0.68
+```
+
+注意微调的梯度是「按 batch 求和」的，所以 `--ft-lr` 要比预训练 lr 小一个 batch 量级
+（默认 1e-3 时 test_acc 只有 0.09，降到 2e-4 才正常），这个坑记在 TESTING.md 第 15 节。
+
+### 4.3 MNIST 卷积小玩具
+
+`examples/mnist_conv.cpp` **用 `complex_net_builder_t` 把层静态堆叠成 `complex_net_t`**
+（`forward` / `backward` / `step` / `init_weight` 全部走链），并支持两种结构在同一份数据、
+超参、随机种子下对比：
+
+```text
+cnn2 = conv→relu→pool→conv→relu→pool→flatten→(fc→relu→fc)→ce      "标准 CNN"
+cnn1 = conv→relu→pool→flatten→(fc→relu→fc)→ce                    （卷积 + MLP encoder）
+trf  = conv→relu→pool→conv→relu→pool→(patch embedding)→Transformer encoder→mean pool→fc→ce
+       卷积 stem 与 cnn2 相同（两次下采样到 7x7），patch embedding 把每个空间位置投影成一个
+       token（16 通道 → d_model），Transformer encoder 用的是库里的 encoder_t（双向自注意力 +
+       LayerNorm + FFN + 残差，由 complex_net 堆成，RoPE 提供 token 顺序），
+       mean_pool 把 49 个 token 平均成分类头要的向量。
+
+# 两条结构各训 3 epoch 后对比（默认 arch=both）
+./build/examples/mnist_conv --data-dir build/mnist --epochs 3 --train-limit 6000 \
+    --batch 16 --lr 2e-3 --arch both --save build/mnist/cmp
+
+# 6000 张 × 3 epoch：CNN 系两变体
+arch          params  epochs  train_loss   train_acc    test_acc   seconds
+cnn2          105194       3    0.098669      0.9695      0.9724   120.618
+cnn1          202330       3    0.119815    0.962667       0.964   113.324
+test_acc 差值（cnn1 - cnn2）= -0.0084
+
+# 3000 张 × 6 epoch，固定 lr 1e-3、无 dropout
+arch          params  epochs  train_loss   train_acc    test_acc   seconds
+cnn2          105194       6    0.104656    0.969333      0.9535   73.53
+trf            21386       6     0.27073    0.921667       0.899  118.73
+test_acc 差值（trf - cnn2）= -0.0545
+
+# 同样的规模，改用余弦退火+热重启（--scheduler cosine）+ dropout 0.2
+arch          params  epochs  train_loss   train_acc    test_acc   seconds
+cnn2          105194       6    0.132647    0.959333      0.9705   66.86
+trf            21386       6     0.33591    0.899333      0.9165  110.03
+test_acc 差值（trf - cnn2）= -0.0540
+
+# 等容量（trf 放大到 3 层 d=64、CLS token，两者参数差 0.4%），1500 张 x 4 epoch
+arch          params  epochs  train_loss   train_acc    test_acc   seconds
+cnn2          105194       4    0.254249    0.917333       0.926   25.88
+trf           105642       4     1.12019    0.571333      0.6365  121.94
+test_acc 差值（trf - cnn2）= -0.2895
+
+# 等容量（自动求解 CNN 宽度），供手动跑
+--arch match            # 先算 trf 参数量，再把 cnn2 隐层裁到最接近该值的宽度
+
+# 等容量对比：--arch match 自动把 cnn2 的隐层裁到与 trf 参数量相当
+[conv2] params=21719   [trf] params=21386   （相差 1.6%，再跑同样的训练即可比"同容量")
+```
+
+读法：
+
+- **CNN 系内部**：两次下采样的 `cnn2` 用一半参数（10.5 万 vs 20.2 万）反而高 0.84 个点——
+  第二个卷积层带来的层级特征比把宽特征直接灌进全连接更划算；
+- **CNN vs Transformer**：把 token 数从 196 降到 49（第二次池化，自注意力开销降 16 倍）、卷积 stem
+  补成与 CNN 相同的两次卷积之后，Transformer 从 55.9% 提到 **89.9%**，差距缩到 5.5 个点，
+  而参数量只有 CNN 的 1/5（21.4k vs 105.2k）——**按参数算它反而更省**。代价是每 epoch 慢 1.6 倍。
+- **训练工具**：训练循环接上了库自带的 `cosine_annealing_decay`（余弦退火 + 热重启，按 mini-batch
+  步推进，总步数的一半作为第一个周期 → 中途恰好一次热重启），并加了 `dropout_net_t`（inverted
+  dropout，评估时显式关闭）。两者一起让 cnn2 95.35% → **97.05%**、trf 89.9% → **91.65%**
+  （各涨约 1.7 个点），日志里能看到 `cycle 0 → 1` 的重启点以及重启后精度的跳升。
+- **等容量对比（0.4% 参数差）**：把 trf 放大到 3 层 d=64 + CLS token（105,642 参数）后，
+  在 1500 张 × 4 epoch 上它反而更差（63.7% vs 92.6%）——**不是容量不够，是数据不够**：
+  它的 train_acc 只有 0.57、loss 还有 1.12，连训练集都没拟合上。对比上一行（21k 参数、
+  3000 张 × 6 epoch 拿到 91.65%）可以看出：在这个数据量级，给小 Transformer 加容量只会更难训。
+  要给它公平的机会需要 ≥20~30k 样本、10+ epoch（本机约 30~60 分钟）。
+- 已具备的其它工具：`--weight-decay`（AdamW 解耦衰减）、`--dropout`、`--scheduler cosine|fixed`、
+  `--hidden`、`--arch match`（自动等容量）、`--save/--load`（含 CLS 向量与元信息）。
+
+按样本前向/反向、用 `cache_updator_t` 做 mini-batch 梯度累加，训练完把权重与元信息写进一个
+`JASMINE_WEIGHTS_V1` 文件，再 `--load` 回来验证往返一致：
+
+```bash
+# 真实 MNIST（IDX 文件未压缩；放到 build/mnist/）
+mkdir -p build/mnist && cd build/mnist
+for f in train-images-idx3-ubyte train-labels-idx1-ubyte \
+         t10k-images-idx3-ubyte t10k-labels-idx1-ubyte; do
+  curl -sSLO "https://ossci-datasets.s3.amazonaws.com/mnist/$f.gz" && gunzip -f "$f.gz"
+done
+cd ../..
+
+./build/examples/mnist_conv --data-dir build/mnist --epochs 3 --train-limit 6000 \
+    --batch 16 --lr 2e-3 --save build/mnist/model.jas
+# -> [epoch 3] train_loss=0.0987 train_acc=0.9695 test_acc=0.9615
+# -> [check] OK: 保存/载入往返一致
+./build/examples/mnist_conv --data-dir build/mnist --load build/mnist/model.jas --epochs 0
+
+# 没有数据/没有网络时：内置合成数字图案，整条链路照样跑通
+./build/examples/mnist_conv --synthetic --epochs 2 --train-limit 500 --test-limit 200
+```
+
+实测（本机、参考 BLAS、单线程）：训练集 60000 张里随机抽 6000 张、3 个 epoch 约 85~115 秒，
+在**完整 10000 张测试集**上达到 **96.2%（seed 1234）/ 97.5%（seed 7）**；训练与测试用的是
+官方 IDX 划分的两个文件（按图像内容比对，两集仅 1 张重复，属 MNIST 自身的已知瑕疵）。
+保存/载入后的预测与保存前完全一致。序列化的读写接口是 `jas_weight_io.hpp` 里已有的
+`weight_writer_t` / `weight_file_t`，本轮补上了按层命名的黏合层（`add_layer_params` /
+`read_layer_params`）与标量元信息（`add_scalar`）。
 
 ---
 

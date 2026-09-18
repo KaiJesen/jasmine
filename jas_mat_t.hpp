@@ -13,7 +13,32 @@
 namespace jasmine {
 
 template<typename val_type>
-class mat_view_t;           // 这里先声明，因为后面要用到这个来声明转置函数
+class mat_view_t;               // 这里先声明，因为后面要用到这个来声明转置函数
+template<typename agent_type>
+class mat_reshape_view_t;       // 形状视图：同一段存储换个 (rows, cols)，不拷贝
+
+namespace detail {
+
+/**
+ * GEMM 操作数描述符：把「一段连续存储 + 前导维 + 是否转置」告诉 GEMM。
+ *
+ * 有它之后，`mat_t` / `mat_view_t` / `mat_reshape_view_t` 都可以零拷贝进 BLAS：
+ *   - transposed == false：ptr 指向行优先存储，每行 l d个元素（ld >= 逻辑列数）
+ *   - transposed == true ：逻辑矩阵是「存储矩阵」的转置，存储矩阵是 (逻辑列数 x 逻辑行数)
+ *                          行优先，每行 ld 个元素（要求 ld >= 逻辑行数）
+ * 给不出合法描述的（列优先存储、嵌套转置视图等）返回 valid == false，GEMM 退回物化。
+ */
+template <typename val_type>
+struct gemm_buffer
+{
+    using ele_type = val_type;
+    const val_type* ptr = nullptr;
+    int ld = 0;
+    bool transposed = false;
+    bool valid = false;
+};
+
+} // namespace detail
 
 template <typename val_type>
 requires std::is_arithmetic_v<val_type>
@@ -264,6 +289,18 @@ public:
         return m_row_first;
     }
 
+    /**
+     * 存储是否与自身形状一样紧凑（没有跨步空洞）。
+     * mat_t 本来就是一块紧凑数组，恒为 true；视图才可能是跨步的。
+     * reshape 视图按下标线性展平，只有紧凑的矩阵/视图才能安全地重解释形状。
+     */
+    JAS_HD bool densely_packed() const noexcept
+    {
+        return true;
+    }
+
+    /** mat_t 的 reshape_view 定义在 jas_mat_view_t.hpp（那里才有视图类型） */
+
     JAS_HD val_type* data() noexcept
     {
         return m_data;
@@ -358,7 +395,27 @@ public:
         return m_data != nullptr;
     }
 
+    /**
+     * GEMM 操作数描述符：行优先存储直接给出 (data, col_num, 不转置)。
+     * 列优先存储给不出（GEMM 的快路径只认行优先），返回 invalid 让调用方退回物化。
+     */
+    detail::gemm_buffer<val_type> gemm_view() const noexcept
+    {
+        if (!m_row_first || m_data == nullptr)
+            return {};
+        return {m_data, col_num(), false, true};
+    }
+
     mat_view_t<mat_t<val_type>> t() noexcept;
+    /**
+     * 形状视图：把同一段存储按 (rows, cols) 重新解释，不拷贝（rows*cols 必须等于元素总数）。
+     *
+     * 视图持有本矩阵的**引用**，所以只允许对左值调用：`mat_t(...).reshape_view(..)` 这种
+     * 「从临时量取视图」在整表达式结束时源矩阵就析构了，视图会悬垂。右值重载直接 delete，
+     * 把这类写法挡在编译期（与 TESTING.md 第 9 节的值类别契约同一套思路）。
+     */
+    mat_reshape_view_t<mat_t<val_type>> reshape_view(int const& rows, int const& cols) &;
+    mat_reshape_view_t<mat_t<val_type>> reshape_view(int const& rows, int const& cols) && = delete;
     mat_view_t<mat_t<val_type>> view(int const& row_offset = 0, int const& col_offset = 0, int const& row_size = -1, int const& col_size = -1) noexcept;
     mat_view_t<const mat_t<val_type>> view(int const& row_offset = 0, int const& col_offset = 0, int const& row_size = -1, int const& col_size = -1) const noexcept;
     mat_view_t<mat_t<val_type>> col(int const& col_num) noexcept;

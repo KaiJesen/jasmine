@@ -1024,6 +1024,22 @@ auto mat_view_t<val_type>::dot(other_type&& m) const &&
     return jasmine::dot(std::move(*this), std::forward<other_type>(m));
 }
 
+template <typename agent_type>
+template<typename other_type>
+requires is_matrix<other_type>
+auto mat_reshape_view_t<agent_type>::dot(other_type&& m) const &
+{
+    return jasmine::dot(*this, std::forward<other_type>(m));
+}
+
+template <typename agent_type>
+template<typename other_type>
+requires is_matrix<other_type>
+auto mat_reshape_view_t<agent_type>::dot(other_type&& m) const &&
+{
+    return jasmine::dot(std::move(*this), std::forward<other_type>(m));
+}
+
 template<typename val_type>
 requires is_matrix<val_type>
 auto sqrt(val_type const& val)

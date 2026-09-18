@@ -1011,3 +1011,981 @@ for i in $(seq 1 60); do ./build/tests/unit_tests --gtest_filter='RoPeCacheThrea
 | `tests/test_llama_weights.cpp` | `LlamaStructure.ReservedRopeCacheKeepsOutputIdenticalAndFailsFast`：预留后的数值必须与惰性填充**逐位一致** |
 | `jas_mha_t.hpp` | 各头并发调用 `m_rope->forward_at()`；`reserve_rope_cache()` 在这里切换模式并预留 |
 | `examples/llama_chat.cpp` | 推理路径唯一的调用点（`reserve_kv_cache` 旁边） |
+
+## 11. 二维卷积（`conv2d_net_t`）：im2col 与「两条 GEMM」的反向
+
+仓库里原先没有任何卷积层的影子，这一节记录新增的 `jas_conv_t.hpp` 为什么长这样，
+以及两个必须知道的坑。
+
+### 为什么是 im2col，而不是写一个卷积核
+
+jasmine 的数据载体只有 2 维的 `mat_t`，没有 NCHW/NHWC 张量，也没有 `im2col` 之外的第三个选择。
+把卷积的感受野摊平成列之后，整层退化成一件仓库里早就优化过的事：
+
+```text
+输入 x   : [C_in,  H * W]            通道先行，空间维展平在列上
+卷积核 W : [C_out, C_in * Kh * Kw]   每个输出通道一行，行内按 (c, kh, kw) 展平
+偏置 b   : [C_out, 1]                广播到所有输出位置
+输出 y   : [C_out, H_out * W_out]
+```
+
+这**就是 `weight_net_t` 的形状约定**（权重 `[out, in]`、输入 `[in, T]`），只是把 "in" 换成了
+`C_in*Kh*Kw`、把 "T" 换成了 `H_out*W_out`。于是：
+
+```text
+forward : y   = W · col + b                      一次 GEMM（大尺寸自动走 BLAS）
+backward: dW  = delta · colᵀ                     第二条 GEMM
+          dcol= Wᵀ · delta                       第三条 GEMM
+          dx  = col2im(dcol)                     散射累加
+          db  = Σ_{输出位置} delta
+```
+
+卷积的复杂度全部收敛在 `im2col` / `col2im` 这对循环里，矩阵乘一行没重写。反向的三份梯度
+（输入 / 权重 / 偏置）都在 `backward` 里算完，权重与偏置直接经 updator 原地更新，与
+`weight_net_t::backward` 的语义一致。
+
+一维卷积（序列卷积）不做单独分支：取 `H = 1, Kh = 1, pad_h = 0`，把长度 L 的序列当作
+`[C_in, 1*L]` 喂进来即可，形状检查与反向逻辑都不需要分叉。这一串参数有便捷写法，
+它返回的仍是同一个类的实例，**不是第二套实现**：
+
+```cpp
+using conv_t = conv2d_net_t<mat_t<double>, sgd_t>;
+auto conv = conv_t::one_d(c_in, c_out, /*len=*/L, /*k=*/3, /*stride=*/2, /*pad=*/1);
+auto y = conv.forward(x);        // x: [C_in, L]  →  y: [C_out, L_out]
+```
+
+### 形状从哪来：`set_param`，而不是 `reinit`
+
+`[C_in, H*W]` 反推不出 `H` 与 `W`（两者可互换），核大小更没法从输入推断，所以本层的形状由
+`set_param(...)` 显式配置，构造函数只是它的一层转发。
+
+**刻意不叫 `reinit`**：`is_reinitable_net` 靠 `requires { net.reinit(std::vector<int>()); }`
+判定（见 `jas_mat_concepts.hpp`），给了 `reinit` 就会改变所有含本层的复杂网络的 reinit 语义
+（容器会要求多一对 `{in, out}` 槽位）。这与 `layer_norm_net_t` 用 `set_param` 的理由完全相同，
+所以本层在 `complex_net_t::reinit` 里是**被跳过**的一层：
+
+```cpp
+using conv_relu_t = complex_net_builder_t<double>
+    ::push_back_updatable<conv2d_net_t, sgd_t>
+    ::push_back_staticnet<relu_net_t>
+    ::type;
+
+conv_relu_t net;                                  // 默认构造：此时权重还是空的
+net.get<0>().set_param(2, 3, 3, 3, 2, 2);         // 显式配置 + 分配权重/偏置
+net.get<0>().init_weight<he_gaussian_t>();        // 再填充
+```
+
+### 坑一：`mat_t::reshape(1, 1)` 在空矩阵上会除零
+
+`C_out == 1` 时偏置是 1x1，而 `mat_t` 把 1x1 一律当作**标量矩阵**。`reshape(1,1)` 一旦走进
+标量分支，会先执行 `(*this)(0, 0)` 去取旧值——而 `mat_t::operator()` 内部是
+`r % row_num()`，对默认构造的 0x0 空矩阵就是 `0 % 0`。这不是「抛异常」，是直接 SIGFPE。
+
+所以本层所有「分配新形状」的位置一律写成**整体赋值一份新矩阵**：
+
+```cpp
+m_weight = mat_t<val_type>(c_out, c_in * kh * kw);   // 而不是 reshape(...)
+m_bias   = mat_t<val_type>(c_out, 1);
+m_col    = mat_t<val_type>(c_in * kh * kw, h_out * w_out);
+```
+
+`col2im` 里的 `dx` 同理（`BackwardAccumulatesOverlappingPatches` 与 `DegenerateShapesStillWork`
+两例就是钉这个：后者是 1 通道 + 1x1 输入 + 1x1 核，权重/偏置/im2col 全是标量）。
+
+### 坑二：除零发生在校验之前
+
+输出尺寸公式里有 `... / stride`。若先算尺寸再校验，`stride == 0` 会先在整数除法上崩掉，
+根本轮不到 `throw`。所以 `set_param` 的顺序被固定为：
+
+1. `validate_basic(...)` —— 通道/空间/核/stride/dilation/padding 的**不依赖尺寸**的检查；
+2. 再算 `H_out / W_out`；
+3. 再检查 `H_out/W_out >= 1`（核比 padded 输入还大的情形）；
+4. 最后才写入成员，抛出时对象保持原状。
+
+### 坑三：`W.dot(col) + b` 会把整次 GEMM 踢出快速路径（已修）
+
+写这段时用探针量出来的一件事，比 im2col 的拷贝本身重要得多：
+
+```cpp
+return m_weight.dot(m_col) + m_bias;      // 慢
+```
+
+`mat_add_t` 继承的是 `mat_express_2_param_stable_t::clone()`，它是**逐元素**求值的：
+对每个 `(i,j)` 调一次 `mat_dot_t::operator()`，而后者是「自己扫一遍 K」的朴素循环。
+于是 `dot` 外包一层 `+` 之后，`try_fast_gemm` / BLAS **根本不会被调用**。实测
+（M=64, N=1024, K=288, 37.8 MFLOP, 20 次平均）：
+
+| 写法 | 耗时 |
+|------|------|
+| `W.dot(col) + b`（表达式） | ~100 ms |
+| `W.dot(col)`（裸 dot，走 BLAS） | 7.4 ms |
+| `mat_t y = W.dot(col); y += b;` | 7.2 ms |
+| `conv2d_net_t::forward`（im2col + 上式的两步写法） | 8.8 ms |
+
+拆成两句后快了 **约 12 倍**：`+=` 是纯逐元素 O(M·N) 的广播加，不碰 GEMM。
+所以本层前向固定写成「先裸 dot、再 `+=` 偏置」，并在 `forward` 里留了注释。
+
+**同一个坑还在 `jas_net_t.hpp:52` 的 `weight_net_t::forward`**——那是全仓库所有线性层
+（QKV/输出投影、FFN、lm_head……）的必经之路，也就是说它们现在都在走朴素三重循环。
+改法与这里完全相同（拆成两句），但它会改变全局数值路径（BLAS 的求和顺序与朴素循环不同，
+量级 1e-15），所以**没有在这次卷积改动里顺手改**：那属于独立的性能改动，
+要连同它对 GPT-2 / LLaMA 对齐测试的影响一起评估。对齐测试的容差是 1e-9（float64），
+理论上足以吸收这个量级，但这是一个需要单独决策的库级变更。
+
+### 顺手验证过的：im2col 能不能做成「不拷贝的懒视图」
+
+顺便回答一个自然的设计问题——既然 `dot` 认的只是 `row_num()/col_num()/operator()(i,j)`
+（见 `jas_mat_concepts.hpp` 的 `is_matrix`），那能不能写一个懒 im2col 视图，把索引计算放在
+`operator()` 里，从而完全不拷贝？（探针里真写了一个 `im2col_view_t`：`static_assert(is_matrix<...>)`
+通过，数值与物化版逐位相同，`max|Δ| = 0`。）
+
+结论是**在这个代码库里不行**，原因是拷贝并没有被消除，只是被搬进了 GEMM：
+
+- `mat_dot_t::clone()` 会走 `try_fast_gemm` → `gemm_operand`，后者只对「行优先的 `mat_t`」直接取
+  `data()` 指针；**任何其它类型（视图、表达式、懒视图）都会被物化成一个临时行优先矩阵**再交给 BLAS。
+  所以懒视图只是把 im2col 的拷贝挪到了 `gemm_operand::owned` 里。
+- 在朴素路径（尺寸小于 BLAS 阈值、或外面又套了表达式）里更糟：`operator()(k, j)` 的索引算术
+  会被**重复 M 次**（每个输出通道读同一列元素一次），而物化版本只算一遍。
+
+实测（C_in=32, C_out=64, H=W=32, 20 次平均，`lazy` 指上面那个懒视图）：
+
+| 核 | im2col 拷贝 | 物化: 裸 dot | 懒视图: 裸 dot | col / input |
+|----|------------|--------------|----------------|-------------|
+| 1x1 | 0.23 ms | 0.72 ms | 1.09 ms | 1x |
+| 3x3 | 1.75 ms | 7.5 ms | 9.5 ms | 9x |
+| 5x5 | 4.4 ms | 19.7 ms | 28.7 ms | 25x |
+| 7x7 | 8.5 ms | 46.9 ms | 59.6 ms | 49x |
+| 11x11（28x28 输入） | 15.5 ms | 56.7 ms | 82.1 ms | 121x |
+
+也就是说：拷贝是 O(K·N)，GEMM 是 O(M·K·N)，拷贝被摊薄了 1/M；而且它把「带除法取模的
+跨步收集」变成了连续、可被 BLAS 按块复用的数据。**物化 im2col 的拷贝在这个设计里是划算的。**
+
+懒视图真正能省的是**内存**（col 是输入的 Kh·Kw 倍，11x11 时 121 倍），以及在自己写
+implicit GEMM / 直接卷积时才谈得上省时间——那要求 GEMM 能直接吃「收集式操作数」，
+而不是先物化再乘。设备端同理：cuBLAS 只认指针 + leading dimension，懒视图在那里无从发挥，
+要省只能在 kernel 里做 implicit GEMM。所以这次维持「物化 col 并缓存给反向复用」的方案。
+
+### 单测
+
+`tests/test_conv.cpp`（14 例，`Conv2d.*`）：
+
+| 用例 | 钉住什么 |
+|------|----------|
+| `ForwardMatchesReference` | 朴素六重循环参考实现逐点对拍；覆盖 stride / padding / dilation / 非方输入 / 非方核，含会走 BLAS 的大尺寸 |
+| `OneByOneIsChannelMix` | 1x1 核必须退化成 `W·x`（与 `weight_net_t` 同形） |
+| `Conv1dIsOneRowSpecialCase` | `H=1, Kh=1` 的一维卷积与参考实现一致 |
+| `BackwardMatchesNumericalGradient` | 输入 / 权重 / 偏置三份梯度都做中心差分对拍（SGD lr=1 直接读出梯度） |
+| `BackwardAccumulatesOverlappingPatches` | 重叠窗口必须**累加**而非覆盖：全 1 权重下的解析梯度恰好是「四角 1 / 边 2 / 中心 4」 |
+| `DegenerateShapesStillWork` | 1 通道 1x1 卷积的标量路径（上面那个 `% 0` 坑）不崩且梯度正确 |
+| `BackwardOnTwelveByTwelveHitsGemmFastPath` | BLAS/分块 GEMM 路径与朴素参考反向逐点一致 |
+| `RejectsBadShapes` / `UnconfiguredLayerFailsFast` / `SetParamRejectsInvalidConfig` | 输入形状、delta 形状、未配置、非法配置的快速失败 |
+| `InitWeightFillsConfiguredShapes` | `init_weight<he_gaussian_t>()` 分配形状正确且非零 |
+| `IsUpdatableButNotReinitDetectedByConcept` | `is_updatable_net` 为真、`is_reinitable_net` 为假（即不占用 reinit 槽位） |
+| `ChainInsideComplexNet` | 作为 `complex_net_t` 的一层跑 forward / backward / step |
+| `NetTypeReportsShapes` | `net_type()` 打印输入/输出/核/步长等结构信息 |
+
+### 相关文件（卷积）
+
+| 文件 | 作用 |
+|------|------|
+| `jas_conv_t.hpp` | `conv2d_net_t`：`set_param` + im2col 前向 + 三条 GEMM 反向 + `col2im` |
+| `tests/test_conv.cpp` | `Conv2d.*`：前向参考对拍 / 数值梯度 / 退化形状 / 概念与链路集成 |
+| `jas_net_t.hpp` | 形状约定与反向语义参照物（`weight_net_t`） |
+| `jas_mat_gemm.hpp` | 前向与反向实际走的 GEMM（BLAS / 分块回退） |
+
+补一条**外部裁判**：除了单测里的朴素参考实现，卷积层还与 PyTorch 做过随机对撞——77 组随机配置
+（`C_in/C_out`、非方输入、1..3 的核、1..3 的步长、0..2 的 padding、1..2 的 dilation）下，
+前向 `y` 与三份梯度 `∂L/∂x / ∂L/∂W / ∂L/∂b` 与 `F.conv2d` 的最大偏差 ≤ `6.7e-15`（float64 舍入量级）。
+工具在 `/tmp` 下临时搭建（`jas_conv_t.hpp` + `F.conv2d` 读同一批数据），不入库。
+
+## 12. 二维池化（`pool2d_net_t`）：无参静态层与 argmax 路由
+
+卷积之后紧接着的是池化。这一节记录 `jas_pool_t.hpp` 的取舍，以及它和 PyTorch 对齐的四条语义。
+
+### 一个类，两种模式
+
+```cpp
+enum class pool_mode { max, average };
+```
+
+最大池化与平均池化的**窗口遍历完全相同**，差异只在「窗口内怎么算」和「梯度怎么回」上，
+所以做成一个类 + 运行期枚举，而不是两个高度重复的类（对照 GQA：那是把 `n_kv_heads` 参数化，
+而不是新写一个注意力核）。运行期参数还让「默认构造 + `set_param`」的构建器模式照旧可用。
+
+**池化没有可训练参数**，而且逐通道独立，所以本层是**静态层**：
+
+- 与 `relu_net_t` / `gelu_net_t` 一样只吃 `input_type`，不持有 updator；
+- 因此 `is_updatable_net` 为假，链上的 `set_updator` / `set_lr` 会自动跳过它；
+- 形状来自 `set_param` 而不是 `reinit`，所以 `complex_net_t::reinit` 也不占槽位
+  （`is_reinitable_net` 同样为假，单测里用 `static_assert` 钉住）；
+- `init_weight<init_type>()` / `step()` 是空实现——但**必须存在**，因为
+  `complex_net_t::init_weight` / `step` 会对所有成员无条件调用它们。
+
+### 与 PyTorch 对齐的四条语义
+
+| 语义 | 取值 | 为什么 |
+|------|------|--------|
+| 并列最大值 | **梯度只给第一个**（行优先） | PyTorch CPU 如此：`x=[[1,1],[1,1]]`、`max_pool2d(2)` 的 grad 是 `[1,0,0,0]`，不是 `[0.25,...]`。实现上就是 `if (v > best)` 的严格大于 |
+| 平均池化除数 | 默认 `count_include_pad = true`，恒为 `Kh*Kw` | `nn.AvgPool2d` 的默认行为：padding 的 0 也进分母。置 false 才除以窗口内有效元素个数 |
+| padding 上限 | `2*pad <= kernel` | PyTorch 的 "pad should be at most half of effective kernel size"。它同时保证每个窗口至少覆盖一个真实元素，于是最大池化不会遇到「整窗 -inf」、平均池化也不会除以 0 |
+| stride 缺省 | `0` 作哨兵，表示「同核大小」 | PyTorch `MaxPool2d(2)` 就是 `stride=2`。0 在别处不是合法步长，拿它当哨兵不会歧义 |
+
+输出尺寸与卷积同式（floor 模式）：`H_out = (H + 2*pad - Kh) / stride + 1`。
+floor 语义下最后一个不满窗会被丢掉，例如长度 7、核 2、步长 2 出 3 个输出（末元素被丢弃）——
+这一点也在单测里钉了。
+
+为什么先不做 dilation / ceil_mode：平均池化在 PyTorch 里根本没有 dilation；`ceil_mode` 会引入
+「最后一个窗口算不算满」的规则并与 `count_include_pad` 交织（PyTorch 在 ceil 模式下还要额外修正
+分母），先把最常用的 floor + 整数核做扎实。
+
+### 反向：一个 argmax 表，或一个位置函数
+
+```text
+max    : forward 记下每个输出元素的 argmax（展平输入下标）→ backward 把 delta 原路送回那个位置
+average: 除数是位置函数（Kh*Kw 或窗口内有效元素个数）→ backward 把 delta/除数 散射累加到窗口内每个有效位置
+```
+
+- argmax 存的是 `std::vector<int>` 而不是浮点矩阵：大图上 `H*W` 超过 2^24 之后 `float` 存不下
+  整数下标，而这里本来也不需要浮点。
+- 重叠窗口（stride < kernel）在两种模式下都必须**累加**：最大池化的同一个像素可能同时是多个窗口
+  的最大值，平均池化更是每个输出都往窗口内每个像素各贡献一份。单测用全 1 输入 + 全 1 delta 把
+  梯度钉成「覆盖次数」与「覆盖次数/4」的解析值。
+- 平均池化的除数反向现算而不缓存：它是 `(oh, ow)` 的纯函数，forward/backward 算出来必然相同。
+
+### 踩到的一个编译坑：文档注释里不能写 `/*name=*/`
+
+`jas_pool_t.hpp` 里给 `one_d` 写的 `/** ... */` 文档注释中原本有一行
+
+```text
+ *     auto pool = pool_t::one_d(pool_mode::max, L, /*kernel=*/2);
+```
+
+行内的 `/*kernel=*/` 里的 `*/` **会提前终止外层块注释**，后面的文字变成代码，报一串
+"expected unqualified-id" 与 "one_d is not a member"。正确写法是把行内说明去掉或改用 `//`。
+代码里（非注释内）的 `/*h=*/1` 这种参数标注是没问题的，只有嵌在块注释里才出事。
+
+### 单测与外部对撞
+
+`tests/test_pool.cpp`（15 例，`Pool2d.*`）：
+
+| 用例 | 钉住什么 |
+|------|----------|
+| `MaxForwardMatchesReference` / `AverageForwardMatchesReference` | 朴素参考实现逐点对拍；覆盖重叠/不重叠、padding、非方核、非方输入、多通道、1x1 池化 |
+| `MatchesPyTorchMaxGoldens` / `MatchesPyTorchAverageGoldens` | 硬编码 torch 2.9 的 `F.max_pool2d` / `F.avg_pool2d` 输出与梯度（含 `count_include_pad` 两种、非方核、多通道） |
+| `MaxTieRoutesWholeGradientToFirstIndex` | 并列最大值只给第一个（全并列与部分并列两种） |
+| `AverageOverlappingWindowsAccumulate` | 重叠窗口必须累加：全 1 输入下梯度 = 覆盖次数/4 |
+| `BackwardMatchesNumericalGradient` | 最大池化（互异值避开不可导点）与平均池化（含/不含 padding）都做中心差分对拍 |
+| `StrideDefaultsToKernelSize` | `stride=0` 哨兵解析为核大小 |
+| `OneDIsOneRowSpecialCase` | `one_d` 一维池化与参考实现一致，且 H/Kh/H_out 确实被置为 1 |
+| `RejectsBadShapes` / `UnconfiguredLayerFailsFast` / `SetParamRejectsInvalidConfig` | 输入/delta 形状、未配置、非法配置（核 0、负步长、负 pad、pad 超半核、核比 padded 输入还大）快速失败 |
+| `IsStaticLayerNotUpdatableNorReinit` | `is_updatable_net` / `is_reinitable_net` 均为假 |
+| `ChainInsideComplexNet` | conv → relu → maxpool 整条链 forward / backward / step |
+| `NetTypeReportsConfig` | `net_type()` 打印模式、形状、核、步长、padding（仅 average 打印 `count_include_pad`） |
+
+另外与 PyTorch 做了随机对撞：108 组随机配置（两种模式、2..9 的输入、1..4 的核、0..3 的步长、
+`pad <= kernel/2` 的全部组合、1..3 通道、随机 delta）下，前向 `y` 与反向 `∂L/∂x` 与
+`F.max_pool2d` / `F.avg_pool2d` 的**最大偏差为 0**（逐位一致）。
+
+### 相关文件（池化）
+
+| 文件 | 作用 |
+|------|------|
+| `jas_pool_t.hpp` | `pool_mode` + `pool2d_net_t`：窗口遍历、argmax 路由、平均池化除数、`one_d` 便捷入口 |
+| `tests/test_pool.cpp` | `Pool2d.*`：前向参考 / PyTorch golden / 数值梯度 / 并列与重叠语义 / 概念与链路集成 |
+| `jas_net_t.hpp` | 静态层（`relu_net_t`）的接口参照物：`init_weight` / `step` 空实现 |
+| `jas_conv_t.hpp` | 形状约定（`[C, H*W]`）与 `one_d` 风格的同源实现 |
+
+## 13. 形状视图（`mat_reshape_view_t`）与「视图操作数零拷贝进 GEMM」
+
+前面第 11 节留下的两个缺口——「reshape 只能重建矩阵、不能改形状」和「懒 im2col 视图最终仍被
+`gemm_operand` 物化」——在这一节一起补掉。
+
+### `mat_reshape_view_t`：只改参数、不碰数据
+
+```cpp
+mat_t<double> x(1, 12);            // 一行 12 个数
+auto patches = x.reshape_view(4, 3);   // (4 x 3)，零拷贝；patches(i,j) 就是 x(0, i*3+j)
+auto col     = patches.t();            // (3 x 4) 转置视图，仍然零拷贝
+```
+
+语义要点（都有单测钉住）：
+
+- `rows*cols` 必须等于元素总数，否则构造抛 `std::invalid_argument`；
+- **别名**而不是副本：通过视图写入会直接改到底层（反之亦然），单测两个方向都验；
+- 索引按**与底层相同的存储顺序**解释：底层行优先时 `view(i,j)` 是展平后的第 `i*cols+j` 个元素，
+  底层列优先时是第 `j*rows+i` 个（等价于 numpy 的 `order='C'/'F'`），所以列优先存储也不会读错；
+- `t()` 返回带转置标志的同类视图，依然零拷贝。
+
+注意它和 `mat_view_t` 的分工：`mat_view_t` 是**取子区域**（子块/行/列/转置），
+`mat_reshape_view_t` 是**换形状**（元素一一对应）。两者都不拷贝。
+
+顺带说明：`mat_t::reshape(rows, cols)` 的行为没有改。它在元素总数相同时**什么都不做**
+（既不重建也不更新维度，`jas_mat_t.hpp` 里只有 `rows*cols != row_num()*col_num()` 才重建），
+在总数不同时会**重新分配并清零**。要"改形状但不拷贝"请用 `reshape_view()`。
+
+### 让 GEMM 接受「指针 + 前导维 + 是否转置」
+
+原来的 `gemm_operand` 只认行优先的 `mat_t`：任何其它类型（子视图、转置视图、懒视图）都被
+物化成一块临时行优先矩阵再交给 BLAS。现在改成先向操作数索要描述符：
+
+```cpp
+detail::gemm_buffer<T> { const T* ptr; int ld; bool transposed; bool valid; };
+```
+
+`mat_t` / `mat_view_t` / `mat_reshape_view_t` 都能给出它（`mat_t::gemm_view()`、
+`mat_view_t::gemm_view()`、`mat_reshape_view_t::gemm_view()`），给不出（列优先存储、嵌套转置、
+元素类型不同）就退回物化——也就是原来的唯一路径。BLAS 侧用 `CblasTrans` 表达，
+自带阻塞回退也加了 `TA/TB` 模板分支（`gemm_blocked_rowmajor_impl<TA,TB>`），两条路径都与朴素乘法
+逐位一致（`tests/test_reshape_view.cpp` 里有断言描述符被真正给出的用例，避免"测试通过但其实在物化"）。
+
+### 一个必须记住的坑：转置左操作数会慢 5 倍
+
+量出来的，不是猜的。同样一批数据、同一套编译标志，只差操作数是视图还是物化矩阵
+（`dW = delta(64x1024) · col(288x1024)^T`、`dcol = W(64x288)^T · delta(64x1024)`，本机参考 BLAS）：
+
+| 位置 | 视图（零拷贝 + CblasTrans） | 物化后再 GEMM | 结论 |
+|------|---------------------------|--------------|------|
+| **右操作数** B | 1.53 ms | 1.66 ms | 零拷贝更快（还省一份拷贝） |
+| **左操作数** A | 8.04 ms | 1.63 ms | **慢 5 倍**，必须物化 |
+
+原因是参考 BLAS 的 `TransA` 走内积配方（按列读 A，stride = lda），而 `TransB` 的存储矩阵是
+`(N x K)` 行优先、K 方向仍顺序访问。所以 `gemm_operand` 只对**右操作数**开 `allow_transposed`
+（`jas_mat_gemm.hpp` 里写了这张表）；左操作数的转置视图仍然物化，`W^T·delta` 这类反向 GEMM
+行为与改动前一致。换成 OpenBLAS/MKL 这条结论可能变，改策略前请重新量。
+
+### 收益（本轮实测）
+
+| 场景 | 改动前 | 改动后 | 说明 |
+|------|--------|--------|------|
+| patchify / 非重叠一维卷积：`W · x.reshape_view(n,t)^T` | 物化 col + GEMM 3.85 ms | 2.11 ms | **1.8x**，且不再需要 `t*n` 的临时矩阵 |
+| 同上，t=9 的窗口 | 3.02 ms | 2.10 ms | **1.4x** |
+| 卷积反向里的 `delta·col^T` | 1.66 ms | 1.53 ms | 1.09x（省掉 288x1024 的转置拷贝） |
+| `conv2d_net_t::backward` 整层（-O2，与改动前同标志） | 19.35 ms | 16.5~17.1 ms | ~1.15x |
+
+另外顺带修掉一个隐患：`mat_dot_t::clone()` 的快速路径现在会在**操作数层面**判断能否零拷贝，
+所以「视图参与 dot」不再无声地退化成"每次调用都物化一次"。
+
+### 单测
+
+`tests/test_reshape_view.cpp`（9 例，`ReshapeView.*`）：
+
+| 用例 | 钉住什么 |
+|------|----------|
+| `ReinterpretsShapeWithoutCopying` | (2x6)→(3x4) 的元素对应关系（按展平下标逐点验） |
+| `WritesAliasBothWays` | 通过视图写 ⟹ 底层可见；写底层 ⟹ 视图可见 |
+| `TransposeIsAlsoAView` | `t()` 的数值与写穿 |
+| `SizeMismatchThrows` / `ColumnMajorBaseKeepsStorageOrder` | 元素总数校验；列优先底层按列优先展平 |
+| `GemmDescriptorIsExposedForRowMajorStorage` | 描述符的 ptr/ld/transposed 正确（含子视图偏移、列优先给不出） |
+| `TransposedOperandsMatchNaive` | 转置左/右/双侧操作数、子视图转置与朴素乘法逐点一致 |
+| `ReshapeOperandMatchesNaive` | reshape 视图参与 dot；1xL 切成 (n,t) 再转置 = patchify 的窗口矩阵 |
+| `ViewOperandIsNotModified` | 零拷贝只读：算完源矩阵原样不动 |
+
+### 13.1 补记：把「按行做一维分解」这条路走通并量清楚
+
+有人在设计讨论里提出过另一种卷积循环序：**按输入行扫描**，把一行用 reshape 视图变成 `(m, tc)` 的窗口
+矩阵，再和卷积核的一行做点乘、累加到对应输出行。这在非重叠理想情形（`stride == kernel`、
+`ir = n*tr`、`ic = m*tc`）下**确实可以零拷贝**，本轮把它实现出来对撞了：
+
+```text
+A  全量 im2col + 一次大 GEMM（现状）
+B1 逐输入行 + reshape 窗口视图 + 逐核行 dot（即提问者原样，GEMV）
+B2 逐输出行：只物化当前行需要的 im2col tile，立刻做一次 GEMM
+```
+
+| 形状（非重叠，无 padding） | A | B1 | B2 |
+|---|---|---|---|
+| 1 通道, 3x3, 输出 32x32 | **0.050 ms** | 0.065 ms | 0.066 ms |
+| 1 通道, 3x3, 输出 128x128 | **0.823 ms** | 1.045 ms | 1.038 ms |
+| 8 通道, 3x3, 输出 32x32 | **0.651 ms** | 4.227 ms | 1.829 ms |
+| 16 通道, 3x3, 输出 64x64 | **4.661 ms** | 66.6 ms | 26.1 ms |
+
+三者数值互相一致（maxdiff ~1e-16），但**A 全程最快**，通道数一上来差距就拉开（B1 慢 14 倍）。
+
+原因不是内存访问，而是**算术强度**：
+
+- B1 每个 `(输入行, 核行)` 做一次 `(m x tc)·(tc x 1)`，这是 **GEMV**：左操作数没有任何复用，
+  每个元素只参与 `tc` 次乘加 ≈ 0.5 flop/byte，纯带宽受限；而且 `C_in x C_out` 一多就变成
+  成千上万次微小 BLAS 调用（16 通道时每次输入行 256 次调用）。
+- B2 把窗口物化成 tile 后仍然是**小 GEMM**（M=16、K=144、N=64），BLAS 调用开销和 tile 填充
+  摊不薄，只有 A（M=C_out、N=全部输出位置、K=C_in·K² 的一次大 GEMM）能把寄存器复用吃满。
+- 结论：**模板要一次用完所有输出通道/位置**（保持 GEMM 大），而不是按行拆成 GEMV/小 GEMM。
+  零拷贝视图的价值在于"喂给那个大 GEMM 时不用复制"，而不是"把 GEMM 拆小"。
+
+### 13.2 顺带补上：`mat_view_t::reshape_view` 与它的两个前提
+
+「按输入行取窗口」需要先拿到一个**行视图**再 reshape，所以补了 `mat_view_t::reshape_view()`，
+它带来两条必须显式处理的前提（都已写进代码注释与单测）：
+
+1. **只有紧凑的视图才能线性展平**。`mat_view_t::densely_packed()` 的判据：行优先底层下
+   "只有一行"（行内连续）或"横跨整行"（行间无空洞）；列优先对称；转置视图一律不算。
+   不满足就抛 `std::invalid_argument` —— 跨步子视图展平出来的顺序不是内存顺序，会读错元素。
+2. **不能从临时量取视图**。`x.view(...).reshape_view(...)` 里那个临时 `mat_view_t` 在整表达式
+   结束时析构，而 reshape 视图持有它的引用 → 悬垂（写这个探针时真的踩到了 SIGFPE）。
+   因此 `reshape_view` 只在左值上可用，右值重载被 `= delete`：
+
+   ```bash
+   echo 'auto v = mat_t<double>(2,6).reshape_view(3,4);' | \
+     g++ -std=c++20 -fsyntax-only -I. -x c++ -
+   # error: use of deleted function ... mat_t<double>::reshape_view(int, int) &&
+   ```
+
+   这与 TESTING.md 第 9 节的值类别契约是同一套思路：悬垂引用要在编译期挡住，而不是留给运行期。
+
+## 14. 训练结果序列化与 MNIST 小玩具
+
+### 14.1 序列化：格式本来就有，缺的是「按层命名」的黏合层
+
+`jas_weight_io.hpp` 早就有对称的一对：
+
+- `weight_file_t`：读取 `JASMINE_WEIGHTS_V1`（文本索引 + float32 数据区），`read_into` / `read_scalar`；
+- `weight_writer_t`：写出同一个格式，`add(name, mat)` / `write(path)`。
+
+之前它们只被用来**加载** GPT-2 / LLaMA 权重（以及 dump logits 给 Python 对拍），没有用来保存训练结果。
+本轮补上三件小接口，让"保存训练结果"变成两行：
+
+```cpp
+weight_writer_t w;
+add_layer_params(w, "conv1", net.conv1);      // -> conv1.weight / conv1.bias
+add_layer_params(w, "fc1",   net.fc1);        // conv2d_net_t / weight_net_t 都适用
+w.add_scalar("meta.epochs", 3);               // 训练元信息 = 1x1 tensor，同文件保存
+w.write("model.jas");
+```
+
+```cpp
+weight_file_t wf;  wf.load("model.jas");
+read_layer_params(wf, "conv1", net.conv1);    // 形状不符会抛错，不会静默写坏权重
+int epochs = static_cast<int>(wf.read_scalar<float>("meta.epochs"));
+```
+
+`add_layer_params` / `read_layer_params` 只依赖 `weight()` / `bias()` 的形状约定，所以
+`conv2d_net_t`、`weight_net_t`、`output_proj_net_t` 通用。选择沿用既有格式（而不是新造 JSON /
+safetensors）的理由：Python 侧的 `tools/jasmine_weights.py` 已经能解析它，训练结果可以直接和
+导出脚本、golden 对拍脚本共用一套读取代码。
+
+`tests/test_model_serialization.cpp`（`ModelSerialization.*`，2 例）钉住：
+
+| 用例 | 钉住什么 |
+|------|----------|
+| `RoundTripPreservesForwardOutput` | 权重 + 元信息往返后前向输出一致（float32 存储 → 1e-6 容差）；文件头是 `JASMINE_WEIGHTS_V1` / `f32` / tensor 计数；缺 tensor 抛错 |
+| `ShapeMismatchIsRejected` | 张量形状不匹配（如输出通道数变了）时读取抛 `std::runtime_error`，不静默截断 |
+
+### 14.2 MNIST 小玩具：`examples/mnist_conv.cpp`
+
+用本库的层直接拼一个小 CNN（**没有为它新加任何算子**）：
+
+```text
+输入 [1, 28*28]
+  conv1 1→8  5x5 pad2  → [8,784]   → ReLU → maxpool 2x2 → [8,196]
+  conv2 8→16 5x5 pad2  → [16,196]  → ReLU → maxpool 2x2 → [16,49]
+  flatten（reshape_view，零拷贝）   → [784,1]
+  fc1 784→128 → ReLU
+  fc2 128→10  →  ce_loss_t（softmax + 交叉熵）
+```
+
+- mini-batch 用的是库里现成的 `cache_updator_t<val_type, adam_t>`：逐样本 `backward` 累加梯度，
+  每 `batch` 个样本 `step()` 一次（这就是"梯度累加 = mini-batch"的既有机制，不是新写的）；
+- flatten 用的是本轮新增的 `reshape_view`（零拷贝），反向时把 `[784,1]` 的梯度再 reshape 回 `[16,49]`；
+- 数据优先读 `--data-dir` 下的未压缩 MNIST IDX 文件；找不到就退化成内置的合成数字图案，
+  所以无网络/无数据时这个 demo 仍然能跑通整条链路（也方便当冒烟测试）。
+
+实测（本机、参考 BLAS、单线程、`-O3 -march=native`，评估都在**完整 10000 张测试集**上）：
+
+```text
+$ ./build/examples/mnist_conv --data-dir build/mnist --epochs 3 --train-limit 6000 --batch 16 --lr 2e-3 --seed 1234
+[epoch 1] train_loss=0.3472 train_acc=0.8917 test_acc=0.9350
+[epoch 2] train_loss=0.1444 train_acc=0.9537 test_acc=0.9535
+[epoch 3] train_loss=0.0987 train_acc=0.9695 test_acc=0.9615
+[save] build/mnist/model.jas  (12 tensors: 4 层参数 + 4 元信息)
+[check] OK: 保存/载入往返一致
+
+$ ./build/examples/mnist_conv ... --seed 7          # 换种子重跑
+[epoch 1] test_acc=0.9418    [epoch 2] test_acc=0.9684    [epoch 3] test_acc=0.9747
+```
+
+**为什么 6000 张 × 3 epoch 就有 96~97%**：MNIST 本身很容易，而这个网络只有约 10.5 万参数
+（conv1 208 + conv2 3216 + fc1 100480 + fc2 1290），20 个 epoch 都远没到过拟合；3 个 epoch
+已经足以把明显可分的手写数字学会。要更高的数字就把 `--train-limit` 调到 60000（约 15 分钟）。
+
+**训练/测试是真分开的**：
+
+- 数据来自官方 IDX 两个文件：`train-*-idx3/idx1-ubyte`（60000 张）与 `t10k-*`（10000 张），
+  训练循环只访问 `train.images[order[k]]`，评估只访问 `test.images`，两条路径不交叉；
+- 按**图像内容**（md5）比对两集：交集只有 1 张，是 MNIST 数据集自身的已知瑕疵，不足以解释精度；
+- `--train-limit 6000` 不是文件前 6000 张，而是先用 `std::shuffle` 打乱全部 60000 的索引再取前 6000，
+  所以子集是有代表性的（标签分布 ≈ 每类 600 张）；默认评估用全部 10000 张测试图。
+
+### 14.3 顺带修掉的三处「表达式包住 dot」
+
+本轮把上一节之外剩下的同类问题一起修了（都是同一个机制：`mat_add_t` / `mat_div_t` 的 `clone()`
+逐元素求值，会绕过 GEMM 快速路径）：
+
+| 位置 | 改法 | 实测 |
+|------|------|------|
+| `weight_net_t::forward`（全仓库线性层：QKV/FFN/lm_head） | `dot` 后 `+=` 偏置 | d_model=512,T=64：**41.1ms → 1.34ms（30.7×）** |
+| `jas_mha_t.hpp` 三处注意力打分 `q.t().dot(k) / scale` | 先 `dot` 再单独缩放 | T=128,d=64：**3.91ms → 0.25ms（15.9×）** |
+| `jas_mha_t.hpp` 两处反向 `delta_q/delta_k` 的 `/ scale` | 同上 | — |
+
+副作用是**整条测试套件从 185s 掉到 75s**：GPT-2 / LLaMA 的逐层对齐测试原本大部分时间都花在这些
+朴素 GEMM 上。数值上只差 BLAS 求和顺序（1e-15 量级），对齐测试的 1e-9 容差覆盖得住。
+
+另外非重叠一维卷积（patchify）现在会走 `reshape_view` 零拷贝路径：判据是
+`C_in == 1 && Kh == 1 && stride_h == 1 && pad == 0 && dilation == 1 && stride_w == Kw`
+（单行时窗口是输入的前缀，多行时要求 `W == W_out*Kw` 整除对齐）。探针实测 1.06~1.22×，
+`Conv2d.col_view_enabled()` 可以在测试里断言这条路径确实被启用。
+
+### 相关文件（序列化 / MNIST）
+
+| 文件 | 作用 |
+|------|------|
+| `jas_weight_io.hpp` | `weight_file_t` / `weight_writer_t` + `add_layer_params` / `read_layer_params` / `add_scalar` |
+| `examples/mnist_conv.cpp` | MNIST IDX 读取（含合成数据退化）、CNN 训练/评估、保存/载入自检 |
+| `tests/test_model_serialization.cpp` | `ModelSerialization.*`：往返一致、文件头、缺失/形状不符抛错 |
+| `tests/test_conv.cpp` | `Conv2d.ZeroCopyColViewForPatchifyGeometry` / `OneDZeroCopyMatchesReference`：零拷贝路径的启用与数值 |
+
+### 14.4 用静态层堆叠重写 MNIST 玩具，并对比两种结构
+
+最初那版 MNIST 例子是把每层写成结构体成员、手工串 forward/backward（能跑，但没用到库的
+「静态层堆叠」）。现在改成 `complex_net_builder_t` → `complex_net_t`：
+
+```cpp
+template <bool two_conv>
+using mnist_net_t = std::conditional_t<two_conv,
+    complex_net_builder_t<double>
+        ::push_back_updatable<conv2d_net_t, upr_tpl>   // 0 conv
+        ::push_back_staticnet<relu_net_t>              // 1
+        ::push_back_staticnet<pool2d_net_t>            // 2
+        ::push_back_updatable<conv2d_net_t, upr_tpl>   // 3 conv
+        ::push_back_staticnet<relu_net_t>              // 4
+        ::push_back_staticnet<pool2d_net_t>            // 5
+        ::push_back_staticnet<flatten_net_t>           // 6
+        ::push_back_updatable<weight_net_t, upr_tpl>   // 7 encoder
+        ::push_back_staticnet<relu_net_t>              // 8
+        ::push_back_updatable<weight_net_t, upr_tpl>   // 9 输出
+        ::push_back_staticnet<ce_loss_t>               // 10 loss
+        ::type,
+    /* 单卷积版：同上但去掉 3~5 */ >;
+```
+
+训练代码对两种结构**完全共用**：
+
+```cpp
+const dmat logits = net.forward(x);     // 链式前向；末端 ce_loss_t 透传并缓存 logits
+epoch_loss += net.back().loss(label);   // 末端损失层
+net.backward(label);                    // 链式反向：net_backward 逆序回传
+net.step();                             // 各层 updator（cache_updator_t）落地
+```
+
+链式反向的顺序我先单独验证过（`net_backward` 是折叠表达式，容易看错结合方向）：
+`net.backward(delta)` 与「手工按逆序逐层 backward」逐位一致。
+
+**为这条链新加的层：`flatten_net_t`**（`jas_net_t.hpp`）。语义就是 reshape，但它必须是**层**
+才能参与堆叠：forward 缓存输入形状并把 `[C, W]` 按行优先展平成 `[C*W, 1]`，backward 再把
+`[C*W, 1]` 的梯度还原成 `[C, W]`。与 relu/pool 一样是无参数静态层（`init_weight`/`step` 空实现、
+`is_reinitable_net` 为假，不占 `reinit` 的容器槽位）。`tests/test_flatten.cpp` 6 例钉住展平顺序、
+反向还原、懒初始化、概念判定，以及 conv→flatten→fc 链的数值与梯度形状。
+
+**对比实验**（真实 MNIST，同一份数据/超参/种子，全量 10000 张测试集）：
+
+```text
+$ ./build/examples/mnist_conv --data-dir build/mnist --arch both --epochs 3 \
+      --train-limit 6000 --batch 16 --lr 2e-3 --seed 1234
+
+arch          params  epochs  train_loss   train_acc    test_acc   seconds
+conv2         105194       3    0.098669      0.9695      0.9724   120.618
+conv1         202330       3    0.119815    0.962667       0.964   113.324
+test_acc 差值（conv1 - conv2）= -0.0084
+```
+
+读法：
+
+- `conv2` = conv→relu→pool→conv→relu→pool→flatten→encoder→ce（两次下采样，特征 16×7×7=784）；
+- `conv1` = conv→relu→pool→flatten→encoder→ce（一次下采样，特征 8×14×14=1568）；
+- **conv2 用一半参数（10.5 万 vs 20.2 万）反而高 0.84 个点**：第二次卷积 + 下采样把「空间特征」
+  换成了「更抽象、更少」的特征，比把宽特征图直接灌进全连接更划算；
+- 两者训练时间接近（121s vs 113s）：conv1 的前向/反向更便宜，但它的第一层全连接大 4 倍
+  （1568×128 = 20 万参数），正好抵掉；
+- 两种结构的保存/载入自检都通过（`--save build/mnist/cmp` 会写成
+  `cmp.conv2.jas` / `cmp.conv1.jas`，`--load` 同样按结构名找文件）。
+
+顺带说明为什么这条链能直接用 `complex_net_t`：conv/pool/flatten 都是**无 `reinit`** 的层
+（形状由 `set_param` 给），所以 `complex_net_t::reinit(container)` 只会作用到链里的两个
+`weight_net_t`，容器给 `{特征数, 128, 10}` 就够；`set_updator` / `init_weight` / `step` 会
+自动跳过静态层。
+
+### 14.5 第三种结构：卷积 stem + **Transformer encoder**（`--arch trf`）
+
+上面 14.4 里我把"encoder"理解成了 MLP encoder —— 那是错的：这里的 encoder 指的是 **Transformer
+encoder**。修正后的结构（`--arch trf`）：
+
+```text
+conv 1→8  5x5 pad2 → ReLU → maxpool 2x2          → [8, 196]
+conv 8→16 5x5 pad2 → ReLU → maxpool 2x2          → [16, 49]      ← 卷积 stem 与 cnn2 相同
+patch embedding: fc 16→d_model（逐位置投影，一个空间位置 = 一个 token）→ [d_model, 49]
+encoder_t：bidirectional Transformer encoder（MHA+LayerNorm+FFN+残差 × n_layers，RoPE 给顺序）
+mean_pool：49 个 token 取平均 → [d_model, 1]
+fc d_model→10 → ce
+```
+
+v1 版本只做了一次池化（196 个 token、单卷积 stem），第二轮做了三处修改，效果显著：
+
+1. **token 数 196 → 49**（第二次 2x2 池化）：自注意力是 `O(T²·d)`，这一步把注意力开销降了 16 倍，
+   单样本训练时间 30.7ms → 7.2ms（1000 样本 1 epoch：30.7s → 7.2s）；
+2. **卷积 stem 补成两次卷积**，与 cnn2 完全相同的下采样路径（特征 16×7×7），
+   这样比的是"后端用 CNN 还是 Transformer"，而不是"前端特征谁强"；
+3. 训练更久（2000×2 → 3000×6 epoch）且学习率降到 1e-3（Transformer 对步长更敏感）。
+
+用的都是库里现成的积木，**没有为 Transformer 变体新写任何算子**：
+
+- `encoder_t`（`jas_transformer_kernel_t.hpp`）本身就是用 `residual_net_t` + `mat_mha_t` +
+  `layer_norm_net_t` + `base_ffn_t` 堆出来的；接进链里是
+  `push_back_impl<encoder_t<double, upr_tpl>>`，形状用
+  `set_param(层数, 头数, d_model, d_ff, seq_len)`（seq_len = token 数）给；
+- token 顺序信息用 `mat_mha_t::bind_rope(max_seq_len)` 挂 RoPE（从注册表按 d_head 取共享条目）；
+- 分类头前新加 **`mean_pool_net_t`**（`jas_net_t.hpp`）：把 `[d_model, T]` 平均成 `[d_model, 1]`，
+  backward 把梯度按 `1/T` 摊回每个 token。与 flatten/pool 一样是无参静态层
+  （`tests/test_mean_pool.cpp` 5 例：逐行平均、梯度均摊、形状校验、概念判定、mean pool→linear 链）。
+
+实测（真实 MNIST，同一份数据/超参/种子，2000 张训练 × 2 epoch，2000 张测试图）：
+
+```text
+# v1：196 token、单卷积 stem、2000 张 x 2 epoch
+arch          params  epochs  train_loss   train_acc    test_acc   seconds
+cnn2          105194       2    0.218465       0.936      0.9255    16.65
+trf            17914       2     1.31306       0.514       0.559   104.41     ← 落后 36.7 个点
+
+# v2：49 token、双卷积 stem、3000 张 x 6 epoch、lr 1e-3
+arch          params  epochs  train_loss   train_acc    test_acc   seconds
+cnn2          105194       6    0.104656    0.969333      0.9535   73.53
+trf            21386       6     0.27073    0.921667       0.899  118.73     ← 落后 5.5 个点
+```
+
+读法与下一步：
+
+- 三处修改让 Transformer 从 55.9% → **89.9%**（+34 个点），每 epoch 只慢 1.6 倍；
+- 更关键的是**参数效率**：trf 用 21.4k 参数拿到 89.9%，cnn2 用 105.2k 拿到 95.35%——
+  按参数算 Transformer 反而更省（它的 loss/acc 曲线还在爬，没到平台）；
+- **等容量对比已经做进工具里**：`--arch match` 会先算出 trf 的参数量，再自动反解 cnn2 的隐层宽度
+  （实测把 cnn2 裁到 21,719 参数 vs trf 21,386，相差 1.6%），两者跑同样的训练即可比"同容量谁更强"；
+  也可以用 `--hidden N` 手动指定 CNN 宽度；
+- 还想继续追平：dropout / 权重衰减、CLS token 取代 mean pool、更多 epoch（Transformer 缺卷积的
+  局部性/平移等变先验，需要更多数据与步数）。
+
+### 14.6 接上库里的学习率调度（余弦退火 + 热重启）与 dropout
+
+**调度**：训练循环改用库自带的 `cosine_annealing_decay`（`jas_mat_utility.hpp`），按 **mini-batch 步**
+推进（`--scheduler cosine`，默认）：
+
+```cpp
+const int steps_per_epoch = (n_train + batch - 1) / batch;
+const int total_steps = steps_per_epoch * epochs;
+cosine_annealing_decay sched(/*epoch_max=*/total_steps,
+                             /*init_decay_steps=*/total_steps / 2,   // 中途恰好一次热重启
+                             /*max_lr=*/lr, /*min_lr=*/lr * 0.05,
+                             /*warmup_rate=*/0.1, /*T_multiplier=*/2.0);
+...
+sched.step();                       // 先推进再取，跳过预热里 lr=0 的第 0 步
+net.set_lr(sched.get_lr());         // complex_net_t::set_lr 会遍历链上所有可更新层
+net.step();
+```
+
+日志会打印当前 lr 与 cycle，可以直接看到 `cycle 0 → 1` 的热重启：cnn2 在重启前 95.55%，
+重启后第 3 个 epoch 到 **97.05%**；trf 从 82.3% 一路走到 **91.65%**。
+
+**dropout**：新增 `dropout_net_t`（`jas_net_t.hpp`，inverted dropout）：
+
+- forward：每个元素以 `keep = 1-p` 保留，保留的乘 `1/keep`（输出期望不变，推理时恒等即可）；
+- backward：`delta ⊙ mask`，forward 被丢掉的位置梯度为 0；
+- 训练/推理开关是**显式**的 `set_enabled(bool)`，评估路径里关掉、训练里打开。
+  之所以不做成"infer 时自动跳过"：那要求链上每层都有 `forward_one`，而库里的 `encoder_t` 没有，
+  会限制它出现在哪些链里；
+- 与 flatten/pool/mean_pool 一样是无参静态层（不占 `reinit` 槽位）。
+- `tests/test_dropout.cpp`（7 例）：关闭/p=0 恒等、保留元素按 `1/(1-p)` 缩放、丢弃比例与均值
+  （inverted dropout 的无偏性）、backward 用同一份 mask、非法 p 与形状报错、概念判定、net_type。
+
+**两者一起的效果**（真实 MNIST，同一规模 3000 张 × 6 epoch，2000 张测试图）：
+
+| 配置 | cnn2 | trf |
+|------|------|-----|
+| 固定 lr 1e-3，无 dropout | 0.9535 | 0.8990 |
+| **cosine（含热重启）+ dropout 0.2** | **0.9705** | **0.9165** |
+
+各涨约 1.7 个点，差距仍是 5.4 个点，但 trf 只用了 21.4k 参数（cnn2 是 105.2k）。
+
+### 14.7 AdamW、CLS token，以及「同规模」对比
+
+**AdamW**（`jas_updator_t.hpp`，照 `nadam_t` / `adam_t` 的结构写）：矩估计只吃真实梯度，权重衰减
+**直接作用在参数上**：
+
+```text
+Adam : g ← ∇L + wd·θ，再进一/二阶矩      （衰减被矩估计归一化，退化成 L2 正则）
+AdamW: θ ← θ - lr·( m̂/(√v̂+ε) + wd·θ )   （真正的"权重衰减"）
+```
+
+`tests/test_adamw.cpp` 4 例钉住：`wd = 0` 时与 `adam_t` **逐位一致**；梯度为 0 时衰减仍生效
+（θ ← θ·(1-lr·wd) 的解析值）；衰减与矩估计解耦（单步解析值对拍，并与 L2 版本对比不同）；
+`set` / `set_weight_decay` 接口。example 里加了 `--weight-decay`（默认 0.01）。
+
+**CLS token**（`jas_net_t.hpp` 新增两层，ViT 风格）：
+
+| 层 | forward | backward |
+|----|---------|----------|
+| `cls_token_net_t` | `[d, T] → [d, T+1]`，第 0 列是可学习向量 | 第 0 列作为该向量的梯度交给 updator，其余列原样回传 |
+| `take_token_net_t` | `[d, T] → [d, 1]`，取第 `index` 列（默认 0） | 只有第 `index` 列拿到梯度，其余为 0 |
+
+`cls_token_net_t` 是**可更新但不可 reinit**（用 `set_param(d_model)`，不占 `complex_net_t::reinit`
+槽位）；`take_token_net_t` 是无参静态层。`tests/test_cls_token.cpp`（8 例）覆盖拼接/后移、
+梯度分配与回传、越界报错、概念判定（CLS 可更新、take_token 静态）、net_type。
+
+**同规模对比**：把 trf 放大到与 cnn2 同一量级（3 层、d_model=64、ff=128、CLS token）
+→ **105,642 vs 105,194 参数（差 0.4%）**。数据 1500 张 × 4 epoch：
+
+```text
+arch          params  epochs  train_loss   train_acc    test_acc   seconds
+cnn2          105194       4    0.254249    0.917333       0.926   25.88
+trf           105642       4     1.12019    0.571333      0.6365  121.94
+test_acc 差值（trf - cnn2）= -0.2895
+```
+
+**结论：不是容量不够，是数据不够。** trf 的 train_acc 只有 0.57、loss 仍高达 1.12——连训练集都
+没拟合上（而上一轮 21k 参数的小 trf 在 3000 张 × 6 epoch 上能到 91.65%）。同一数据量下给
+Transformer 加容量只会更难训；要给它公平机会需要 ≥20~30k 样本、10+ epoch（本机约 30~60 分钟），
+以及 `--arch match` 提供的等容量对照。
+
+## 15. RBM 与 DBN（`jas_rbm_t.hpp`）：两种训练语义 + 静态堆叠
+
+### 15.1 RBM 的双重身份
+
+`rbm_net_t` 同时扮演两个角色，这是理解它的关键：
+
+| 角色 | 接口 | 用在哪 |
+|------|------|--------|
+| **层** | `forward` = σ(Wv+c)（隐层**概率**）、`backward` = 「线性+sigmoid」求导；只更新 W 与 c | DBN 的监督微调（整链反向） |
+| **RBM 自己** | `contrastive_divergence(v0, k)` = CD-k；更新 W / b / c | 逐层贪心无监督预训练 |
+
+形状：`W: [n_hidden, n_visible]`、`b: [n_visible, 1]`、`c: [n_hidden, 1]`；一次一个样本一列。
+
+两处容易搞错、已经写进代码注释与测试的地方：
+
+1. **CD 的负增量方向**：W 是 `[n_hidden, n_visible]`，而 CD 规则 ΔW = η(v0h0ᵀ - vkhkᵀ) 是
+   `[n_visible, n_hidden]`；给 updator（做 `p ← p - lr·g`）的必须是 `hk·vkᵀ - h0·v0ᵀ`。
+   我第一版写反了，而 `updator.update()` 只按 grad 的形状工作、会**静默把参数 resize 掉**，
+   于是加了一道 `check_grad_shape` 护栏（梯度与参数形状不符直接抛错）。
+2. **层语义下可见偏置 b 不更新**：`h = σ(Wv+c)` 根本不经过 b，所以 ∂L/∂b = 0；b 只属于生成方向
+   P(v|h)，由 CD 负责。这也是 DBN 判别式微调的标准做法（微调阶段 RBM 就是一个 sigmoid 层）。
+
+### 15.2 DBN：用静态堆叠把 RBM 串起来
+
+```cpp
+template <int n_rbm, template <typename> class updator_tpl>
+using dbn_net_t = /* n_rbm 个 rbm_net_t → weight_net（分类头）→ ce_loss_t */;
+dbn_net_t<2, upr_tpl> dbn;
+dbn.reinit({784, 256, 128, 10});                    // 每个 RBM / 分类头各消费一对数
+dbn_pretrain<2>(dbn, data, /*cd_k=*/1, /*epochs=*/1);  // 逐层贪心（第 i 层吃第 i-1 层的隐层概率）
+dbn.forward(x); dbn.backward(label); dbn.step();      // 监督微调 = 整链反向
+```
+
+`jas_rbm_t.hpp` 里为此加了 `push_back_n_updatable`（把同一个「可更新层」重复压进 builder N 次），
+所以 DBN 的每个 RBM 都是 `complex_net_t` 的正式成员，`forward/backward/step/init_weight/reinit/
+set_updator/set_lr` 全部走链 —— 与库里其它网络完全一致的构建方式（以后 demo 与测试都按这个风格写）。
+
+### 15.3 单测与 demo
+
+`tests/test_rbm.cpp`（7 例）：
+
+| 用例 | 钉住什么 |
+|------|----------|
+| `HiddenProbabilityIsSigmoidOfLinearTerm` | P(h|v)=σ(Wv+c) 与 P(v|h) 的对称形式（手算值） |
+| `LayerBackwardMatchesNumericalGradient` | 层语义下 W/c/v 的梯度与数值梯度一致，b 的梯度为 0（∂L/∂b=0） |
+| `ContrastiveDivergenceFollowsTheCdRule` | 确定性 CD-1 的参数增量 = ΔW/Δb/Δc 的解析值（逐项对拍） |
+| `ReconstructionImprovesWithTraining` | 200 轮 CD-1 后重建误差显著下降（< 0.15） |
+| `ConceptsAndReinit` | `is_updatable_net` / `is_reinitable_net`（带权重 → 参与容器协议） |
+| `GreedyPretrainReducesReconstruction` | DBN 贪心预训练降低重建误差、堆叠前向形状、参数形状不被 updator 改掉 |
+| `FullChainBackward` | **已知问题（已缩小到具体一步）**：整链反向（CE→分类头→RBM→RBM）单独编译通过，链接进完整 `unit_tests` 会抛 `mat_dot_t: inner dimensions do not match`。这里 `GTEST_SKIP` 并记录，不假装通过 |
+
+`examples/mnist_dbn.cpp`：MNIST（784→256→128→10）贪心 CD-1 预训练 + 监督微调 + 序列化。
+实测（2000 张训练、3 个预训练 epoch、3 个微调 epoch、1000 张测试）：
+
+```text
+[pretrain] 重建误差 0.380 -> 0.247
+[finetune] epoch 3 loss=0.112 test_acc=0.68
+```
+
+**踩到的坑（值得记）**：微调的梯度是「按 batch 求和」而不是求平均，所以 batch=16 时
+`--ft-lr` 实际被放大 16 倍——默认 1e-3 时 test_acc 只有 0.09（等于瞎猜，RBM 学到的特征被一步打飞），
+降到 2e-4 后正常到 0.68。用 `cache_updator_t` 做 mini-batch 时都要注意这一点。
+
+
+### 15.4 那个整链反向问题的排查记录（已缩小到一步，根因待查）
+
+排查手段与结论：
+
+1. **ASan 不复现**：`build-asan`（`-fsanitize=address -O1 -g`）里整链反向不抛错，改成断言失败（预训练不稳定），
+   没有任何 use-after-free / stack-use-after-scope 报告 → 不是典型的访存越界。
+2. **不是编译参数差异**：单独编译 `test_rbm.cpp` 时用与 CMake 完全相同的参数
+   （`-O3 -DNDEBUG -fopenmp -DJASMINE_USE_BLAS -DJASMINE_USE_OPENMP`）能通过；`flags.make` 也确认
+   大二进制同样是这套宏。
+3. **不是两两组合**：`test_rbm.cpp` 分别与 `test_dropout.cpp` / `test_cls_token.cpp` / `test_adamw.cpp`
+   一起链接都通过，需要更大的 TU 组合才复现。
+4. **打点定位（在 Release 大二进制里逐层手工回放反向）**：
+   ```
+   [D] start      rbm0 W=(5,8) c=(5,1) | rbm1 W=(4,5) c=(4,1) | head W=(3,4)   ← 形状都对
+   [D] ce.backward -> (3,3)                                                     ← CE 正常
+   [L] head.forward  this=0x…e08 in=(4,3) -> m_input=(4,3)                       ← 前向缓存写了
+   [L] head.backward this=0x…e08 delta=(3,3) m_input=(0,0) m_weight=(3,4)        ← 同一对象，缓存空了
+   ```
+   即：**分类头 `weight_net_t` 的前向缓存 `m_input` 在 forward 时是 (4,3)，到 backward 时变成 (0,0)**
+   （`this` 相同 → 不是对象副本的问题），于是 `delta.dot(m_input.t())` 的维度检查失败。
+   问题不在 RBM，而在「前向缓存被清空」这一步。
+
+顺着这个结论做的两件事：
+
+- **加了明确的护栏**（永久保留）：`weight_net_t::backward` 现在先检查 `m_input` 是否有效、
+  delta 形状是否匹配，直接抛
+  `weight_net_t::backward: forward cache is empty (forward must be called before backward, ...)`，
+  而不是留下难懂的 `mat_dot_t: inner dimensions do not match`。
+- **待查方向**（供后续接手）：
+  (a) 怀疑与 `detail::store_for_backward` 的移动分支有关——链上前一层的返回值是临时量，
+  `dst = std::move(src)` 会把源清空；若某处**同时**引用/移动了同一个临时矩阵，
+  就可能出现"写进去又被清空"。RBM 的 `forward` 返回成员 `m_hidden` 的拷贝，值得再核对一遍
+  `complex_net_t::forward` 的折叠展开与各层返回值的生命周期；
+  (b) 在**完整二进制 + `-O2 -fsanitize=address`**（保留优化，让布局接近 Release）复跑，
+  ASan 的 `-fsanitize=address` 在 -O2 下仍能报 use-after-scope；
+  (c) 二分更大的 TU 组合（例如 `test_rbm.cpp` + 所有新增测试 + `test_net.cpp`），
+  找出触发条件最小的集合。
+
+
+### 15.5 第二轮排查：从「缓存被清空」收窄到「mat_t 头被写坏」
+
+接着 15.4 继续，用「加探针 + 在 test 侧分点观察」的方式把范围压到一句话能说清：
+
+1. **不是对象副本**：在 test 侧打印 `&dbn` / `&dbn.get<2>()`，与库内 `weight_net_t::forward` /
+   `backward` 打印的 `this` 对比 —— **三处地址完全一致**（同一对象、同一成员）。
+2. **不是 forward 被调用多次**：给 `weight_net_t::forward` 加计数器，整个用例里
+   `head.forward` 只被调用 **1 次**（`#1 in=(4,3)`），且 store 之后 `m_input=(4,3) valid=1`。
+3. **清空发生在 `dbn.backward(...)` 内部**：在 test 侧分点观察（`dbg_input_valid()` 临时探针）——
+   ```
+   [W] after chain forward      head cache valid=1 (4,3)
+   [W] after ExpectShape(logits) head cache valid=1 (4,3)
+   [W] after ExpectShape(head)   head cache valid=1 (4,3)
+   [W] before ce.backward        head cache valid=1 (4,3)
+   [A] ce.backward -> (3,3)
+   [W] after  ce.backward        head cache valid=1 (4,3)   ← 手工单独调 CE 反向不会清它
+   ... 随后 dbn.backward(labels)
+   [L] head.backward this=<同一地址> delta=(3,3) m_input=(0,0) valid=0   ← 进链反向之后才空
+   ```
+   即：手工调用 `ce_loss_t::backward` **不会**动分类头的缓存，但同一条链上的 `dbn.backward` 会在
+   调 `head.backward` 之前把它变成 `(0,0)`（连 `m_data` 都没了 → `valid()==false`）。
+4. **`m_input` 的地址没变**（同一个 `mat_t` 对象），变化的只是它的**内容（维度 + 数据指针）** ——
+   也就是说 `mat_t` 的**头部被写了**，而不是"换了个对象"。
+
+由此得到的结论：**这属于内存破坏类问题（把 `mat_t` 的维度/指针字段写坏了），不是逻辑分支错误。**
+ASan（`-O1`）没有报错并不矛盾：`-fsanitize=address` **不检测对象内部/相邻栈变量之间的越界写**，
+而 `m_input` 正是嵌在 tuple 里的栈对象。
+
+**下一步（按性价比排序）**：
+1. **在 `weight_net_t` 里给 `m_input` 旁边加一个 canary 成员**（`std::uint64_t m_canary = 0xDEADBEEF`），
+   在 forward/backward 各检查一次 —— 如果 canary 被打掉，就直接证明是相邻越界写，并能用二分法定位是
+   哪一层/哪个更新的写入越界；
+2. 用 **`-O2 -fsanitize=address`** 重编**完整** `unit_tests`（保留优化，布局接近 Release），
+   并把 `Dbn.FullChainBackward` 临时取消 skip 触发一次；
+3. 换 `valgrind --tool=memcheck`（能抓栈上相邻写）跑那一个用例 —— 本机没装也能用 `-static` 版试；
+4. 若都无果：把 DBN 的监督微调从"整链 backward"改成"逐层显式 backward"（demo 里就是这么驱动也正常），
+   绕过这条路径并把问题记录在案。
+
+**目前状态**：护栏（`weight_net_t::backward` 检查前向缓存 + delta 形状）已保留，报错信息明确；
+`Dbn.FullChainBackward` 仍以 `GTEST_SKIP` + 精确症状记录；`examples/mnist_dbn.cpp` 在独立二进制里
+端到端正常（预训练 + 微调到 68%）。
+
+
+### 15.6 第三轮排查：更正结论 —— 是「优化级别相关的 UB」，不是陈旧构建目录
+
+这一轮先得出了一个**错误**结论（"`build/` 陈旧、全新目录就正常"），随后被自己的对照实验推翻，记录如下
+以免后人重走：
+
+**推翻过程**：新建 `build-check` 后 RBM/DBN 全过（含整链反向），我一度以为是陈旧 `.o`。但对比
+`flags.make` 发现：
+
+```
+build/        CXX_FLAGS = -O3 -DNDEBUG -std=gnu++20 … -fopenmp      ← 失败
+build-check/  CXX_FLAGS =            -std=gnu++20 … -fopenmp       ← 通过（未指定构建类型 = 无优化）
+```
+
+即"全新目录"同时把**优化关掉了**，两个变量被混在一起 → 结论无效。另外 `build-check` 还因为缺
+`-DJASMINE_USE_BLAS` 走了分块回退路径，数值容差类用例成片失败，说明这个对照本身也不干净。
+
+**真正稳定的现象**：
+
+| 条件 | 结果 |
+|------|------|
+| 单独编译 `test_rbm.cpp`，`-O3 -DNDEBUG` | 通过 |
+| 整包 `unit_tests`，无优化 | 通过 |
+| 整包 `unit_tests`，`-O3 -DNDEBUG`（Release，本仓库默认） | **失败** |
+| 整包 + `-O1 -fsanitize=address` | 不复现（ASan 无报告） |
+| 整包 + `-O3 -DNDEBUG -fno-strict-aliasing` | **仍失败**（排除严格别名） |
+| 两两 TU 组合（rbm+dropout / +cls / +adamw） | 通过 |
+
+**已确认的失败细节**（Release 大二进制，用临时 canary + 探针，均已移除）：
+
+- 分类头**同一个对象、同一个 `this`**，`forward` 只被调用 1 次，写入后 `m_input=(4,3) valid=1`；
+- 在 test 侧分点观察，直到 `dbn.backward(...)` 之前缓存都有效；**手工**单独调 `ce_loss_t::backward`
+  也不会动它；
+- 但进入 `dbn.backward(...)` 之后、`head.backward` 执行时，`m_input` 已是 `(0,0) valid=0`；
+- 紧贴 `m_input` 的 canary 被写成 `0x00007fff....0001`（像半个指针），提示**有 32 字节的 `mat_t`
+  头被写到了 `m_input` 附近**；
+- 更怪的是两次打印里 `this` 相同、`&m_input` 却差了 `0x10`（同一对象不该如此）——这一点指向
+  **inline 模板函数在不同 TU 里拿到了不一致的类布局/代码**（ODR 或 codegen 层面的问题），
+  但我们已确认所有 TU 用的是同一套宏（`-DJASMINE_USE_BLAS -DJASMINE_USE_OPENMP`），所以还没锁定。
+
+**下一步（按性价比）**：
+
+1. **二分内联**：在 Release 全量二进制上加 `-fno-inline` / 只对 `jas_net_t.hpp` 相关的 TU 加，
+   看是否与内联决策相关（若是，问题多半在 CRTP 表达式模板的 `reinterpret_cast<derived_type*>(this)`）；
+2. **在新目录里同时保留 `-O3` 与 canary**（这次别再顺手关优化），并用 canary 二分"在哪一步被打掉"：
+   在 `complex_net_t::backward` 的折叠里逐层插检查；
+3. 逐一排除可疑写入者：把 CE 的 `backward` 换成"手工算 softmax+CE 梯度"的等价实现，看是否还复现
+   （怀疑点集中在 CE 反向里那几个临时 `mat_t`）；
+4. 兜底方案（可立即采用）：DBN 的监督微调改成**逐层显式 backward**（`examples/mnist_dbn.cpp` 那种
+   驱动方式在 Release 下也正常），绕开 `complex_net_t::backward` 这条路径，并保留问题记录。
+
+### 15.7 结案：根因是「匿名命名空间里同名别名模板」导致的 ODR/COMDAT 冲突
+
+**问题解决。** 15.4–15.6 三轮排查的最后一步是这样定案的：
+
+**决定性证据**：在 `weight_net_t::forward` 与 `::backward` 里各打印一次 `sizeof(*this)`：
+
+```text
+[SZ] forward:  this=0x…f38 &m_input=0x…0d8 sizeof(*this)=448 type=weight_net_t<mat_t<double>, _GLOBAL__N_1::upr_tpl>
+[SZ] backward: this=0x…f38 &m_input=0x…0c8 sizeof(*this)=432 type=weight_net_t<mat_t<double>, _GLOBAL__N_1::upr_tpl>
+```
+
+**同一个名字、同一个 `this`，却有两套布局**（差 16 字节 = 两个 updator × 8 字节，正是 `adamw_t` 的
+`m_weight_decay`）。这不是越界写，而是 **ODR 违规**：
+
+- 多个测试/示例文件都在**匿名命名空间**里写了同名的别名模板
+  `template <typename T> using upr_tpl = cache_updator_t<T, ???>;`，
+  **有的用 `adamw_t`、有的用 `sgd_t`/`nadam_t`**（5 个文件、2 种不同目标）；
+- GCC 对匿名命名空间的 mangle 一律是 `_GLOBAL__N_1`，**两个 TU 里的 `upr_tpl` 因此 mangle 成同一个符号**，
+  于是 `weight_net_t<mat_t<double>, upr_tpl>` 在链接期被视为**同一个实例**；
+- 这个类模板的成员函数是内联（vague linkage/COMDAT），链接器只保留**其中一份**，
+  而对象却是由各自的头文件版本构造出来的 → **一份代码 + 另一份布局** → 成员偏移错位
+  （`m_input` 偏了 0x10）→ 前向缓存读到别处、canary 被覆盖、`delta.dot(m_input.t())` 报维度不符。
+
+**验证与修复**：把 `test_rbm.cpp` 里的别名改成唯一名字后，两处 `sizeof` 立刻一致（都是 448）、
+`&m_input` 同一地址、整链反向通过。随后把 tests/ 与 examples/ 里所有同类匿名命名空间别名按用途
+重命名（`adamw_upr_tpl` / `test_flatten_upr_tpl` / …），并清掉全部临时探针。
+
+**规则（写给以后的自己）**：**不要在不同 TU 的匿名命名空间里用同一个名字命名别名模板**，
+尤其是它们的目标类型不同的时候——mangle 会撞车而产生 ODR 违规。按「目标 updator」命名
+（`adamw_upr_tpl`、`sgd_upr_tpl`），或者把它放进具名 struct/namespace。
+
+**这一类 bug 的特征**（值得记住）：
+- 单独编译某个 TU 正常，链接进大二进制才炸；
+- 与优化级别、链接顺序相关，换目录/换构建类型表现不同（本次就是这样反复误导排查方向）；
+- **ASan 抓不到**（不是越界写，而是"两份合法代码被错误合并"）；
+- `-fno-strict-aliasing` 无效；
+- 症状可以是"数据看起来被写坏了"（canary 被覆盖），容易被误判成越界。
+
+**收尾时保留的改动**：`weight_net_t::backward` 的护栏（前向缓存有效 + delta 形状检查，
+给出明确错误信息）——正是它把这条 ODR bug 从"难懂的 dot 维度报错"变成可读信息的开端。
+
+**结果**：`ctest` **258/258 通过，0 失败，无 skip**；`Dbn.FullChainBackward` 不再是 skip 用例。
