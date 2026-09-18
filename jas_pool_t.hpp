@@ -13,10 +13,12 @@
 namespace jasmine {
 
 /**
- * 池化模式。
+ * Pooling modes.
  *
- * - max    ：取窗口内最大值；padding 视作 -inf；并列最大值按「第一个」路由梯度（见下）。
- * - average：窗口内求和后除以除数，除数是 kh*kw 还是「有效元素个数」由 count_include_pad 决定。
+ * - max    : take the maximum inside the window; padding counts as -inf; ties route their gradient
+ *            to the first element (see below).
+ * - average: sum the window and divide by a divisor; whether that divisor is kh*kw or the number of
+ *            valid elements is controlled by count_include_pad.
  */
 enum class pool_mode
 {
@@ -30,44 +32,49 @@ inline const char* pool_mode_name(pool_mode mode)
 }
 
 /**
- * 二维池化层（最大池化 / 平均池化），带完整反向传播（∂L/∂输入）。
+ * 2-D pooling layer (max / average) with a complete backward pass (dL/dInput).
  *
- * 形状约定与 `conv2d_net_t` 一致：
+ * The shape convention matches `conv2d_net_t`:
  *
- *     输入 x : [C, H * W]        通道先行，空间维展平在列上
- *     输出 y : [C, H_out * W_out]
+ *     input  x : [C, H * W]        channels first, spatial dims flattened into columns
+ *     output y : [C, H_out * W_out]
  *
- * 池化**没有可训练参数**，而且逐通道独立（输出通道数 == 输入通道数），所以本层是「静态层」：
- * 与 `relu_net_t` / `gelu_net_t` 一样只吃 `input_type`、不持有 updator，
- * `init_weight<init_type>()` / `step()` 都是空实现（`complex_net_t` 会无条件调用它们）。
- * 这带来两个直接后果：`is_updatable_net` 为假（链上的 `set_updator` 会跳过本层），
- * 且因为它没有 `reinit`（形状由 `set_param` 给），`complex_net_t::reinit` 也不占槽位。
+ * Pooling has **no trainable parameters** and is independent per channel (the output channel count
+ * equals the input channel count), so this is a "static layer": like `relu_net_t` / `gelu_net_t` it
+ * only takes `input_type`, holds no updator, and implements `init_weight<init_type>()` / `step()` as
+ * no-ops (`complex_net_t` calls them unconditionally). Two consequences: `is_updatable_net` is false
+ * (the chain's `set_updator` skips this layer), and because it has no `reinit` (its shape comes from
+ * `set_param`) it takes no slot in `complex_net_t::reinit`.
  *
- * 输出尺寸（floor 模式，与 PyTorch `MaxPool2d` / `AvgPool2d` 同式）：
+ * Output sizes (floor mode, same formula as PyTorch's `MaxPool2d` / `AvgPool2d`):
  *
  *     H_out = (H + 2 * pad_h - Kh) / stride_h + 1
  *     W_out = (W + 2 * pad_w - Kw) / stride_w + 1
  *
- * 三个刻意与 PyTorch 对齐的语义（都有单测钉住）：
+ * Three semantics deliberately aligned with PyTorch (each pinned by a unit test):
  *
- * 1. **stride 缺省等于核大小**：`stride_h/stride_w` 传 0 表示「同核大小」（PyTorch 的
- *    `MaxPool2d(2)` 就是 `stride=2`）。0 在别处不是合法步长，所以拿它当哨兵不会歧义。
- * 2. **平均池化默认 count_include_pad = true**：除数恒为 `Kh*Kw`，padding 的 0 也进分母
- *    （PyTorch `nn.AvgPool2d` 的默认行为）。置 false 则除以窗口内**有效**元素个数，
- *    此时边界窗口的除数更小、输出更大。
- * 3. **并列最大值取第一个**（按 (kh, kw) 行优先顺序），梯度只走那一个位置，不均分。
- *    PyTorch CPU 实现同样如此：`x = [[1,1],[1,1]]`、`max_pool2d(2)` 的 `x.grad` 是
- *    `[1,0,0,0]` 而不是 `[0.25,...]`。
+ * 1. **stride defaults to the kernel size**: passing 0 for `stride_h`/`stride_w` means "same as the
+ *    kernel" (PyTorch's `MaxPool2d(2)` is `stride=2`). 0 is never a legal stride elsewhere, so the
+ *    sentinel is unambiguous.
+ * 2. **average pooling defaults to count_include_pad = true**: the divisor is always `Kh*Kw`, so the
+ *    padding zeros enter the denominator as well (PyTorch's `nn.AvgPool2d` default). Setting it to
+ *    false divides by the number of **valid** elements instead, which makes the divisor smaller for
+ *    border windows and the output larger.
+ * 3. **ties go to the first maximum** (in (kh, kw) row-major order); the gradient follows that single
+ *    position rather than being split evenly. PyTorch's CPU kernel does the same: with
+ *    `x = [[1,1],[1,1]]`, `max_pool2d(2)` gives `x.grad == [1,0,0,0]`, not `[0.25,...]`.
  *
- * 为什么没有 dilation / ceil_mode：平均池化在 PyTorch 里就没有 dilation，ceil_mode 会引入
- * 「最后一个窗口是否算满」的额外规则，和 count_include_pad 交织在一起；这两条按需再加，
- * 现在先把最常用的 floor + 整数核做扎实。`pad <= Kh/2`（PyTorch 的 "pad should be at most
- * half of effective kernel size"）是硬约束，它同时保证每个窗口至少覆盖一个真实元素，
- * 于是最大池化不会遇到「整窗都是 -inf」、平均池化也不会除以 0。
+ * Why there is no dilation / ceil_mode: average pooling has no dilation in PyTorch at all, and
+ * ceil_mode introduces "is the last window complete" rules that interact with count_include_pad.
+ * Both can be added on demand; the common floor + whole-kernel case is done properly first.
+ * `pad <= Kh/2` (PyTorch's "pad should be at most half of effective kernel size") is a hard
+ * constraint, and it also guarantees that every window covers at least one real element, so max
+ * pooling never faces an all-(-inf) window and average pooling never divides by zero.
  *
- * 反向缓存：最大池化 forward 时记录每个输出元素的 argmax（展平后的输入下标，存 int 向量，
- * 不用浮点矩阵是为了避免大图上的精度问题）；平均池化的除数是位置函数，反向现算即可，
- * 不需要额外缓存。两者都缓存了 `m_channels` 用于校验 delta 的行数。
+ * Backward cache: max pooling records the argmax of every output element during forward (the
+ * flattened input index, kept in an int vector rather than a float matrix to avoid precision issues
+ * on large maps); average pooling's divisor is a function of the output position and is recomputed
+ * during backward, so it needs no cache. Both cache `m_channels` to validate delta's row count.
  */
 template <typename input_type>
 class pool2d_net_t
@@ -77,8 +84,8 @@ public:
 
 private:
     pool_mode m_mode = pool_mode::max;
-    int m_h = 0;                // 输入空间高（一维池化取 1）
-    int m_w = 0;                // 输入空间宽（一维池化即序列长度）
+    int m_h = 0;                // input spatial height (1 for 1-D pooling)
+    int m_w = 0;                // input spatial width (the sequence length for 1-D pooling)
     int m_kh = 0;
     int m_kw = 0;
     int m_stride_h = 0;
@@ -89,9 +96,9 @@ private:
     int m_w_out = 0;
     bool m_count_include_pad = true;
 
-    int m_channels = 0;             // forward 缓存：backward 校验 delta 行数
-    std::vector<int> m_argmax;      // max 模式专用：每个输出元素对应的展平输入下标
-    std::vector<int> m_divisor;     // average 模式专用：每个输出位置的除数（预存，避免逐个重算）
+    int m_channels = 0;             // cached by forward; backward validates delta's rows against it
+    std::vector<int> m_argmax;      // max mode only: flattened input index of every output element
+    std::vector<int> m_divisor;     // average mode only: divisor per output position (precomputed)
 
     static int output_size(int const in, int const k, int const stride, int const pad)
     {
@@ -99,8 +106,9 @@ private:
     }
 
     /**
-     * 与输出尺寸无关的参数自检，必须在 output_size() 之前调用：
-     * 那里有 `... / stride`，stride 为 0 就不是「抛异常」而是除零崩掉（整数除法）。
+     * Parameter checks that do not depend on the output size; they must run before output_size(),
+     * which divides by `stride` -- with stride == 0 that is not an exception but a division by zero
+     * (integer division).
      */
     static void validate_basic(int const h, int const w, int const kh, int const kw,
                                int const stride_h, int const stride_w,
@@ -116,7 +124,7 @@ private:
             throw std::invalid_argument("pool2d_net_t: pad should be at most half of the kernel size");
     }
 
-    /** 窗口遍历：把 (oh, ow) 的第 (i, j) 个元素映射到输入坐标，越界返回 false */
+    /** Window walk: map element (i, j) of output position (oh, ow) to input coordinates; false if out of range */
     bool window_at(int const oh, int const ow, int const i, int const j,
                    int& ih, int& iw) const
     {
@@ -126,9 +134,10 @@ private:
     }
 
     /**
-     * 平均池化的除数：include_pad 时恒为窗口面积，否则是本窗口的有效元素个数。
-     * 两种情形都在 set_param 里预存成一张 (H_out x W_out) 的表 —— 除数只是输出位置的函数，
-     * 没必要在 forward/backward 的每个输出元素上重算一遍 O(Kh*Kw)。
+     * Divisor used by average pooling: always the window area when include_pad is set, otherwise the
+     * number of valid elements in this window. Both cases are precomputed into an (H_out x W_out)
+     * table in set_param -- the divisor only depends on the output position, so recomputing it in
+     * O(Kh*Kw) for every output element of forward/backward would be pointless.
      */
     int avg_divisor(int const oh, int const ow) const
     {
@@ -147,9 +156,10 @@ public:
     }
 
     /**
-     * 配置形状与窗口；本层无权重，所以这里只记账 + 校验，不分配任何参数。
-     * `stride_h/stride_w` 传 0 表示「等于对应方向的核大小」。
-     * 抛出时对象保持原状（先算局部量并校验，最后才写入成员）。
+     * Configure shapes and windows; this layer has no weights, so it only records and validates and
+     * allocates nothing. Passing 0 for `stride_h`/`stride_w` means "same as the kernel in that
+     * direction". When it throws, the object keeps its previous state (locals are validated before
+     * any member is written).
      */
     void set_param(pool_mode const mode, int const h, int const w, int const kh, int const kw,
                    int const stride_h = 0, int const stride_w = 0,
@@ -179,7 +189,7 @@ public:
         m_channels = 0;
         m_argmax.clear();
 
-        // 预存每个输出位置的除数（只有 average 用得上）
+        // Precompute the divisor of every output position (only average mode needs it)
         m_divisor.clear();
         if (m_mode == pool_mode::average)
         {
@@ -210,11 +220,11 @@ public:
     }
 
     /**
-     * 一维池化便捷入口：`*this` 仍是同一个 2-D 实现，只是把长度 L 的序列放在宽度方向
-     * （H = 1、Kh = 1、pad_h = 0），不引入第二条代码路径。
+     * Convenience entry point for 1-D pooling: still the same 2-D implementation, with the sequence
+     * of length L along the width (H = 1, Kh = 1, pad_h = 0) and no second code path.
      *
-     *     auto pool = pool_t::one_d(pool_mode::max, L, 2);   // k=2, stride 缺省 = k
-     *     auto y = pool.forward(x);        // x 形状 [C, L]，y 形状 [C, L_out]
+     *     auto pool = pool_t::one_d(pool_mode::max, L, 2);   // k=2, stride defaults to k
+     *     auto y = pool.forward(x);        // x is [C, L], y is [C, L_out]
      */
     static pool2d_net_t one_d(pool_mode const mode, int const len, int const k,
                               int const stride = 0, int const pad = 0,
@@ -262,9 +272,10 @@ public:
                     const int col = oh * m_w_out + ow;
                     if (m_mode == pool_mode::max)
                     {
-                        // 严格 `>`：并列时保留先遇到的那个（行优先），与 PyTorch 一致。
-                        // 初值 -inf 只是为了让「整窗都是 padding」也有定义；按 pad <= k/2 的
-                        // 约束，这种窗口不会出现（真的出现也会被下面的 idx < 0 挡在反向之前）。
+                        // Strict `>`: ties keep the one seen first (row-major), matching PyTorch.
+                        // The -inf seed only gives an all-padding window a defined value; the
+                        // pad <= k/2 constraint rules that case out (and if it ever happened, the
+                        // idx < 0 check below would stop it before backward).
                         val_type best = -std::numeric_limits<val_type>::infinity();
                         int best_idx = -1;
                         for (int i = 0; i < m_kh; ++i)
@@ -306,7 +317,7 @@ public:
         return out;
     }
 
-    /** 无状态（在空间/时间维上无递归）层：单列/整段输入走同一条路径 */
+    /** Stateless layer (no recurrence over space/time): a single column and a whole input share one path */
     template <typename Src>
     mat_t<val_type> forward_one(Src&& input)
     {
@@ -314,9 +325,10 @@ public:
     }
 
     /**
-     * delta = ∂L/∂y，形状 [C, H_out*W_out]；返回 ∂L/∂x 形状 [C, H*W]。
-     * 最大池化：梯度按 forward 记下的 argmax 原路返回（每个窗口只有一个位置拿到梯度）。
-     * 平均池化：`delta / 除数` 散射累加到窗口内每个有效位置；重叠窗口自然累加。
+     * delta = dL/dy with shape [C, H_out*W_out]; returns dL/dx with shape [C, H*W].
+     * Max pooling: the gradient goes back through the argmax recorded by forward (only one position
+     * per window receives it). Average pooling: `delta / divisor` is scatter-added to every valid
+     * position of the window, so overlapping windows accumulate naturally.
      */
     template <typename other_type>
     mat_t<val_type> backward(other_type const& delta)
@@ -328,7 +340,7 @@ public:
 
         const int c = m_channels;
         const int n = m_h_out * m_w_out;
-        mat_t<val_type> dx(c, m_h * m_w);       // 新构造的矩阵一定是清零的
+        mat_t<val_type> dx(c, m_h * m_w);       // a freshly constructed matrix is guaranteed zeroed
 
         for (int ch = 0; ch < c; ++ch)
         {
@@ -363,16 +375,16 @@ public:
         return dx;
     }
 
-    /** 无参数层：与 relu_net_t / gelu_net_t 一样是空实现，供 complex_net_t 无条件调用 */
+    /** Parameterless layer: no-ops like relu_net_t / gelu_net_t, called unconditionally by complex_net_t */
     template <typename init_type>
     void init_weight()
     {
-        // 无权重
+        // no weights
     }
 
     void step()
     {
-        // 无权重
+        // no weights
     }
 
     std::string net_type(int const& indent = 0) const

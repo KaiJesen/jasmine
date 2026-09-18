@@ -1,0 +1,17 @@
+---
+description: Code comments in this repository must be written in English (conversation with the maintainer stays in Chinese)
+globs: **/*.{hpp,h,cpp,cc,cu,cuh}
+alwaysApply: false
+---
+
+# Code comments are English
+
+Every comment that lands in the repository's source files must be written in **English**:
+block comments, line comments, doxygen-style comments, and comments inside tests and examples.
+
+- Conversation with the maintainer is in **Chinese**; code comments are **English**.
+- `README.md` is English; `TESTING.md` and `CUDA.md` are Chinese prose documents and stay Chinese.
+- Existing Chinese comments are being migrated file by file. Translating a comment must keep its
+  technical content and its rationale intact (design decisions, measured numbers, pitfalls, and
+  any "why not X" reasoning), not just the literal words.
+- Never add a new comment in Chinese.
