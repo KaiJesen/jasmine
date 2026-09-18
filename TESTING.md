@@ -1895,3 +1895,54 @@ ASan（`-O1`）没有报错并不矛盾：`-fsanitize=address` **不检测对象
 **目前状态**：护栏（`weight_net_t::backward` 检查前向缓存 + delta 形状）已保留，报错信息明确；
 `Dbn.FullChainBackward` 仍以 `GTEST_SKIP` + 精确症状记录；`examples/mnist_dbn.cpp` 在独立二进制里
 端到端正常（预训练 + 微调到 68%）。
+
+
+### 15.6 第三轮排查：更正结论 —— 是「优化级别相关的 UB」，不是陈旧构建目录
+
+这一轮先得出了一个**错误**结论（"`build/` 陈旧、全新目录就正常"），随后被自己的对照实验推翻，记录如下
+以免后人重走：
+
+**推翻过程**：新建 `build-check` 后 RBM/DBN 全过（含整链反向），我一度以为是陈旧 `.o`。但对比
+`flags.make` 发现：
+
+```
+build/        CXX_FLAGS = -O3 -DNDEBUG -std=gnu++20 … -fopenmp      ← 失败
+build-check/  CXX_FLAGS =            -std=gnu++20 … -fopenmp       ← 通过（未指定构建类型 = 无优化）
+```
+
+即"全新目录"同时把**优化关掉了**，两个变量被混在一起 → 结论无效。另外 `build-check` 还因为缺
+`-DJASMINE_USE_BLAS` 走了分块回退路径，数值容差类用例成片失败，说明这个对照本身也不干净。
+
+**真正稳定的现象**：
+
+| 条件 | 结果 |
+|------|------|
+| 单独编译 `test_rbm.cpp`，`-O3 -DNDEBUG` | 通过 |
+| 整包 `unit_tests`，无优化 | 通过 |
+| 整包 `unit_tests`，`-O3 -DNDEBUG`（Release，本仓库默认） | **失败** |
+| 整包 + `-O1 -fsanitize=address` | 不复现（ASan 无报告） |
+| 整包 + `-O3 -DNDEBUG -fno-strict-aliasing` | **仍失败**（排除严格别名） |
+| 两两 TU 组合（rbm+dropout / +cls / +adamw） | 通过 |
+
+**已确认的失败细节**（Release 大二进制，用临时 canary + 探针，均已移除）：
+
+- 分类头**同一个对象、同一个 `this`**，`forward` 只被调用 1 次，写入后 `m_input=(4,3) valid=1`；
+- 在 test 侧分点观察，直到 `dbn.backward(...)` 之前缓存都有效；**手工**单独调 `ce_loss_t::backward`
+  也不会动它；
+- 但进入 `dbn.backward(...)` 之后、`head.backward` 执行时，`m_input` 已是 `(0,0) valid=0`；
+- 紧贴 `m_input` 的 canary 被写成 `0x00007fff....0001`（像半个指针），提示**有 32 字节的 `mat_t`
+  头被写到了 `m_input` 附近**；
+- 更怪的是两次打印里 `this` 相同、`&m_input` 却差了 `0x10`（同一对象不该如此）——这一点指向
+  **inline 模板函数在不同 TU 里拿到了不一致的类布局/代码**（ODR 或 codegen 层面的问题），
+  但我们已确认所有 TU 用的是同一套宏（`-DJASMINE_USE_BLAS -DJASMINE_USE_OPENMP`），所以还没锁定。
+
+**下一步（按性价比）**：
+
+1. **二分内联**：在 Release 全量二进制上加 `-fno-inline` / 只对 `jas_net_t.hpp` 相关的 TU 加，
+   看是否与内联决策相关（若是，问题多半在 CRTP 表达式模板的 `reinterpret_cast<derived_type*>(this)`）；
+2. **在新目录里同时保留 `-O3` 与 canary**（这次别再顺手关优化），并用 canary 二分"在哪一步被打掉"：
+   在 `complex_net_t::backward` 的折叠里逐层插检查；
+3. 逐一排除可疑写入者：把 CE 的 `backward` 换成"手工算 softmax+CE 梯度"的等价实现，看是否还复现
+   （怀疑点集中在 CE 反向里那几个临时 `mat_t`）；
+4. 兜底方案（可立即采用）：DBN 的监督微调改成**逐层显式 backward**（`examples/mnist_dbn.cpp` 那种
+   驱动方式在 Release 下也正常），绕开 `complex_net_t::backward` 这条路径，并保留问题记录。

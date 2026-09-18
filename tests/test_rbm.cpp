@@ -7,6 +7,7 @@
  */
 
 #include <cmath>
+#include <cstdio>
 #include <vector>
 
 #include <cstdio>
@@ -217,20 +218,64 @@ TEST(Dbn, GreedyPretrainReducesReconstruction)
                      0, 0, 1,
                      0, 0, 1});
 
-    // 逐层贪心：第 0 层先训，再把它的隐层概率喂给第 1 层
-    const auto recon_1 = dbn_pretrain<2>(dbn, data, /*cd_k=*/1, /*epochs=*/1);
-    auto recon_more = recon_1;
-    for (int i = 0; i < 20; ++i) recon_more = dbn_pretrain<2>(dbn, data, 1, 1);
-    EXPECT_LT(recon_more, recon_1) << "贪心预训练应当降低重建误差";
+    // 用「显式重构误差」而不是 CD 返回的最后一个 mini-batch 误差做判据 —— 后者随 lr 抖，
+    // 会写出不稳定的断言（第一版就吃过这个亏）。
+    auto recon_error = [&]() {
+        double sum = 0.0;
+        for (int t = 0; t < data.col_num(); ++t)
+        {
+            const dmat col = column_as_vector(data, t);
+            const dmat rec = dbn.template get<0>().reconstruct(col);
+            for (int i = 0; i < rec.row_num(); ++i)
+                sum += std::abs(rec(i, 0) - col(i, 0));
+        }
+        return sum / (data.row_num() * data.col_num());
+    };
 
-    // 预训练确实改了参数（不是空转）
-    EXPECT_NE(dbn.template get<0>().weight()(0, 0), 0.0);
+    const double before = recon_error();
+    dbn_pretrain<2>(dbn, data, /*cd_k=*/1, /*epochs=*/5);
+    const double after = recon_error();
+    EXPECT_LT(after, before) << "贪心预训练应当降低第 0 层的重建误差";
 
     // 堆叠后的前向：RBM0(8→5) → RBM1(5→4) → 分类头(4→3)
+    const dmat logits = dbn.forward(data);
+    ExpectShape(logits, 3, 3);
+    ExpectShape(dbn.template get<0>().weight(), 5, 8);   // 形状没被 updator 改掉
+    ExpectShape(dbn.template get<1>().weight(), 4, 5);
+    ExpectShape(dbn.template get<2>().weight(), 3, 4);
 }
 
 TEST(Dbn, FullChainBackward)
 {
-    GTEST_SKIP() << "整链反向在完整 unit_tests 里失败：分类头的前向缓存 m_input 在 backward 时是空的"
-                 "（same this、前向时为 (4,3)），已缩小到「缓存被清空」这一步，根因待查；见 TESTING.md 15.3";
+    // 整链反向：CE → 分类头 → RBM1 → RBM0，梯度要一路回到可见层。
+    //
+    // 已知问题：**只在 `-O3 -DNDEBUG` + 完整 unit_tests 二进制里失败**（Release）；
+    // 单独编译本文件、或整包在无优化下编译都通过。失败时分类头的前向缓存 m_input
+    // 在 backward 时已被写坏（dims/指针被覆盖），排查详见 TESTING.md 15.6。
+    // 这里 skip，避免让 Release 套件带着一个未定位的失败；断言保留，修好后删掉这一行即可。
+    GTEST_SKIP() << "整链反向在 Release(-O3) 完整二进制里失败（优化相关的 UB，待定位，见 TESTING.md 15.6）";
+
+    dbn_net_t<2, upr_tpl> dbn;
+    dbn.reinit(std::vector<int>{8, 5, 4, 3});
+    dbn.set_updator(0.01);
+
+    dmat data(8, 3);
+    data = 0.0;
+    for (int t = 0; t < 3; ++t) data(t, t) = 1.0;
+
+    const dmat logits = dbn.forward(data);
+    ExpectShape(logits, 3, 3);
+
+    dmat labels(1, 3, {0, 1, 2});
+    const dmat dx = dbn.backward(labels);
+    ExpectShape(dx, 8, 3);                       // 梯度回到可见层
+    dbn.step();
+
+    // 更新之后形状仍然完好（updator 不会把参数 resize 掉）
+    ExpectShape(dbn.template get<0>().weight(), 5, 8);
+    ExpectShape(dbn.template get<1>().weight(), 4, 5);
+    ExpectShape(dbn.template get<2>().weight(), 3, 4);
+
+    // 再前向一次：缓存被正确重建，链路仍然可用
+    ExpectShape(dbn.forward(data), 3, 3);
 }
