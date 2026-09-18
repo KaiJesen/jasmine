@@ -60,10 +60,10 @@ inline bool mha_heads_should_parallel(int num_heads, int seq_len, int d_head)
 }
 
 /**
- * 阻塞回退内核。TA/TB 表示操作数是「存储矩阵的转置」：
- *   TA == false：A 按 (M x K) 行优先存放（行距 lda）
- *   TA == true ：A 逻辑上是 (M x K)，实际存放的是 (K x M) 行优先（行距 lda）
- * 转置只改寻址，不改分块策略，所以按模板参数特化，避免内层循环里出现分支。
+ * Blocked fallback kernel. TA/TB mean the operand is "the transpose of the stored matrix":
+ *   TA == false: A is stored as (M x K) row-major (row stride lda)
+ *   TA == true : A is logically (M x K) but stored as (K x M) row-major (row stride lda)
+ * Transposing only changes addressing, not the blocking strategy, so it is a template parameter
  */
 template <bool TA, bool TB, typename T>
 void gemm_blocked_rowmajor_impl(int M, int N, int K,
@@ -144,7 +144,7 @@ void gemm_blas_or_blocked(int M, int N, int K,
         const enum CBLAS_TRANSPOSE ta = trans_a ? CblasTrans : CblasNoTrans;
         const enum CBLAS_TRANSPOSE tb = trans_b ? CblasTrans : CblasNoTrans;
         // Single-threaded system BLAS: split C by row panels across OpenMP threads.
-        // 只有 A 不转置时才能按行切片（转置后 A 的行距是 1，不能整体偏移）。
+        // A can only be split by rows when it is not transposed (a transposed A has row stride 1, so the
         if (gemm_should_parallel(M, N, K) && !trans_a)
         {
 #ifdef JASMINE_USE_OPENMP
@@ -206,12 +206,12 @@ void gemm_rowmajor(int M, int N, int K,
 }
 
 /**
- * GEMM 操作数：优先向操作数索要「指针 + 前导维 + 是否转置」描述符（gemm_view()），
- * 拿到就零拷贝交给 BLAS / 阻塞内核；拿不到（列优先、嵌套转置、元素类型不同……）
- * 才物化成一块行优先的临时矩阵 —— 这是原来的唯一路径，保留为兜底。
+ * GEMM operand: ask for a "pointer + leading dimension + transposed" descriptor (gemm_view())
+ * first and, if it gets one, hand it to BLAS / the blocked kernel without copying. Otherwise
+ * (column-major, nested transpose, different element type, ...) it materialises a row-major
  *
- * `mat_t` / `mat_view_t` / `mat_reshape_view_t` 都能给出描述符，所以
- * `a.t().dot(b)`、`a.dot(b.t())`、`x.reshape_view(r,c).dot(w)` 全都不再复制操作数。
+ * temporary -- the previous only path, kept as the fallback. `mat_t` / `mat_view_t` /
+ * `mat_reshape_view_t` all provide descriptors, so `a.t().dot(b)`, `a.dot(b.t())` and
  */
 template <typename Mat, typename T>
 struct gemm_operand
@@ -222,18 +222,18 @@ struct gemm_operand
     bool transposed = false;
 
     /**
-     * allow_transposed：是否接受「转置的操作数」零拷贝描述。
+     * allow_transposed: whether a zero-copy descriptor for a transposed operand is accepted.
      *
-     * 只对**右操作数**开这个口，是量出来的，不是猜的（M=64,N=288,K=1024 的 dW 与
-     * M=288,N=1024,K=64 的 dcol，本机 reference BLAS）：
+     * Only the **right operand** gets this permission, and that is measured rather than guessed
+     * (dW with M=64,N=288,K=1024 and dcol with M=288,N=1024,K=64, reference BLAS here):
      *
-     *   | 位置 | 视图(零拷贝) | 物化后 GEMM | 说明 |
+     | slot      | view (zero copy) | materialised GEMM | note |
      *   |------|-------------|------------|------|
-     *   | B（右）| 2.15 ms | 2.08 ms | 持平：存储矩阵 (N x K) 行优先，K 方向仍是顺序访问 |
-     *   | A（左）| 8.04 ms | 1.63 ms | **慢 5 倍**：TransA 要按列读 A，参考 BLAS 走内积配方 |
+     | B (right) | 2.15 ms          | 2.08 ms           | a wash: the stored (N x K) matrix is row-major, so K stays sequential |
+     | A (left)  | 8.04 ms          | 1.63 ms           | **5x slower**: TransA reads A by column and reference BLAS uses the inner-product form |
      *
-     * 左操作数的转置视图因此仍然物化（这与改动前的行为一致，`W^T·delta` 这类反向 GEMM 不受影响）；
-     * 右操作数的转置（`delta·col^T`、patchify 的窗口矩阵）零拷贝。
+     * A transposed left operand is therefore still materialised (unchanged, so backward GEMMs such as
+     * `W^T * delta` are unaffected), while a transposed right operand (`delta * col^T`, the patchify
      */
     explicit gemm_operand(Mat const& m, bool allow_transposed)
     {

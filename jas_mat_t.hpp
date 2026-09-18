@@ -13,20 +13,20 @@
 namespace jasmine {
 
 template<typename val_type>
-class mat_view_t;               // 这里先声明，因为后面要用到这个来声明转置函数
+// declared first: the transpose function below needs it
 template<typename agent_type>
-class mat_reshape_view_t;       // 形状视图：同一段存储换个 (rows, cols)，不拷贝
+// shape view: same storage, new (rows, cols), no copy
 
 namespace detail {
 
 /**
- * GEMM 操作数描述符：把「一段连续存储 + 前导维 + 是否转置」告诉 GEMM。
+ * GEMM operand descriptor: tells the GEMM about "one contiguous buffer + a leading dimension +
  *
- * 有它之后，`mat_t` / `mat_view_t` / `mat_reshape_view_t` 都可以零拷贝进 BLAS：
- *   - transposed == false：ptr 指向行优先存储，每行 l d个元素（ld >= 逻辑列数）
- *   - transposed == true ：逻辑矩阵是「存储矩阵」的转置，存储矩阵是 (逻辑列数 x 逻辑行数)
- *                          行优先，每行 ld 个元素（要求 ld >= 逻辑行数）
- * 给不出合法描述的（列优先存储、嵌套转置视图等）返回 valid == false，GEMM 退回物化。
+ * whether it is transposed". With it, `mat_t` / `mat_view_t` / `mat_reshape_view_t` can all reach
+ * BLAS without a copy:
+ *   - transposed == false: ptr points at row-major storage, `ld` elements per row (ld >= logical cols)
+ *   - transposed == true : the logical matrix is the transpose of the stored one; the stored matrix
+ *                          is (logical cols x logical rows) row-major with `ld` elements per row
  */
 template <typename val_type>
 struct gemm_buffer
@@ -50,14 +50,14 @@ class mat_t
 public:
     using ele_type = val_type;
 private:
-    int m_dims[2];          // 维度数组，0为内层维度，1为外层维度
-    val_type *m_data;       // 由先内层后外层紧密排列
-    bool m_row_first;    // 是否为行优先存储
-    bool m_scalar = false;  // 是否为标量
+    // dimensions: 0 = inner dim, 1 = outer dim
+    // laid out inner-first then outer, tightly packed
+    // whether the storage is row-major
+    // whether this is a scalar
     val_type m_scalar_val{};
     void destroy() noexcept
     {
-        if (m_scalar)       // 标量矩阵，不进行释放
+        // a scalar matrix owns no buffer to free
         {
             m_scalar = false;
             return;
@@ -290,16 +290,16 @@ public:
     }
 
     /**
-     * 存储是否与自身形状一样紧凑（没有跨步空洞）。
-     * mat_t 本来就是一块紧凑数组，恒为 true；视图才可能是跨步的。
-     * reshape 视图按下标线性展平，只有紧凑的矩阵/视图才能安全地重解释形状。
+     * Whether the storage is as dense as the shape (no stride-induced gaps). A mat_t is always one
+     * dense array, so this is always true; only views can be strided. A reshape view flattens by
+     * index, so only a dense matrix/view can have its shape reinterpreted safely.
      */
     JAS_HD bool densely_packed() const noexcept
     {
         return true;
     }
 
-    /** mat_t 的 reshape_view 定义在 jas_mat_view_t.hpp（那里才有视图类型） */
+    /** mat_t::reshape_view is defined in jas_mat_view_t.hpp (the view types live there) */
 
     JAS_HD val_type* data() noexcept
     {
@@ -396,8 +396,8 @@ public:
     }
 
     /**
-     * GEMM 操作数描述符：行优先存储直接给出 (data, col_num, 不转置)。
-     * 列优先存储给不出（GEMM 的快路径只认行优先），返回 invalid 让调用方退回物化。
+     * GEMM operand descriptor: row-major storage reports (data, col_num, not transposed) directly.
+     * Column-major cannot report (the fast path only understands row-major), so it returns invalid and
      */
     detail::gemm_buffer<val_type> gemm_view() const noexcept
     {
@@ -408,11 +408,11 @@ public:
 
     mat_view_t<mat_t<val_type>> t() noexcept;
     /**
-     * 形状视图：把同一段存储按 (rows, cols) 重新解释，不拷贝（rows*cols 必须等于元素总数）。
+     * Shape view: reinterpret the same storage as (rows, cols) without copying (rows*cols must equal
      *
-     * 视图持有本矩阵的**引用**，所以只允许对左值调用：`mat_t(...).reshape_view(..)` 这种
-     * 「从临时量取视图」在整表达式结束时源矩阵就析构了，视图会悬垂。右值重载直接 delete，
-     * 把这类写法挡在编译期（与 TESTING.md 第 9 节的值类别契约同一套思路）。
+     * the element count). The view holds a **reference** to this matrix, so only lvalues may call it:
+     * with `mat_t(...).reshape_view(..)` the source dies at the end of the full expression and the view
+     * dangles. The rvalue overload is deleted so those forms fail to compile (the value-category
      */
     mat_reshape_view_t<mat_t<val_type>> reshape_view(int const& rows, int const& cols) &;
     mat_reshape_view_t<mat_t<val_type>> reshape_view(int const& rows, int const& cols) && = delete;
@@ -450,9 +450,9 @@ public:
         return mat_t<val_type>(*this);
     }
 
-    // 成员函数里的 *this 恒为左值，所以这里按【接收者】的值类别分派：
-    //   const&  → 左值矩阵：借引用（零拷贝）
-    //   const&& → 临时矩阵（如 `make().dot(x)`）：按值拥有，否则表达式树存下来就是悬垂引用
+    // Inside a member function `*this` is always an lvalue, so dispatch on the value category of the
+    // *receiver*: const&  -> lvalue matrix, borrow a reference (zero copy)
+    //            const&& -> temporary matrix (e.g. `make().dot(x)`), own it by value, otherwise a stored
     template<typename other_type>
     requires is_matrix<other_type>
     auto dot(other_type&& m) const &;

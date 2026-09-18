@@ -19,7 +19,7 @@ private:
     int m_col_offset;
     int m_row_size;
     int m_col_size;
-    bool m_transposed;      // 是否转置了
+    // whether this view is transposed
 public:
     mat_view_t(agent_type& m, int row_offset = 0, int col_offset = 0, int row_size = -1, int col_size = -1) noexcept
         : m_mat(m), m_row_offset(row_offset), m_col_offset(col_offset), m_row_size(row_size), m_col_size(col_size), m_transposed(false)
@@ -32,7 +32,7 @@ public:
     {
         if (m_transposed)
         {
-            // 转置后的 (row,col) 对应原视图的 (col,row)
+            // after transposing, (row,col) maps to (col,row) of the original view
             return m_mat(m_row_offset + col, m_col_offset + row);
         }
         else
@@ -104,18 +104,18 @@ public:
         return mv;
     }
 
-    /** 存储序继承自底层矩阵（视图不改变存储顺序，只改索引方式） */
+    /** The storage order is inherited from the base (a view changes indexing, not layout) */
     bool row_first() const noexcept
     {
         return m_mat.row_first();
     }
 
     /**
-     * 只有当本视图在一维展平后与内存顺序一致时才算紧凑：
-     *   - 行优先底层：只有一行（行内连续），或横跨整行（行间无空隙）
-     *   - 列优先底层：只有一列，或纵跨整列
-     *   - 转置视图：行方向在内存里跨步，一律不算紧凑
-     * 这是 reshape_view() 的前提：跨步子视图线性展平出来的顺序不是内存顺序。
+     * A view counts as dense only when flattening it linearly matches memory order:
+     *   - row-major base: a single row (contiguous within it), or a full-width block
+     *   - column-major base: a single column, or a full-height block
+     *   - a transposed view: its rows stride through memory, so never dense
+     * This is the precondition of reshape_view(): flattening a strided sub-view does not produce
      */
     bool densely_packed() const noexcept
     {
@@ -127,10 +127,10 @@ public:
     }
 
     /**
-     * 形状视图：把本视图的元素按内存顺序重新解释成 (rows, cols)；不紧凑时抛异常。
+     * Shape view: reinterpret this view's elements in memory order as (rows, cols); throws when the
      *
-     * 同样只允许左值调用：`x.view(...).reshape_view(...)` 里那个临时视图在整表达式结束时
-     * 就析构了，而 reshape 视图持有它的引用 —— 先具名再 reshape。
+     * view is not dense. Only lvalues may call it here either: in `x.view(...).reshape_view(...)` the
+     * temporary view dies at the end of the full expression while the reshape view references it.
      */
     mat_reshape_view_t<mat_view_t<agent_type>> reshape_view(int const& rows, int const& cols) &
     {
@@ -140,12 +140,12 @@ public:
     mat_reshape_view_t<mat_view_t<agent_type>> reshape_view(int const& rows, int const& cols) && = delete;
 
     /**
-     * GEMM 操作数描述符：子视图仍然是一段「行距固定、列连续」的稠密矩阵，
-     * 所以只要底层能给出描述，本视图也能零拷贝交给 BLAS：
-     *   - 未转置：ptr = 基址 + row_offset*ld + col_offset，ld 用底层的前导维
-     *   - 转置  ：存储上就是「基址偏移处的 (col_size x row_size) 行优先矩阵」，
-     *             交给 BLAS 时带 CblasTrans（要求 ld >= row_size）
-     * 底层列优先、或底层本身已经是转置视图（嵌套转置）时给不出，返回 invalid 退回物化。
+     * GEMM operand descriptor: a sub-view is still dense (fixed row stride, contiguous columns), so
+     * as long as the base can describe itself the view reaches BLAS without a copy:
+     *   - not transposed: ptr = base + row_offset*ld + col_offset, ld from the base's leading dim
+     *   - transposed    : in storage this is the (col_size x row_size) row-major matrix at that offset,
+     *                     handed to BLAS with CblasTrans (requires ld >= row_size)
+     * A column-major base, or a base that is itself a transposed view (nested transpose), cannot
      */
     detail::gemm_buffer<val_type> gemm_view() const noexcept
     {
@@ -158,8 +158,8 @@ public:
         return {base.ptr + offset, base.ld, m_transposed, true};
     }
 
-    // 同 mat_t::dot：按接收者值类别分派，否则 `m.t().dot(x)` 这类写法存下来会悬垂
-    // 实现放到jas_mat_express_t.hpp中，因为此时还没有定义全局的dot函数
+    // Same as mat_t::dot: dispatch on the receiver's value category, otherwise a stored
+    // `m.t().dot(x)` would dangle. The implementation lives in jas_mat_express_t.hpp because the
     template<typename other_type>
     requires is_matrix<other_type>
     auto dot(other_type&& m) const &;
@@ -198,21 +198,21 @@ public:
 };
 
 /**
- * 形状视图：把同一段存储按新的 (rows, cols) 重新解释，**不拷贝、不分配**。
+ * Shape view: reinterpret the same storage as a new (rows, cols), **without copying or allocating**.
  *
- * 与 `mat_view_t` 的分工：
- *   - `mat_view_t`      → 取子区域（子块/行/列/转置），元素是原矩阵的子集；
- *   - `mat_reshape_view_t` → 换形状，元素与原矩阵一一对应，只是换了索引方式。
+ * How it differs from `mat_view_t`:
+ *   - `mat_view_t`         -> take a sub-region (block / row / column / transpose); its elements
+ *   - `mat_reshape_view_t` -> change the shape; elements correspond one to one, only indexing changes.
  *
- * 约定：
- *   - `rows * cols` 必须等于底层元素总数，否则构造时抛 `std::invalid_argument`；
- *   - 索引按**与底层相同的存储顺序**解释：底层行优先时 view(i,j) 就是展平后的第
- *     `i*cols + j` 个元素；底层列优先时是第 `j*rows + i` 个（等价于 numpy 的 order='C'/'F'）；
- *   - 因此它是**别名**而不是副本：通过视图写入会直接改到底层数据（反向亦然）；
- *   - `t()` 返回带转置标志的同类视图，仍然零拷贝。
+ * Rules:
+ *   - `rows * cols` must equal the base element count, otherwise the constructor throws
+ *   - indexing follows the **same storage order as the base**: for a row-major base, view(i,j)
+ *     `i*cols + j`-th element of the flattening; for a column-major base it is `j*rows + i`
+ *   - it is therefore an **alias**, not a copy: writing through it changes the base data (and back);
+ *   - `t()` returns a view of the same kind with the transpose flag set, still without copying.
  *
- * 用途：`(n, t)` 与 `(t, n)` 之间的重解释（1D 卷积/patchify 把输入切成窗口）、
- * 以及把展平的张量按任意二维形状喂给 `dot` / BLAS，全程不动数据。
+ * Use cases: reinterpreting between `(n, t)` and `(t, n)` (1-D convolution / patchify), and
+ * feeding a flattened tensor as any 2-D shape into `dot` / BLAS without touching the data.
  */
 template <typename agent_type>
 class mat_reshape_view_t
@@ -226,7 +226,7 @@ private:
     int m_cols;
     bool m_transposed = false;
 
-    /** 按底层的存储顺序取第 k 个元素 */
+    /** Take the k-th element in the base's storage order */
     inline val_type& flat(int const k) noexcept
     {
         if (m_mat.row_first())
@@ -241,7 +241,7 @@ private:
         return m_mat(k % m_mat.row_num(), k / m_mat.row_num());
     }
 
-    /** 未转置视图的 (i,j) */
+    /** (i,j) of the untransposed view */
     inline val_type& at(int const i, int const j) noexcept
     {
         return flat(m_mat.row_first() ? i * m_cols + j : j * m_rows + i);
@@ -258,8 +258,8 @@ public:
     {
         if (rows < 0 || cols < 0 || rows * cols != m.row_num() * m.col_num())
             throw std::invalid_argument("mat_reshape_view_t: rows*cols must equal the element count");
-        // 跨步子视图不能线性展平（展平顺序 ≠ 内存顺序），这里的下标计算会读错元素。
-        // mat_t 恒为紧凑；mat_view_t 只在横跨整行（行优先）/整列（列优先）时才算紧凑。
+        // A strided sub-view cannot be flattened linearly (flattening order != memory order) and the
+        // indexing below would read the wrong elements. mat_t is always dense; mat_view_t is dense only
         if constexpr (requires(const agent_type& a) { a.densely_packed(); })
         {
             if (!m.densely_packed())
@@ -300,8 +300,8 @@ public:
     }
 
     /**
-     * GEMM 操作数描述符：reshape 之后每行的长度就是新的 `cols`（底层元素连续），
-     * 所以 ld = cols；转置时存储矩阵是 (cols x rows)、行距仍是 cols，正好满足 BLAS 的 ldb >= K。
+     * GEMM operand descriptor: after reshaping one row is exactly the new `cols` (base elements are
+     * contiguous), so ld = cols; when transposed the stored matrix is (cols x rows) with the same row
      */
     detail::gemm_buffer<val_type> gemm_view() const noexcept
     {
