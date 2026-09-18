@@ -15,11 +15,12 @@ concept is_matrix =
     };
 
 /**
- * 可参与矩阵表达式运算：标量或矩阵。
+ * Can take part in a matrix expression: a scalar or a matrix.
  *
- * 判标量前必须先剥掉引用 / const —— 二元运算符如今用转发引用接收操作数，
- * 左值标量（例如 `double s; m / s;`）推导出的类型是 `double&`，
- * 直接 `is_arithmetic_v<double&>` 是 false，会让整个重载悄悄消失。
+ * Reference and const qualifiers have to be stripped before testing for a scalar: the binary
+ * operators now take their operands by forwarding reference, so an lvalue scalar (e.g.
+ * `double s; m / s;`) deduces to `double&`, and `is_arithmetic_v<double&>` is false -- which would
+ * silently remove the whole overload.
  */
 template<typename...val_types>
 concept is_caculable =
@@ -66,7 +67,7 @@ concept is_updatable_net =
 template<typename net_type>
 concept is_unupdatable_net = !is_updatable_net<net_type>;
 
-/** 推理时跳过该层（通常为 loss）：不调用本层，输入原样传给后续层 */
+/** Skipped during inference (usually a loss layer): it is not called, its input is passed on unchanged */
 template<typename T, typename = void>
 struct is_infer_skipped_net : std::false_type {};
 

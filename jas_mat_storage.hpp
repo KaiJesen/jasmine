@@ -6,7 +6,7 @@
 namespace jasmine {
 namespace detail {
 
-/** 反向需持久输入时：表达式物化一次；mat rvalue 移动；mat lvalue 拷贝 */
+/** When backward needs the input to persist: materialise an expression once, move an rvalue mat, copy an lvalue mat */
 template<typename val_type, typename Src>
 void store_for_backward(mat_t<val_type>& dst, Src&& src)
 {
