@@ -230,10 +230,11 @@ use the CMake targets instead.
 ```text
 cnn2 = conv→relu→pool→conv→relu→pool→flatten→(fc→relu→fc)→ce      "标准 CNN"
 cnn1 = conv→relu→pool→flatten→(fc→relu→fc)→ce                    （卷积 + MLP encoder）
-trf  = conv→relu→pool→(patch embedding)→Transformer encoder→mean pool→fc→ce
-       其中 Transformer encoder 用的是库里的 encoder_t（双向自注意力 + LayerNorm + FFN + 残差，
-       由 complex_net 堆成），patch embedding 把每个空间位置投影成一个 token，
-       mean_pool 把 T 个 token 平均成分类头要的向量。
+trf  = conv→relu→pool→conv→relu→pool→(patch embedding)→Transformer encoder→mean pool→fc→ce
+       卷积 stem 与 cnn2 相同（两次下采样到 7x7），patch embedding 把每个空间位置投影成一个
+       token（16 通道 → d_model），Transformer encoder 用的是库里的 encoder_t（双向自注意力 +
+       LayerNorm + FFN + 残差，由 complex_net 堆成，RoPE 提供 token 顺序），
+       mean_pool 把 49 个 token 平均成分类头要的向量。
 
 # 两条结构各训 3 epoch 后对比（默认 arch=both）
 ./build/examples/mnist_conv --data-dir build/mnist --epochs 3 --train-limit 6000 \
@@ -245,22 +246,25 @@ cnn2          105194       3    0.098669      0.9695      0.9724   120.618
 cnn1          202330       3    0.119815    0.962667       0.964   113.324
 test_acc 差值（cnn1 - cnn2）= -0.0084
 
-# 2000 张 × 2 epoch：CNN vs Transformer encoder（--arch both 的默认组合）
+# 3000 张 × 6 epoch：CNN vs Transformer encoder（--arch both 的默认组合）
 arch          params  epochs  train_loss   train_acc    test_acc   seconds
-cnn2          105194       2    0.218465       0.936      0.9255    16.65
-trf            17914       2     1.31306       0.514       0.559   104.41
-test_acc 差值（trf - cnn2）= -0.3665
+cnn2          105194       6    0.104656    0.969333      0.9535   73.53
+trf            21386       6     0.27073    0.921667       0.899  118.73
+test_acc 差值（trf - cnn2）= -0.0545
+
+# 等容量对比：--arch match 自动把 cnn2 的隐层裁到与 trf 参数量相当
+[conv2] params=21719   [trf] params=21386   （相差 1.6%，再跑同样的训练即可比"同容量")
 ```
 
 读法：
 
 - **CNN 系内部**：两次下采样的 `cnn2` 用一半参数（10.5 万 vs 20.2 万）反而高 0.84 个点——
   第二个卷积层带来的层级特征比把宽特征直接灌进全连接更划算；
-- **CNN vs Transformer**：这个规模下（2000 张 × 2 epoch）Transformer 落后 37 个点，而且慢 6 倍
-  （196 个 token 的自注意力）。它的 loss 仍在稳定下降（2.18 → 1.31，train_acc 0.19 → 0.51），
-  属于**还没训够**：Transformer 没有卷积那样的局部性/平移等变先验，需要更多数据、更多 epoch、
-  更小的学习率或更强正则才能追上。想跑出有意义的曲线就加大 `--epochs` / `--train-limit`
-  （例如 `--arch trf --epochs 20 --train-limit 20000 --lr 5e-4`）。
+- **CNN vs Transformer**：把 token 数从 196 降到 49（第二次池化，自注意力开销降 16 倍）、卷积 stem
+  补成与 CNN 相同的两次卷积之后，Transformer 从 55.9% 提到 **89.9%**，差距缩到 5.5 个点，
+  而参数量只有 CNN 的 1/5（21.4k vs 105.2k）——**按参数算它反而更省**。代价是每 epoch 慢 1.6 倍。
+  继续追平/反超的下一步：等容量对比（`--arch match`，已实现）、dropout / 权重衰减、CLS token、
+  以及更多 epoch（Transformer 缺卷积的局部性先验，需要更多数据与步数）。
 
 按样本前向/反向、用 `cache_updator_t` 做 mini-batch 梯度累加，训练完把权重与元信息写进一个
 `JASMINE_WEIGHTS_V1` 文件，再 `--load` 回来验证往返一致：

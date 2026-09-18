@@ -1618,12 +1618,21 @@ test_acc 差值（conv1 - conv2）= -0.0084
 encoder**。修正后的结构（`--arch trf`）：
 
 ```text
-conv 1→8 5x5 pad2 → ReLU → maxpool 2x2            → [8, 196]
-patch embedding: fc 8→d_model（逐位置投影，一个空间位置 = 一个 token）→ [d_model, 196]
-encoder_t：bidirectional Transformer encoder（MHA+LayerNorm+FFN+残差 × n_layers）
-mean_pool：T 个 token 取平均 → [d_model, 1]
+conv 1→8  5x5 pad2 → ReLU → maxpool 2x2          → [8, 196]
+conv 8→16 5x5 pad2 → ReLU → maxpool 2x2          → [16, 49]      ← 卷积 stem 与 cnn2 相同
+patch embedding: fc 16→d_model（逐位置投影，一个空间位置 = 一个 token）→ [d_model, 49]
+encoder_t：bidirectional Transformer encoder（MHA+LayerNorm+FFN+残差 × n_layers，RoPE 给顺序）
+mean_pool：49 个 token 取平均 → [d_model, 1]
 fc d_model→10 → ce
 ```
+
+v1 版本只做了一次池化（196 个 token、单卷积 stem），第二轮做了三处修改，效果显著：
+
+1. **token 数 196 → 49**（第二次 2x2 池化）：自注意力是 `O(T²·d)`，这一步把注意力开销降了 16 倍，
+   单样本训练时间 30.7ms → 7.2ms（1000 样本 1 epoch：30.7s → 7.2s）；
+2. **卷积 stem 补成两次卷积**，与 cnn2 完全相同的下采样路径（特征 16×7×7），
+   这样比的是"后端用 CNN 还是 Transformer"，而不是"前端特征谁强"；
+3. 训练更久（2000×2 → 3000×6 epoch）且学习率降到 1e-3（Transformer 对步长更敏感）。
 
 用的都是库里现成的积木，**没有为 Transformer 变体新写任何算子**：
 
@@ -1639,17 +1648,24 @@ fc d_model→10 → ce
 实测（真实 MNIST，同一份数据/超参/种子，2000 张训练 × 2 epoch，2000 张测试图）：
 
 ```text
+# v1：196 token、单卷积 stem、2000 张 x 2 epoch
 arch          params  epochs  train_loss   train_acc    test_acc   seconds
 cnn2          105194       2    0.218465       0.936      0.9255    16.65
-trf            17914       2     1.31306       0.514       0.559   104.41
-test_acc 差值（trf - cnn2）= -0.3665
+trf            17914       2     1.31306       0.514       0.559   104.41     ← 落后 36.7 个点
+
+# v2：49 token、双卷积 stem、3000 张 x 6 epoch、lr 1e-3
+arch          params  epochs  train_loss   train_acc    test_acc   seconds
+cnn2          105194       6    0.104656    0.969333      0.9535   73.53
+trf            21386       6     0.27073    0.921667       0.899  118.73     ← 落后 5.5 个点
 ```
 
-结论与预期一致，也值得记下来：
+读法与下一步：
 
-- **这个规模下 CNN 完胜**（92.6% vs 55.9%），而且快 6 倍——196 个 token 的自注意力是
-  `O(T²·d)`，而 CNN 在这里只有 3×3 卷积；
-- Transformer 的 loss 仍在稳步下降（2.18 → 1.31，train_acc 0.19 → 0.51），是**没训够**而不是没学会：
-  它缺卷积那种局部性/平移等变先验，需要更多数据、更多 epoch、更小学习率或更强正则；
-- 想验证"数据量够时 Transformer 能追上/超过 CNN"，把规模调大即可：
-  `--arch both --epochs 20 --train-limit 20000 --lr 5e-4`（Transformer 那条约 20~30 分钟）。
+- 三处修改让 Transformer 从 55.9% → **89.9%**（+34 个点），每 epoch 只慢 1.6 倍；
+- 更关键的是**参数效率**：trf 用 21.4k 参数拿到 89.9%，cnn2 用 105.2k 拿到 95.35%——
+  按参数算 Transformer 反而更省（它的 loss/acc 曲线还在爬，没到平台）；
+- **等容量对比已经做进工具里**：`--arch match` 会先算出 trf 的参数量，再自动反解 cnn2 的隐层宽度
+  （实测把 cnn2 裁到 21,719 参数 vs trf 21,386，相差 1.6%），两者跑同样的训练即可比"同容量谁更强"；
+  也可以用 `--hidden N` 手动指定 CNN 宽度；
+- 还想继续追平：dropout / 权重衰减、CLS token 取代 mean pool、更多 epoch（Transformer 缺卷积的
+  局部性/平移等变先验，需要更多数据与步数）。
