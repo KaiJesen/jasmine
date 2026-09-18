@@ -213,6 +213,114 @@ public:
 };
 
 /**
+ * Dropout 层（inverted dropout）。
+ *
+ *   forward : 每个元素以 keep = 1-p 的概率保留，保留下来的乘以 1/keep —— 这样输出的期望不变，
+ *             推理时直接恒等即可，不需要额外补偿（这就是 "inverted" 的含义）。
+ *   backward: delta ⊙ mask（forward 被丢掉的位置梯度为 0）
+ *
+ * 与 flatten / pool / mean_pool 一样是无参数静态层：没有 updator，`init_weight` / `step` 空实现，
+ * 也没有 `reinit`（不占 complex_net_t::reinit 的容器槽位）。
+ *
+ * **训练/推理开关是显式的**：`set_enabled(false)` 让 forward 变成恒等（评估/推理时用）。
+ * 之所以不做成「infer 时自动跳过」：那要求链上每一层都有 `forward_one`（本库的 `encoder_t`
+ * 没有），会限制它出现在哪些链里；显式开关最简单，也让评估路径一目了然，并且保持了
+ * 训练时前向的可复现性（随机数取自 `g_random_engine`）。
+ */
+template <typename input_type>
+class dropout_net_t
+{
+public:
+    // 公开：允许该层位于 complex_net 链首（complex_net_t 从首个成员取 val_type）
+    using val_type = typename input_type::ele_type;
+private:
+    val_type m_p = val_type(0);         // 丢弃概率
+    bool m_enabled = true;              // false = 恒等（评估/推理）
+    mat_t<val_type> m_input;            // forward 缓存
+    mat_t<val_type> m_mask;             // forward 缓存：保留处 = 1/(1-p)，丢弃处 = 0；空 = 恒等
+public:
+    dropout_net_t() = default;
+    explicit dropout_net_t(val_type const& p) : m_p(p) {}
+
+    void set_param(val_type const& p) { m_p = p; }
+    val_type drop_probability() const { return m_p; }
+    void set_enabled(bool const on) { m_enabled = on; }
+    bool enabled() const { return m_enabled; }
+
+    template <typename Src>
+    mat_t<val_type> forward(Src&& input)
+    {
+        detail::store_for_backward(m_input, std::forward<Src>(input));
+        const int rows = m_input.row_num();
+        const int cols = m_input.col_num();
+
+        if (!m_enabled || m_p <= val_type(0))
+        {
+            m_mask = mat_t<val_type>();                  // 标记为「恒等」
+            return m_input;
+        }
+        if (m_p >= val_type(1))
+            throw std::invalid_argument("dropout_net_t::forward: drop probability must be < 1");
+
+        const val_type keep = val_type(1) - m_p;
+        const val_type scale = val_type(1) / keep;
+        std::uniform_real_distribution<double> uni(0.0, 1.0);
+        mat_t<val_type> out(rows, cols);
+        m_mask = mat_t<val_type>(rows, cols);
+        for (int i = 0; i < rows; ++i)
+        {
+            for (int j = 0; j < cols; ++j)
+            {
+                const bool survive = uni(g_random_engine) < static_cast<double>(keep);
+                m_mask(i, j) = survive ? scale : val_type(0);
+                out(i, j) = m_input(i, j) * m_mask(i, j);
+            }
+        }
+        return out;
+    }
+
+    /** 无状态层：单列输入与整段 forward 相同 */
+    template <typename Src>
+    mat_t<val_type> forward_one(Src&& input)
+    {
+        return forward(std::forward<Src>(input));
+    }
+
+    template <typename other_type>
+    mat_t<val_type> backward(const other_type& delta)
+    {
+        if (delta.row_num() != m_input.row_num() || delta.col_num() != m_input.col_num())
+            throw std::runtime_error("dropout_net_t::backward: delta size does not match input size");
+        if (!m_mask.valid())                             // forward 是恒等 → 梯度原样回传
+            return mat_t<val_type>(delta);
+        mat_t<val_type> out(m_input.row_num(), m_input.col_num());
+        for (int i = 0; i < out.row_num(); ++i)
+            for (int j = 0; j < out.col_num(); ++j)
+                out(i, j) = delta(i, j) * m_mask(i, j);
+        return out;
+    }
+
+    std::string net_type(int const& indent = 0) const
+    {
+        std::stringstream ss;
+        ss << print_indent(indent) << "dropout_net_t:(p:" << m_p
+           << ", " << (m_enabled ? "train" : "eval") << ")";
+        return ss.str();
+    }
+
+    template<typename init_type>
+    void init_weight()
+    {
+        // 无权重
+    }
+
+    void step()
+    {
+        // 无权重
+    }
+};
+
+/**
  * 序列均值池化层：把 [d_model, T] 的 token 序列压成 [d_model, 1]。
  *
  * 用途是 Transformer 分类头的前半段（encoder → **mean pool** → linear → CE）：对 T 个 token

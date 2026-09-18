@@ -182,8 +182,9 @@ using cnn_chain_t = std::conditional_t<
         ::push_back_staticnet<flatten_net_t>           // 6
         ::push_back_updatable<weight_net_t, upr_tpl>   // 7
         ::push_back_staticnet<relu_net_t>              // 8
-        ::push_back_updatable<weight_net_t, upr_tpl>   // 9
-        ::push_back_staticnet<ce_loss_t>               // 10
+        ::push_back_staticnet<dropout_net_t>           // 9 dropout（正则）
+        ::push_back_updatable<weight_net_t, upr_tpl>   // 10
+        ::push_back_staticnet<ce_loss_t>               // 11
         ::type,
     complex_net_builder_t<double>
         ::push_back_updatable<conv2d_net_t, upr_tpl>   // 0
@@ -192,8 +193,9 @@ using cnn_chain_t = std::conditional_t<
         ::push_back_staticnet<flatten_net_t>           // 3
         ::push_back_updatable<weight_net_t, upr_tpl>   // 4
         ::push_back_staticnet<relu_net_t>              // 5
-        ::push_back_updatable<weight_net_t, upr_tpl>   // 6
-        ::push_back_staticnet<ce_loss_t>               // 7
+        ::push_back_staticnet<dropout_net_t>           // 6 dropout（正则）
+        ::push_back_updatable<weight_net_t, upr_tpl>   // 7
+        ::push_back_staticnet<ce_loss_t>               // 8
         ::type>;
 
 /** conv→relu→pool→(逐位置投影成 token)→Transformer encoder→mean pool→fc→ce */
@@ -207,8 +209,9 @@ using trf_chain_t = complex_net_builder_t<double>
     ::push_back_updatable<weight_net_t, upr_tpl>       // 6 patch embedding: 16 → d_model，逐位置
     ::push_back_impl<encoder_t<double, upr_tpl>>       // 7 Transformer encoder（双向）
     ::push_back_staticnet<mean_pool_net_t>             // 8 token 平均
-    ::push_back_updatable<weight_net_t, upr_tpl>       // 9 分类头
-    ::push_back_staticnet<ce_loss_t>                   // 10
+    ::push_back_staticnet<dropout_net_t>               // 9 dropout（正则）
+    ::push_back_updatable<weight_net_t, upr_tpl>       // 10 分类头
+    ::push_back_staticnet<ce_loss_t>                   // 11
     ::type;
 
 template <arch_t A>
@@ -228,8 +231,9 @@ struct idx_t
     static constexpr int encoder = 7;                  // trf
     static constexpr int meanpool = 8;                 // trf
     static constexpr int fc1 = (A == arch_t::cnn2) ? 7 : 4;    // cnn 的 encoder 第一层
-    static constexpr int fc2 = (A == arch_t::cnn2) ? 9 : ((A == arch_t::cnn1) ? 6 : 9);
-    static constexpr int loss = (A == arch_t::cnn2) ? 10 : ((A == arch_t::cnn1) ? 7 : 10);
+    static constexpr int dropout = (A == arch_t::cnn2) ? 9 : ((A == arch_t::cnn1) ? 6 : 9);
+    static constexpr int fc2 = (A == arch_t::cnn2) ? 10 : ((A == arch_t::cnn1) ? 7 : 10);
+    static constexpr int loss = (A == arch_t::cnn2) ? 11 : ((A == arch_t::cnn1) ? 8 : 11);
 };
 
 /** cnn 变体的 flatten 后特征数 */
@@ -241,7 +245,7 @@ constexpr int features_of()
 }
 
 template <arch_t A>
-mnist_net_t<A> make_net(unsigned seed, double lr, int hidden)
+mnist_net_t<A> make_net(unsigned seed, double lr, int hidden, double dropout_p)
 {
     using idx = idx_t<A>;
     mnist_net_t<A> net;
@@ -288,6 +292,7 @@ mnist_net_t<A> make_net(unsigned seed, double lr, int hidden)
     if constexpr (A != arch_t::trf)
         net.template get<idx::fc1>().bias() = 0.0;
 
+    net.template get<idx::dropout>().set_param(static_cast<typename mnist_net_t<A>::val_type>(dropout_p));
     net.set_updator(lr);
     return net;
 }
@@ -397,6 +402,8 @@ struct args_t
     int epochs = 3, batch = 16;
     int hidden = 128;                          // CNN 变体 encoder 的隐层宽度（--hidden，match 模式会自动求解）
     double lr = 2e-3;
+    double dropout = 0.2;                      // 分类头前的 dropout 概率（0 = 关闭）
+    std::string scheduler = "cosine";          // cosine（余弦退火+热重启）| fixed（固定 lr）
     long train_limit = 6000, test_limit = 10000;
     unsigned seed = 1234;
     bool synthetic = false;
@@ -422,6 +429,7 @@ int argmax_col(dmat const& m)
 template <arch_t A>
 double evaluate(mnist_net_t<A>& net, dataset_t const& d, std::size_t limit)
 {
+    net.template get<idx_t<A>::dropout>().set_enabled(false);   // 评估必须关掉 dropout
     const std::size_t n = std::min(limit, d.size());
     std::size_t correct = 0;
     for (std::size_t i = 0; i < n; ++i)
@@ -431,6 +439,7 @@ double evaluate(mnist_net_t<A>& net, dataset_t const& d, std::size_t limit)
         const dmat logits = net.forward(x);        // 只前向；末端 CE 是透传层，不参与梯度
         if (argmax_col(logits) == d.labels[i]) ++correct;
     }
+    net.template get<idx_t<A>::dropout>().set_enabled(true);    // 训练继续用 dropout
     return n == 0 ? 0.0 : static_cast<double>(correct) / static_cast<double>(n);
 }
 
@@ -442,7 +451,7 @@ result_t run_arch(dataset_t const& train, dataset_t const& test, args_t const& a
     r.name = arch_name(A);
     const auto t0 = std::chrono::steady_clock::now();
 
-    auto net = make_net<A>(a.seed, a.lr, a.hidden);
+    auto net = make_net<A>(a.seed, a.lr, a.hidden, a.dropout);
     r.params = param_count<A>(net);
 
     if (!load_path.empty())
@@ -460,6 +469,21 @@ result_t run_arch(dataset_t const& train, dataset_t const& test, args_t const& a
     std::vector<std::size_t> order(train.size());
     for (std::size_t i = 0; i < order.size(); ++i) order[i] = i;
     std::mt19937 rng(a.seed);
+
+    // 学习率调度：余弦退火 + 热重启（库自带的 cosine_annealing_decay），按「mini-batch 步」推进。
+    // init_decay_steps 取总步数的一半 → 训练中途恰好经历一次热重启（之后周期 ×2）。
+    const int steps_per_epoch = static_cast<int>((n_train + static_cast<std::size_t>(a.batch) - 1)
+                                                / static_cast<std::size_t>(a.batch));
+    const int total_steps = std::max(1, steps_per_epoch * std::max(0, a.epochs));
+    cosine_annealing_decay sched(/*epoch_max=*/std::max(total_steps, 1),
+                                 /*init_decay_steps=*/std::max(1, total_steps / 2),
+                                 /*max_lr=*/a.lr,
+                                 /*min_lr=*/a.lr * 0.05,
+                                 /*warmup_rate=*/0.1,
+                                 /*T_multiplier=*/2.0);
+    if (a.scheduler != "cosine" && a.scheduler != "fixed")
+        throw std::runtime_error("unknown --scheduler '" + a.scheduler + "' (expect cosine | fixed)");
+    double lr_now = a.lr;
 
     for (int epoch = 0; epoch < a.epochs; ++epoch)
     {
@@ -484,6 +508,12 @@ result_t run_arch(dataset_t const& train, dataset_t const& test, args_t const& a
             ++in_batch;
             if (in_batch >= a.batch || k + 1 == n_train)
             {
+                if (a.scheduler == "cosine")
+                {
+                    sched.step();                        // 先推进再取：跳过预热里 lr=0 的第 0 步
+                    lr_now = sched.get_lr();
+                    net.set_lr(static_cast<typename mnist_net_t<A>::val_type>(lr_now));
+                }
                 net.step();
                 in_batch = 0;
             }
@@ -494,13 +524,14 @@ result_t run_arch(dataset_t const& train, dataset_t const& test, args_t const& a
         r.train_acc = seen ? static_cast<double>(correct) / static_cast<double>(seen) : 0.0;
         r.test_acc = evaluate<A>(net, test, test_n);
         std::cout << "[" << r.name << "][epoch " << r.epochs << "] train_loss=" << r.loss
-                  << " train_acc=" << r.train_acc << " test_acc=" << r.test_acc << std::endl;
+                  << " train_acc=" << r.train_acc << " test_acc=" << r.test_acc
+                  << " lr=" << lr_now << " cycle=" << sched.get_current_cycle() << std::endl;
     }
 
     if (!save_path.empty())
     {
         save_net<A>(net, save_path, r.epochs, r.loss, r.test_acc);
-        mnist_net_t<A> reloaded = make_net<A>(a.seed + 999, a.lr, a.hidden);
+        mnist_net_t<A> reloaded = make_net<A>(a.seed + 999, a.lr, a.hidden, a.dropout);
         load_net<A>(reloaded, save_path);
         const double acc = evaluate<A>(reloaded, test, test_n);
         std::cout << "[" << r.name << "] [check] 重新载入 test_acc=" << acc;
@@ -553,6 +584,8 @@ int main(int argc, char** argv)
         else if (arg == "--batch") a.batch = std::stoi(next());
         else if (arg == "--lr") a.lr = std::stod(next());
         else if (arg == "--hidden") a.hidden = std::stoi(next());
+        else if (arg == "--dropout") a.dropout = std::stod(next());
+        else if (arg == "--scheduler") a.scheduler = next();
         else if (arg == "--train-limit") a.train_limit = std::stol(next());
         else if (arg == "--test-limit") a.test_limit = std::stol(next());
         else if (arg == "--seed") a.seed = static_cast<unsigned>(std::stoul(next()));
@@ -560,7 +593,8 @@ int main(int argc, char** argv)
         else
         {
             std::cout << "usage: mnist_conv [--arch cnn2|cnn1|trf|both|all|match] [--data-dir DIR] [--epochs N]\n"
-                         "                  [--batch N] [--lr LR] [--hidden N] [--train-limit N] [--test-limit N]\n"
+                         "                  [--batch N] [--lr LR] [--hidden N] [--dropout P] [--train-limit N]\n"
+                         "                  [--scheduler cosine|fixed] [--test-limit N]\n"
                          "                  [--save FILE] [--load FILE] [--synthetic] [--seed N]\n"
                          "  cnn2  = conv->relu->pool->conv->relu->pool->flatten->fc->relu->fc->ce（标准 CNN）\n"
                          "  cnn1  = conv->relu->pool->flatten->fc->relu->fc->ce\n"
@@ -610,7 +644,7 @@ int main(int argc, char** argv)
     if (a.arch == "match")
     {
         // 等容量对比：先算出 Transformer 变体的参数量，再反解 CNN 的隐层宽度
-        const std::size_t trf_params = param_count<arch_t::trf>(make_net<arch_t::trf>(a.seed, a.lr, a.hidden));
+        const std::size_t trf_params = param_count<arch_t::trf>(make_net<arch_t::trf>(a.seed, a.lr, a.hidden, a.dropout));
         a.hidden = hidden_matching(trf_params, /*two_conv=*/true);
         std::cout << "[match] trf 参数量 = " << trf_params << "；把 cnn2 隐层裁到 " << a.hidden
                   << "（参数量 " << cnn_params_for_hidden(a.hidden, true) << "）做等容量对比\n";

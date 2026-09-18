@@ -1669,3 +1669,44 @@ trf            21386       6     0.27073    0.921667       0.899  118.73     ←
   也可以用 `--hidden N` 手动指定 CNN 宽度；
 - 还想继续追平：dropout / 权重衰减、CLS token 取代 mean pool、更多 epoch（Transformer 缺卷积的
   局部性/平移等变先验，需要更多数据与步数）。
+
+### 14.6 接上库里的学习率调度（余弦退火 + 热重启）与 dropout
+
+**调度**：训练循环改用库自带的 `cosine_annealing_decay`（`jas_mat_utility.hpp`），按 **mini-batch 步**
+推进（`--scheduler cosine`，默认）：
+
+```cpp
+const int steps_per_epoch = (n_train + batch - 1) / batch;
+const int total_steps = steps_per_epoch * epochs;
+cosine_annealing_decay sched(/*epoch_max=*/total_steps,
+                             /*init_decay_steps=*/total_steps / 2,   // 中途恰好一次热重启
+                             /*max_lr=*/lr, /*min_lr=*/lr * 0.05,
+                             /*warmup_rate=*/0.1, /*T_multiplier=*/2.0);
+...
+sched.step();                       // 先推进再取，跳过预热里 lr=0 的第 0 步
+net.set_lr(sched.get_lr());         // complex_net_t::set_lr 会遍历链上所有可更新层
+net.step();
+```
+
+日志会打印当前 lr 与 cycle，可以直接看到 `cycle 0 → 1` 的热重启：cnn2 在重启前 95.55%，
+重启后第 3 个 epoch 到 **97.05%**；trf 从 82.3% 一路走到 **91.65%**。
+
+**dropout**：新增 `dropout_net_t`（`jas_net_t.hpp`，inverted dropout）：
+
+- forward：每个元素以 `keep = 1-p` 保留，保留的乘 `1/keep`（输出期望不变，推理时恒等即可）；
+- backward：`delta ⊙ mask`，forward 被丢掉的位置梯度为 0；
+- 训练/推理开关是**显式**的 `set_enabled(bool)`，评估路径里关掉、训练里打开。
+  之所以不做成"infer 时自动跳过"：那要求链上每层都有 `forward_one`，而库里的 `encoder_t` 没有，
+  会限制它出现在哪些链里；
+- 与 flatten/pool/mean_pool 一样是无参静态层（不占 `reinit` 槽位）。
+- `tests/test_dropout.cpp`（7 例）：关闭/p=0 恒等、保留元素按 `1/(1-p)` 缩放、丢弃比例与均值
+  （inverted dropout 的无偏性）、backward 用同一份 mask、非法 p 与形状报错、概念判定、net_type。
+
+**两者一起的效果**（真实 MNIST，同一规模 3000 张 × 6 epoch，2000 张测试图）：
+
+| 配置 | cnn2 | trf |
+|------|------|-----|
+| 固定 lr 1e-3，无 dropout | 0.9535 | 0.8990 |
+| **cosine（含热重启）+ dropout 0.2** | **0.9705** | **0.9165** |
+
+各涨约 1.7 个点，差距仍是 5.4 个点，但 trf 只用了 21.4k 参数（cnn2 是 105.2k）。

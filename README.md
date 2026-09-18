@@ -26,14 +26,14 @@ mat_t<float> s = q.t().dot(k);               // matrix product (CPU: BLAS / GPU:
 | --- | --- |
 | Matrices & expressions | `mat_t` / `mat_view_t` / `mat_reshape_view_t`; lazy expression trees, compile-time fusion, scalar operands, transposed views, zero-copy subviews and shape views, zero-copy BLAS operands |
 | Operators | Arithmetic, comparisons, `exp` / `log` / `sqrt` / `sigmoid`, `dot`, row/column reductions, row-wise softmax, LayerNorm / RMSNorm |
-| Layers | Linear, **Conv2d (im2col + GEMM, full backward)**, **MaxPool2d / AvgPool2d (full backward)**, **Flatten**, **MeanPool（token 序列）**, LayerNorm / RMSNorm, SiLU / GELU / ReLU, SwiGLU gating, residual, **Transformer encoder**, Embedding, cross-entropy / MSE |
+| Layers | Linear, **Conv2d (im2col + GEMM, full backward)**, **MaxPool2d / AvgPool2d (full backward)**, **Flatten**, **MeanPool（token 序列）**, **Dropout**, LayerNorm / RMSNorm, SiLU / GELU / ReLU, SwiGLU gating, residual, **Transformer encoder**, Embedding, cross-entropy / MSE |
 | Models | decoder-only base; **GPT-2** (absolute positions + `gelu_new` + tied lm_head); **LLaMA family** (RoPE + RMSNorm + SwiGLU + GQA/MQA); enc-dec stack |
-| Training | Backprop checked against numerical gradients; SGD / Adam / NAdam; gradient accumulation (`cache_updator_t`) |
+| Training | Backprop checked against numerical gradients; SGD / Adam / NAdam; gradient accumulation (`cache_updator_t`); **cosine annealing with warm restarts** (`cosine_annealing_decay`) |
 | Inference | KV-cache prefill + per-token decoding; greedy / top-k / top-p sampling; streaming output |
 | Weights | Single-file `JASMINE_WEIGHTS_V1` format; **training-result serialization** (per-layer params + meta in one file, `save`/`load` round-trip); direct export from HuggingFace (`tools/`); layer-by-layer / logits golden-value alignment |
 | CUDA | Element-wise chains fused into a single kernel launch, cuBLAS GEMM, reductions, device-side KV cache / RoPE / MHA / a whole LLaMA, backwards and optimizers, **fused attention**, **bf16 / fp16 mixed precision** |
 
-**Status**: the host side passes `ctest` 233/233; the CUDA backend has 174 cases (compute-heavy cases
+**Status**: the host side passes `ctest` 240/240; the CUDA backend has 174 cases (compute-heavy cases
 are skipped by default). The CUDA backend is still being iterated on; target-machine vs test-machine
 differences are covered in [`CUDA.md`](CUDA.md), section 11.
 
@@ -246,11 +246,17 @@ cnn2          105194       3    0.098669      0.9695      0.9724   120.618
 cnn1          202330       3    0.119815    0.962667       0.964   113.324
 test_acc 差值（cnn1 - cnn2）= -0.0084
 
-# 3000 张 × 6 epoch：CNN vs Transformer encoder（--arch both 的默认组合）
+# 3000 张 × 6 epoch，固定 lr 1e-3、无 dropout
 arch          params  epochs  train_loss   train_acc    test_acc   seconds
 cnn2          105194       6    0.104656    0.969333      0.9535   73.53
 trf            21386       6     0.27073    0.921667       0.899  118.73
 test_acc 差值（trf - cnn2）= -0.0545
+
+# 同样的规模，改用余弦退火+热重启（--scheduler cosine）+ dropout 0.2
+arch          params  epochs  train_loss   train_acc    test_acc   seconds
+cnn2          105194       6    0.132647    0.959333      0.9705   66.86
+trf            21386       6     0.33591    0.899333      0.9165  110.03
+test_acc 差值（trf - cnn2）= -0.0540
 
 # 等容量对比：--arch match 自动把 cnn2 的隐层裁到与 trf 参数量相当
 [conv2] params=21719   [trf] params=21386   （相差 1.6%，再跑同样的训练即可比"同容量")
@@ -263,7 +269,11 @@ test_acc 差值（trf - cnn2）= -0.0545
 - **CNN vs Transformer**：把 token 数从 196 降到 49（第二次池化，自注意力开销降 16 倍）、卷积 stem
   补成与 CNN 相同的两次卷积之后，Transformer 从 55.9% 提到 **89.9%**，差距缩到 5.5 个点，
   而参数量只有 CNN 的 1/5（21.4k vs 105.2k）——**按参数算它反而更省**。代价是每 epoch 慢 1.6 倍。
-  继续追平/反超的下一步：等容量对比（`--arch match`，已实现）、dropout / 权重衰减、CLS token、
+- **训练工具**：训练循环接上了库自带的 `cosine_annealing_decay`（余弦退火 + 热重启，按 mini-batch
+  步推进，总步数的一半作为第一个周期 → 中途恰好一次热重启），并加了 `dropout_net_t`（inverted
+  dropout，评估时显式关闭）。两者一起让 cnn2 95.35% → **97.05%**、trf 89.9% → **91.65%**
+  （各涨约 1.7 个点），日志里能看到 `cycle 0 → 1` 的重启点以及重启后精度的跳升。
+- 继续追平/反超的下一步：等容量对比（`--arch match`，已实现）、CLS token 取代 mean pool、
   以及更多 epoch（Transformer 缺卷积的局部性先验，需要更多数据与步数）。
 
 按样本前向/反向、用 `cache_updator_t` 做 mini-batch 梯度累加，训练完把权重与元信息写进一个
