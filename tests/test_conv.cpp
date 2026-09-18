@@ -1,12 +1,15 @@
 /**
- * conv2d_net_t（im2col + GEMM 的二维卷积）单测。
+ * Unit tests for conv2d_net_t (2-D convolution implemented as im2col + GEMM).
  *
- * 覆盖三件事：
- *   1. 前向与朴素卷积参考实现逐点一致（含 stride / padding / dilation / 1x1 通道混合 / 一维特例）；
- *   2. 反向与有限差分一致——输入、权重、偏置三份梯度都要对拍，不能只钉头尾；
- *   3. 作为 `complex_net_t` 的一层参与 forward / backward / step（不占用 reinit 的容器槽位）。
+ * Three things are covered:
+ *   1. the forward matches a naive convolution reference point by point (including stride / padding /
+ *      dilation / 1x1 channel mixing / the 1-D special case);
+ *   2. the backward matches finite differences -- all three gradients (input, weight, bias) are
+ *      compared, not just the first and last entries;
+ *   3. as a member of `complex_net_t` it takes part in forward / backward / step (occupying no reinit
+ *      container slot).
  *
- * 参考值不依赖任何权重文件或外部工具，CI 里始终会跑。
+ * The reference values need no weight file and no external tool, so these tests always run in CI.
  */
 
 #include <cmath>
@@ -31,10 +34,10 @@ namespace
 
 using dmat = mat_t<double>;
 using conv_t = conv2d_net_t<dmat, nadam_t>;
-/** 纯 SGD 便于让 `weight_after == weight_before - grad` 直接读出梯度 */
+/** Plain SGD, so `weight_after == weight_before - grad` exposes the gradient directly */
 using conv_sgd_t = conv2d_net_t<dmat, sgd_t>;
 
-/** 确定性伪随机填充：不依赖全局随机引擎，保证可复现 */
+/** Deterministic pseudo-random fill: no global RNG, so results are reproducible */
 dmat make_mat(int rows, int cols, double scale, unsigned seed)
 {
     dmat m(rows, cols);
@@ -46,7 +49,7 @@ dmat make_mat(int rows, int cols, double scale, unsigned seed)
     return m;
 }
 
-/** 朴素参考实现：六重循环直接按定义累加，作为前向的唯一裁判 */
+/** Naive reference: six nested loops accumulating straight from the definition -- the only judge of the forward */
 dmat reference_conv(const dmat& w, const dmat& b, const dmat& x,
                     int h, int w_in, int kh, int kw,
                     int stride_h, int stride_w, int pad_h, int pad_w,
@@ -85,7 +88,7 @@ dmat reference_conv(const dmat& w, const dmat& b, const dmat& x,
     return y;
 }
 
-/** 一组配置：把「构造 -> 前向对拍」的样板收在一处 */
+/** One configuration group: keeps the "construct -> compare forward" boilerplate in one place */
 struct conv_case
 {
     int c_in, c_out, h, w, kh, kw, sh, sw, ph, pw, dh, dw;
@@ -96,14 +99,14 @@ struct conv_case
 
 TEST(Conv2d, ForwardMatchesReference)
 {
-    // 覆盖：无 padding 单位步长、stride=2 + padding、dilation=2、非方输入、以及
-    // 大到会走 BLAS 快速路径的尺寸（M*N*K >= 16^3）。
+    // covers: unit stride without padding, stride=2 + padding, dilation=2, non-square input, and a
+    // size large enough to take the BLAS fast path (M*N*K >= 16^3).
     const std::vector<conv_case> cases = {
         {2, 3, 3, 4, 2, 2, 1, 1, 0, 0, 1, 1, 11},
         {2, 3, 5, 6, 3, 3, 2, 2, 1, 1, 1, 1, 12},
         {1, 2, 6, 6, 3, 3, 1, 1, 0, 0, 2, 2, 13},
         {3, 4, 4, 7, 2, 3, 1, 2, 0, 0, 1, 1, 14},
-        {4, 5, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1, 15},   // M*N*K = 5*64*36 > 4096，走 BLAS
+        {4, 5, 8, 8, 3, 3, 1, 1, 1, 1, 1, 1, 15},   // M*N*K = 5*64*36 > 4096, takes the BLAS path
     };
 
     for (const auto& c : cases)
@@ -124,7 +127,7 @@ TEST(Conv2d, ForwardMatchesReference)
 
 TEST(Conv2d, OneByOneIsChannelMix)
 {
-    // 1x1 卷积没有空间混合：y = W · x，与 weight_net_t 完全同形
+    // a 1x1 convolution has no spatial mixing: y = W * x, exactly the shape of weight_net_t
     const int c_in = 3, c_out = 2, h = 2, w = 3;
     conv_t conv(c_in, c_out, h, w, 1, 1);
     conv.weight() = make_mat(c_out, c_in, 0.5, 21);
@@ -133,13 +136,13 @@ TEST(Conv2d, OneByOneIsChannelMix)
 
     const dmat y = conv.forward(x);
     ExpectShape(y, c_out, h * w);
-    const dmat ref = conv.weight().dot(x) + conv.bias();     // 1x1 核就是一次通道混合
+    const dmat ref = conv.weight().dot(x) + conv.bias();     // a 1x1 kernel is one channel mixing
     ExpectNearMat(y, ref, 1e-12);
 }
 
 TEST(Conv2d, Conv1dIsOneRowSpecialCase)
 {
-    // 序列卷积：H=1、Kh=1、pad_h=0，长度 L 的序列当作 [C_in, 1*L]
+    // sequence convolution: H=1, Kh=1, pad_h=0, a length-L sequence fed as [C_in, 1*L]
     const int c_in = 2, c_out = 3, L = 7, k = 3, stride = 2, pad = 1;
     conv_t conv = conv_t::one_d(c_in, c_out, L, k, stride, pad);
     conv.weight() = make_mat(c_out, c_in * k, 0.5, 31);
@@ -148,7 +151,7 @@ TEST(Conv2d, Conv1dIsOneRowSpecialCase)
     const dmat x = make_mat(c_in, L, 0.5, 33);
     const dmat y = conv.forward(x);
 
-    // 便捷入口不能改掉底层配置：H/Kh 必须是 1，H_out 必须是 1
+    // the convenience entry must not change the underlying configuration: H/Kh must be 1, H_out must be 1
     EXPECT_EQ(conv.in_h(), 1);
     EXPECT_EQ(conv.kernel_h(), 1);
     EXPECT_EQ(conv.out_h(), 1);
@@ -162,11 +165,12 @@ TEST(Conv2d, Conv1dIsOneRowSpecialCase)
 
 TEST(Conv2d, BackwardMatchesNumericalGradient)
 {
-    // 端到端数值梯度：对输入、权重、偏置逐项做中心差分，与 backward 的解析梯度比对。
-    // 损失取 L = Σ 0.5·y²，于是 ∂L/∂y = y，直接拿前向输出当 delta。
-    // 用 SGD(lr=1)，令 weight_after == weight_before - grad，直接从参数差读出梯度。
-    // 故意混入 stride=2 + padding + 非方输入：被 padding 丢弃的位置与跳过的位置
-    // 都必须贡献**恰好 0** 的梯度，这是 col2im 最容易写错的地方。
+    // End-to-end numerical gradient: central differences over every input, weight and bias entry,
+    // compared with the analytic gradient from backward. The loss is L = sum 0.5*y^2, so dL/dy = y
+    // and the forward output serves as delta. With SGD(lr=1) the parameter difference is the
+    // gradient. stride=2 + padding + a non-square input are mixed in on purpose: positions dropped
+    // by padding and positions skipped by the stride must contribute **exactly zero** gradient --
+    // the place where col2im is easiest to get wrong.
     const int c_in = 2, c_out = 3, h = 4, w = 5, kh = 3, kw = 2;
     const int sh = 2, sw = 1, ph = 1, pw = 0;
 
@@ -179,7 +183,8 @@ TEST(Conv2d, BackwardMatchesNumericalGradient)
 
     const dmat y = conv.forward(x);
 
-    // 快照：backward 会原地更新权重与偏置，数值梯度必须基于同一份参数状态
+    // snapshot: backward updates weight and bias in place, so the numerical gradient has to start
+    // from the same parameter state
     const conv_sgd_t pristine = conv;
     const dmat w_before = conv.weight();
     const dmat b_before = conv.bias();
@@ -236,9 +241,10 @@ TEST(Conv2d, BackwardMatchesNumericalGradient)
 
 TEST(Conv2d, BackwardAccumulatesOverlappingPatches)
 {
-    // 单位步长、大核：同一个输入像素被多个输出窗口共享，∂L/∂x 必须是**累加**而非覆盖。
-    // 取全 1 权重 / 0 偏置 / 全 1 delta，解析梯度就等于「该像素参与的窗口数」，
-    // 这正是重叠计数，任何"写而不是加"的实现都会在这里露馅。
+    // Unit stride, large kernel: one input pixel is shared by several output windows, so dL/dx must
+    // **accumulate** rather than be overwritten. With all-ones weights, zero bias and an all-ones
+    // delta the analytic gradient is simply the number of windows the pixel takes part in -- an
+    // overlap count that any "write instead of add" implementation fails.
     const int c_in = 1, c_out = 1, h = 3, w = 3, k = 2;
     conv_sgd_t conv(c_in, c_out, h, w, k, k);
     conv.weight() = 1.0;
@@ -249,15 +255,16 @@ TEST(Conv2d, BackwardAccumulatesOverlappingPatches)
     conv.forward(x);
     const dmat dx = conv.backward(dmat(c_out, (h - k + 1) * (w - k + 1)) = 1.0);
 
-    // 2x2 核在 3x3 输入上：四角 1 次、边中 2 次、中心 4 次
+    // a 2x2 kernel on a 3x3 input: corners once, edge middles twice, centre four times
     ExpectNearMat(dx, dmat(1, 9, {1, 2, 1, 2, 4, 2, 1, 2, 1}), 1e-12);
 }
 
 TEST(Conv2d, DegenerateShapesStillWork)
 {
-    // 退化到「单通道 + 1x1 输入 + 1x1 核」时，mat_t 会把权重/偏置/im2col 全当成标量矩阵。
-    // 这条路径专门用来钉住标量分支：既不能崩（reshape(1,1) 会读空矩阵的 (0,0)），
-    // 也不能把梯度算错——C_out==1 的偏置在真实网络里非常常见。
+    // Degenerating to "one channel + 1x1 input + 1x1 kernel": mat_t treats the weight, bias and
+    // im2col all as scalar matrices. This path exists to pin the scalar branch down -- it must
+    // neither crash (reshape(1,1) reads (0,0) of an empty matrix) nor compute the gradient wrongly,
+    // and a single output channel is very common in real networks.
     conv_sgd_t conv(1, 1, 1, 1, 1, 1);
     conv.set_updator(1.0);
     conv.weight() = 2.0;
@@ -277,21 +284,22 @@ TEST(Conv2d, DegenerateShapesStillWork)
 
 TEST(Conv2d, ZeroCopyColViewForPatchifyGeometry)
 {
-    // C_in=1、行方向不卷、宽度按核大小不重叠 —— 这时 col 就是输入本体的重解释（patchify / ViT
-    // patch embedding / 非重叠一维卷积），层必须走零拷贝视图路径。
+    // C_in=1, no convolution along the rows, width windows non-overlapping by kernel size -- here col
+    // is a reinterpretation of the input itself (patchify / ViT patch embedding / non-overlapping
+    // 1-D convolution) and the layer has to take the zero-copy view path.
     const int c_out = 4, h = 2, w = 12, kh = 1, kw = 3;
     conv_t conv(/*c_in=*/1, c_out, h, w, kh, kw, /*sh=*/1, /*sw=*/kw, /*ph=*/0, /*pw=*/0);
     EXPECT_TRUE(conv.col_view_enabled());
 
-    // 只有单通道才成立：多通道时内存是通道优先，折不成一个矩阵
+    // only with a single channel: with several channels memory is channel-major and cannot be folded into one matrix
     conv_t multi(2, c_out, h, w, kh, kw, 1, kw, 0, 0);
     EXPECT_FALSE(multi.col_view_enabled());
 
-    // 重叠窗口（stride < kw）不成立
+    // overlapping windows (stride < kw) do not qualify
     conv_t overlap(1, c_out, h, w, 1, kw, 1, 1, 0, 0);
     EXPECT_FALSE(overlap.col_view_enabled());
 
-    // 非 1x1 的核高（kh > 1）也不成立
+    // a kernel height other than 1 (kh > 1) does not qualify either
     conv_t tall(1, c_out, h, w, 2, kw, 1, kw, 0, 0);
     EXPECT_FALSE(tall.col_view_enabled());
 
@@ -304,7 +312,7 @@ TEST(Conv2d, ZeroCopyColViewForPatchifyGeometry)
                                     1, kw, 0, 0, 1, 1);
     ExpectNearMat(y, ref, 1e-12);
 
-    // 显式按视图语义算一遍，确认走的就是这条等式
+    // compute it explicitly through the view semantics to confirm which identity is used
     const int n = (h - kh + 1) * ((w - kw) / kw + 1);
     dmat col(kw, n);
     for (int oh = 0; oh < h - kh + 1; ++oh)
@@ -314,18 +322,18 @@ TEST(Conv2d, ZeroCopyColViewForPatchifyGeometry)
     dmat ref_col = conv.weight().dot(col) + conv.bias();
     ExpectNearMat(y, ref_col, 1e-12);
 
-    // 反向：dW 同样来自视图（delta · (colᵀ) = delta · windows）
+    // backward: dW comes from the view as well (delta * col^T = delta * windows)
     conv_sgd_t sgd_conv(1, c_out, h, w, kh, kw, 1, kw, 0, 0);
     sgd_conv.weight() = conv.weight();
     sgd_conv.bias() = conv.bias();
     sgd_conv.set_updator(1.0);
     const dmat w_before = sgd_conv.weight();
     const dmat delta = make_mat(c_out, n, 0.5, 94);
-    sgd_conv.forward(x);                       // 视图路径的 backward 要靠 forward 缓存的输入
+    sgd_conv.forward(x);                       // the view path's backward relies on the cached input
     const dmat dx = sgd_conv.backward(delta);
     ExpectShape(dx, 1, h * w);
 
-    // 朴素参考梯度
+    // naive reference gradient
     dmat ref_dw(c_out, kw);
     ref_dw = 0.0;
     dmat ref_dx(1, h * w);
@@ -344,7 +352,7 @@ TEST(Conv2d, ZeroCopyColViewForPatchifyGeometry)
     ExpectNearMat(w_before - sgd_conv.weight(), ref_dw, 1e-12);
     ExpectNearMat(dx, ref_dx, 1e-12);
 
-    // 视图路径与通用路径（等价几何、用 multi 配置跑同一份权重）结果一致
+    // the view path agrees with the generic path (equivalent geometry, same weights, multi-channel config)
     conv_sgd_t generic(1, c_out, h, w, kh, kw, 1, kw, 0, 0);
     generic.set_param(1, c_out, h, w, kh, kw, 1, kw, 0, 0);
     generic.weight() = conv.weight();
@@ -354,7 +362,7 @@ TEST(Conv2d, ZeroCopyColViewForPatchifyGeometry)
 
 TEST(Conv2d, OneDZeroCopyMatchesReference)
 {
-    // 非重叠一维卷积（H=1）—— 便捷入口 one_d 也应吃到零拷贝路径
+    // non-overlapping 1-D convolution (H=1): the one_d entry should reach the zero-copy path too
     const int c_out = 8, L = 60, k = 3, stride = k;
     conv_t conv = conv_t::one_d(1, c_out, L, k, stride, 0);
     EXPECT_TRUE(conv.col_view_enabled());
@@ -371,11 +379,11 @@ TEST(Conv2d, RejectsBadShapes)
     conv_sgd_t conv(2, 3, 3, 3, 2, 2);
     conv.forward(make_mat(2, 9, 0.1, 51));
 
-    // 前向：必须是 [C_in, H*W]
+    // forward: must be [C_in, H*W]
     EXPECT_THROW(conv.forward(make_mat(3, 9, 0.1, 52)), std::invalid_argument);
     EXPECT_THROW(conv.forward(make_mat(2, 8, 0.1, 53)), std::invalid_argument);
 
-    // 反向：必须是 [C_out, H_out*W_out] = [3, 2*2]
+    // backward: must be [C_out, H_out*W_out] = [3, 2*2]
     EXPECT_NO_THROW(conv.backward(make_mat(3, 4, 0.1, 54)));
     EXPECT_THROW(conv.backward(make_mat(2, 4, 0.1, 55)), std::runtime_error);
     EXPECT_THROW(conv.backward(make_mat(3, 5, 0.1, 56)), std::runtime_error);
@@ -386,7 +394,7 @@ TEST(Conv2d, UnconfiguredLayerFailsFast)
     conv_sgd_t conv;
     EXPECT_THROW(conv.forward(make_mat(1, 4, 0.1, 61)), std::runtime_error);
     EXPECT_THROW(conv.backward(make_mat(1, 4, 0.1, 62)), std::runtime_error);
-    // set_param 之后立即可用（权重/偏置为 0）
+    // usable immediately after set_param (weight and bias are 0)
     conv.set_param(1, 1, 2, 2, 1, 1);
     ExpectNearMat(conv.forward(make_mat(1, 4, 0.5, 63)), dmat(1, 4) = 0.0, 1e-12);
 }
@@ -394,11 +402,11 @@ TEST(Conv2d, UnconfiguredLayerFailsFast)
 TEST(Conv2d, SetParamRejectsInvalidConfig)
 {
     conv_sgd_t conv;
-    EXPECT_THROW(conv.set_param(0, 1, 3, 3, 1, 1), std::invalid_argument);   // 通道为 0
-    EXPECT_THROW(conv.set_param(1, 1, 3, 3, 0, 1), std::invalid_argument);   // 核为 0
-    EXPECT_THROW(conv.set_param(1, 1, 3, 3, 2, 2, 0, 1), std::invalid_argument);  // stride 为 0
-    EXPECT_THROW(conv.set_param(1, 1, 3, 3, 2, 2, 1, 1, -1, 0), std::invalid_argument); // 负 pad
-    EXPECT_THROW(conv.set_param(1, 1, 3, 3, 4, 4), std::invalid_argument);   // 核比输入大
+    EXPECT_THROW(conv.set_param(0, 1, 3, 3, 1, 1), std::invalid_argument);   // 0 channels
+    EXPECT_THROW(conv.set_param(1, 1, 3, 3, 0, 1), std::invalid_argument);   // 0 kernel
+    EXPECT_THROW(conv.set_param(1, 1, 3, 3, 2, 2, 0, 1), std::invalid_argument);  // 0 stride
+    EXPECT_THROW(conv.set_param(1, 1, 3, 3, 2, 2, 1, 1, -1, 0), std::invalid_argument); // negative pad
+    EXPECT_THROW(conv.set_param(1, 1, 3, 3, 4, 4), std::invalid_argument);   // kernel larger than input
 }
 
 TEST(Conv2d, InitWeightFillsConfiguredShapes)
@@ -413,12 +421,13 @@ TEST(Conv2d, InitWeightFillsConfiguredShapes)
     for (int i = 0; i < conv.weight().row_num(); ++i)
         for (int j = 0; j < conv.weight().col_num(); ++j)
             norm += std::abs(conv.weight()(i, j));
-    EXPECT_GT(norm, 0.0) << "init_weight 之后权重不应全为 0";
+    EXPECT_GT(norm, 0.0) << "the weights must not be all zero after init_weight";
 }
 
 TEST(Conv2d, IsUpdatableButNotReinitDetectedByConcept)
 {
-    // set_param 而非 reinit：本层形状来自自身配置，不该占用 complex_net_t::reinit 的容器槽位
+    // set_param rather than reinit: this layer's shape comes from its own configuration, so it
+    // should not occupy a complex_net_t::reinit container slot
     static_assert(is_updatable_net<conv_t>);
     static_assert(!is_reinitable_net<conv_t>);
     SUCCEED();
@@ -426,7 +435,7 @@ TEST(Conv2d, IsUpdatableButNotReinitDetectedByConcept)
 
 TEST(Conv2d, ChainInsideComplexNet)
 {
-    // conv -> relu 作为 complex_net_t 的一整条链：前向出形状、反向回形状、step 不炸
+    // conv -> relu as one complex_net_t chain: forward yields a shape, backward returns one, step survives
     using conv_relu_t = complex_net_builder_t<double>
         ::push_back_updatable<conv2d_net_t, sgd_t>
         ::push_back_staticnet<relu_net_t>
@@ -453,8 +462,8 @@ TEST(Conv2d, ChainInsideComplexNet)
 
 TEST(Conv2d, BackwardOnTwelveByTwelveHitsGemmFastPath)
 {
-    // 尺寸足以走 BLAS/分块 GEMM（M*N*K 远超阈值），确保两条实现路径给出同一结果：
-    // 解析梯度与朴素参考实现算出的梯度一致。
+    // Sized well beyond the BLAS/blocked GEMM threshold (M*N*K far above it), so both
+    // implementation paths must agree: the analytic gradient matches the naive reference.
     const int c_in = 3, c_out = 4, h = 12, w = 12, k = 3;
     conv_sgd_t conv(c_in, c_out, h, w, k, k);
     conv.set_updator(1.0);
@@ -467,7 +476,7 @@ TEST(Conv2d, BackwardOnTwelveByTwelveHitsGemmFastPath)
     const dmat b_before = conv.bias();
     const dmat dx = conv.backward(y);
 
-    // 朴素参考的反向：直接对定义式求导，逐点累加 ∂L/∂x
+    // the naive reference backward: differentiate the definition directly, accumulating dL/dx per point
     const int h_out = h - k + 1, w_out = w - k + 1;
     dmat ref_dx(c_in, h * w);
     ref_dx = 0.0;
@@ -514,5 +523,5 @@ TEST(Conv2d, NetTypeReportsShapes)
     const std::string s = conv.net_type();
     EXPECT_NE(s.find("conv2d_net_t"), std::string::npos);
     EXPECT_NE(s.find("in:2x4x5"), std::string::npos);
-    EXPECT_NE(s.find("out:3x4x5"), std::string::npos);   // 3x3 + pad 1 保持尺寸
+    EXPECT_NE(s.find("out:3x4x5"), std::string::npos);   // 3x3 + pad 1 preserves the size
 }

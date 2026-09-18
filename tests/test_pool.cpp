@@ -1,12 +1,14 @@
 /**
- * pool2d_net_t（最大池化 / 平均池化）单测。
+ * Unit tests for pool2d_net_t (max / average pooling).
  *
- * 覆盖四件事：
- *   1. 前向与朴素参考实现逐点一致（stride / padding / 非方核 / 多通道 / 一维特例）；
- *   2. 与 PyTorch 的语义对齐——并列最大值走「第一个」、平均池化的 count_include_pad、
- *      输出尺寸与 padding 约束（基准值由 torch 2.9 的 F.max_pool2d / F.avg_pool2d 生成）；
- *   3. 反向与有限差分一致，重叠窗口必须累加；
- *   4. 作为「静态层」参与 complex_net_t（无 updator、不占 reinit 槽位）。
+ * Four things are covered:
+ *   1. the forward matches a naive reference point by point (stride / padding / non-square kernel /
+ *      several channels / the 1-D special case);
+ *   2. the semantics aligned with PyTorch -- ties go to the first maximum, average pooling's
+ *      count_include_pad, the output sizes and the padding constraint (the golden values come from
+ *      torch 2.9's F.max_pool2d / F.avg_pool2d);
+ *   3. the backward matches finite differences, and overlapping windows must accumulate;
+ *   4. as a "static layer" it takes part in complex_net_t (no updator, no reinit slot).
  */
 
 #include <cmath>
@@ -33,7 +35,7 @@ namespace
 using dmat = mat_t<double>;
 using pool_t = pool2d_net_t<dmat>;
 
-/** 确定性伪随机填充：不依赖全局随机引擎，保证可复现 */
+/** Deterministic pseudo-random fill: no global RNG, so results are reproducible */
 dmat make_mat(int rows, int cols, double scale, unsigned seed)
 {
     dmat m(rows, cols);
@@ -45,7 +47,7 @@ dmat make_mat(int rows, int cols, double scale, unsigned seed)
     return m;
 }
 
-/** 朴素参考实现：逐通道、逐输出位置直接按定义扫描窗口 */
+/** Naive reference: scan the window per channel and per output position, straight from the definition */
 dmat reference_pool(const dmat& x, int h, int w, int kh, int kw,
                     int sh, int sw, int ph, int pw, pool_mode mode, bool include_pad)
 {
@@ -89,7 +91,7 @@ dmat reference_pool(const dmat& x, int h, int w, int kh, int kw,
     return y;
 }
 
-/** `1 x 1 x 3 x 3` 的 1..9，PyTorch 基准值统一用它 */
+/** 1..9 laid out as 1 x 1 x 3 x 3; every PyTorch golden value uses it */
 dmat ramp_3x3()
 {
     return dmat(1, 9, {1, 2, 3, 4, 5, 6, 7, 8, 9});
@@ -106,14 +108,14 @@ dmat ones(int rows, int cols)
 
 TEST(Pool2d, MaxForwardMatchesReference)
 {
-    // 覆盖：不重叠、重叠、padding、非方核、非方输入、多通道
+    // covers: non-overlapping, overlapping, padding, non-square kernel, non-square input, channels
     struct c { int h, w, kh, kw, sh, sw, ph, pw, ch; unsigned seed; };
     const std::vector<c> cases = {
         {3, 3, 2, 2, 2, 2, 0, 0, 1, 11},
         {3, 3, 2, 2, 1, 1, 1, 1, 1, 12},
         {5, 7, 3, 2, 2, 1, 1, 0, 2, 13},
         {6, 6, 3, 3, 2, 2, 1, 1, 3, 14},
-        {4, 4, 1, 1, 1, 1, 0, 0, 2, 15},   // 1x1 池化 = 恒等
+        {4, 4, 1, 1, 1, 1, 0, 0, 2, 15},   // 1x1 pooling = identity
     };
 
     for (const auto& t : cases)
@@ -154,8 +156,8 @@ TEST(Pool2d, AverageForwardMatchesReference)
 
 TEST(Pool2d, MatchesPyTorchMaxGoldens)
 {
-    // 基准来自 torch 2.9：F.max_pool2d(x, 2, 2) / (2, stride=1, padding=1)，
-    // 输入 x = arange(1,10).reshape(1,1,3,3)，grad = (∂Σy/∂x)（即 delta 全 1 时 backward 的返回）
+    // golden values from torch 2.9: F.max_pool2d(x, 2, 2) and (2, stride=1, padding=1), with
+    // x = arange(1,10).reshape(1,1,3,3); grad = d(sum y)/dx (what backward returns for delta = 1)
     const dmat x = ramp_3x3();
 
     {
@@ -180,7 +182,7 @@ TEST(Pool2d, MatchesPyTorchMaxGoldens)
     }
 
     {
-        // 非方核 + 非方步长、3x4 输入（arange(1,13)）
+        // non-square kernel + non-square stride, 3x4 input (arange(1,13))
         const dmat x2(1, 12, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
         pool_t pool(pool_mode::max, 3, 4, 2, 3, 2, 1);
         const dmat y = pool.forward(x2);
@@ -191,7 +193,7 @@ TEST(Pool2d, MatchesPyTorchMaxGoldens)
     }
 
     {
-        // 多通道：通道之间必须互不干扰
+        // several channels: they must not interfere with each other
         const dmat x3(2, 9, {1, 2, 3, 4, 5, 6, 7, 8, 9,
                              10, 11, 12, 13, 14, 15, 16, 17, 18});
         pool_t pool(pool_mode::max, 3, 3, 2, 2);
@@ -204,7 +206,7 @@ TEST(Pool2d, MatchesPyTorchAverageGoldens)
     const dmat x = ramp_3x3();
 
     {
-        // F.avg_pool2d(x, 2) —— 默认 count_include_pad 无关（无 padding）
+        // F.avg_pool2d(x, 2) -- with no padding count_include_pad is irrelevant
         pool_t pool(pool_mode::average, 3, 3, 2, 2);
         ExpectNearMat(pool.forward(x), dmat(1, 1, {3.0}), 1e-12);
         const dmat grad = pool.backward(ones(1, 1));
@@ -212,20 +214,21 @@ TEST(Pool2d, MatchesPyTorchAverageGoldens)
     }
 
     {
-        // F.avg_pool2d(x, 2, stride=1, padding=1)：默认 count_include_pad=True，除数恒为 4
+        // F.avg_pool2d(x, 2, stride=1, padding=1): count_include_pad defaults to True, divisor always 4
         pool_t pool(pool_mode::average, 3, 3, 2, 2, 1, 1, 1, 1, true);
         const dmat y = pool.forward(x);
         ExpectNearMat(y, dmat(1, 16, {0.25, 0.75, 1.25, 0.75,
                                       1.25, 3.0, 4.0, 2.25,
                                       2.75, 6.0, 7.0, 3.75,
                                       1.75, 3.75, 4.25, 2.25}), 1e-12);
-        // 每个输出对窗口内 4 个位置各贡献 1/4，合计贡献 1 —— 于是每个输入都恰好拿到 1
+        // every output contributes 1/4 to each of the 4 window positions, i.e. 1 in total, so each
+        // input ends up with exactly 1
         const dmat grad = pool.backward(ones(1, 16));
         ExpectNearMat(grad, dmat(1, 9, {1, 1, 1, 1, 1, 1, 1, 1, 1}), 1e-12);
     }
 
     {
-        // count_include_pad=False：除数改为窗口内有效元素个数
+        // count_include_pad=False: the divisor becomes the number of valid elements in the window
         pool_t pool(pool_mode::average, 3, 3, 2, 2, 1, 1, 1, 1, false);
         const dmat y = pool.forward(x);
         ExpectNearMat(y, dmat(1, 16, {1.0, 1.5, 2.5, 3.0,
@@ -239,7 +242,7 @@ TEST(Pool2d, MatchesPyTorchAverageGoldens)
     }
 
     {
-        // 非方核 + 非方步长，3x4 输入：窗口 2x3，步长 2x1
+        // non-square kernel + non-square stride, 3x4 input: window 2x3, stride 2x1
         const dmat x2(1, 12, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
         pool_t pool(pool_mode::average, 3, 4, 2, 3, 2, 1, 0, 0);
         const dmat y = pool.forward(x2);
@@ -254,8 +257,8 @@ TEST(Pool2d, MatchesPyTorchAverageGoldens)
 
 TEST(Pool2d, MaxTieRoutesWholeGradientToFirstIndex)
 {
-    // PyTorch CPU 的约定：并列最大值只把梯度给**第一个**（行优先），不均分。
-    // x = [[1,1],[1,1]]、max_pool2d(2) 的 grad 是 [1,0,0,0]。
+    // PyTorch's CPU convention: a tie gives the whole gradient to the **first** maximum (row-major)
+    // instead of splitting it. For x = [[1,1],[1,1]], max_pool2d(2) yields grad [1,0,0,0].
     pool_t pool(pool_mode::max, 2, 2, 2, 2);
     const dmat x(1, 4, {1, 1, 1, 1});
     const dmat y = pool.forward(x);
@@ -263,7 +266,7 @@ TEST(Pool2d, MaxTieRoutesWholeGradientToFirstIndex)
     const dmat grad = pool.backward(ones(1, 1));
     ExpectNearMat(grad, dmat(1, 4, {1, 0, 0, 0}), 1e-12);
 
-    // 部分并列时同理：先出现的那个拿走全部梯度
+    // same with a partial tie: whichever appears first takes the whole gradient
     pool_t pool2(pool_mode::max, 2, 2, 2, 2);
     const dmat x2(1, 4, {2, 1, 2, 1});
     pool2.forward(x2);
@@ -273,12 +276,13 @@ TEST(Pool2d, MaxTieRoutesWholeGradientToFirstIndex)
 
 TEST(Pool2d, AverageOverlappingWindowsAccumulate)
 {
-    // 全 1 输入、2x2 核、步长 1：每个像素拿到「覆盖它的窗口数 / 4」。
-    // 3x3 上四角 1 个窗口、边中 2 个、中心 4 个 —— 任何"写而不是加"的实现都过不了。
+    // All-ones input, 2x2 kernel, stride 1: every pixel gets "windows covering it / 4". On a 3x3,
+    // corners sit in 1 window, edge middles in 2 and the centre in 4 -- an implementation that
+    // writes instead of adding cannot pass.
     pool_t pool(pool_mode::average, 3, 3, 2, 2, 1, 1, 0, 0);
     const dmat x = ones(1, 9);
     const dmat y = pool.forward(x);
-    ExpectNearMat(y, dmat(1, 4, {1, 1, 1, 1}), 1e-12);   // 每个窗口均值都是 1
+    ExpectNearMat(y, dmat(1, 4, {1, 1, 1, 1}), 1e-12);   // every window mean is 1
 
     const dmat grad = pool.backward(ones(1, 4));
     ExpectNearMat(grad, dmat(1, 9, {0.25, 0.5, 0.25,
@@ -288,9 +292,10 @@ TEST(Pool2d, AverageOverlappingWindowsAccumulate)
 
 TEST(Pool2d, BackwardMatchesNumericalGradient)
 {
-    // 数值梯度：损失 L = Σ 0.5·y²，于是 ∂L/∂y = y，直接拿前向输出当 delta。
-    // 最大池化故意用互不相同的随机值（并列点不可导，中心差分不适用），
-    // 平均池化则两种 count_include_pad 都测。
+    // Numerical gradients: the loss is L = sum 0.5*y^2, hence dL/dy = y and the forward output is
+    // used as delta directly. Max pooling deliberately uses distinct random values (ties are not
+    // differentiable, so central differences do not apply); average pooling tests both
+    // count_include_pad settings.
     struct c { pool_mode mode; bool include_pad; int h, w, kh, kw, sh, sw, ph, pw; unsigned seed; };
     const std::vector<c> cases = {
         {pool_mode::max, true, 4, 5, 3, 2, 2, 1, 1, 0, 41},
@@ -348,7 +353,7 @@ TEST(Pool2d, StrideDefaultsToKernelSize)
 
 TEST(Pool2d, OneDIsOneRowSpecialCase)
 {
-    // 序列池化：H=1、Kh=1、pad_h=0，长度 L 的序列当作 [C, 1*L]
+    // sequence pooling: H=1, Kh=1, pad_h=0, a length-L sequence fed as [C, 1*L]
     const int L = 7, k = 2, stride = 2;
     pool_t pool = pool_t::one_d(pool_mode::max, L, k, stride);
     EXPECT_EQ(pool.in_h(), 1);
@@ -357,7 +362,7 @@ TEST(Pool2d, OneDIsOneRowSpecialCase)
 
     const dmat x(2, L, {1, 3, 2, 6, 5, 4, 7,
                         7, 1, 2, 3, 4, 5, 6});
-    // floor 语义：(7 - 2)/2 + 1 = 3，最后一个落单的元素被丢掉（与 PyTorch floor 模式一致）
+    // floor semantics: (7 - 2)/2 + 1 = 3; the leftover element is dropped (as in PyTorch's floor mode)
     const dmat y = pool.forward(x);
     ExpectShape(y, 2, 3);
     ExpectNearMat(y, dmat(2, 3, {3, 6, 5,
@@ -365,7 +370,7 @@ TEST(Pool2d, OneDIsOneRowSpecialCase)
     ExpectNearMat(y, reference_pool(x, 1, L, 1, k, 1, stride, 0, 0, pool_mode::max, true),
                   1e-12);
 
-    // 平均池化的一维形式同样只走同一条实现
+    // the 1-D form of average pooling goes through the very same implementation
     pool_t avg = pool_t::one_d(pool_mode::average, L, k, stride);
     ExpectNearMat(avg.forward(x),
                   reference_pool(x, 1, L, 1, k, 1, stride, 0, 0, pool_mode::average, true),
@@ -380,7 +385,7 @@ TEST(Pool2d, RejectsBadShapes)
     EXPECT_THROW(pool.forward(make_mat(2, 8, 0.1, 52)), std::invalid_argument);
     EXPECT_THROW(pool.forward(dmat(0, 0)), std::invalid_argument);
 
-    // delta 必须是 [C, H_out*W_out] = [2, 1]（3x3 输入、2x2 核、步长 2 → 输出 1x1）
+    // delta must be [C, H_out*W_out] = [2, 1] (3x3 input, 2x2 kernel, stride 2 -> output 1x1)
     EXPECT_NO_THROW(pool.backward(make_mat(2, 1, 0.1, 53)));
     EXPECT_THROW(pool.backward(make_mat(1, 1, 0.1, 54)), std::runtime_error);
     EXPECT_THROW(pool.backward(make_mat(2, 2, 0.1, 55)), std::runtime_error);
@@ -391,7 +396,7 @@ TEST(Pool2d, UnconfiguredLayerFailsFast)
     pool_t pool;
     EXPECT_THROW(pool.forward(make_mat(1, 4, 0.1, 61)), std::runtime_error);
     EXPECT_THROW(pool.backward(make_mat(1, 4, 0.1, 62)), std::runtime_error);
-    // set_param 之后立即可用
+    // usable immediately after set_param
     pool.set_param(pool_mode::max, 2, 2, 2, 2);
     const dmat x = make_mat(1, 4, 0.5, 63);
     double expect = x(0, 0);
@@ -403,20 +408,20 @@ TEST(Pool2d, UnconfiguredLayerFailsFast)
 TEST(Pool2d, SetParamRejectsInvalidConfig)
 {
     pool_t pool;
-    EXPECT_THROW(pool.set_param(pool_mode::max, 3, 3, 0, 1), std::invalid_argument);   // 核为 0
-    EXPECT_THROW(pool.set_param(pool_mode::max, 0, 3, 1, 1), std::invalid_argument);   // 空间为 0
-    EXPECT_THROW(pool.set_param(pool_mode::max, 3, 3, 2, 2, -1, 1), std::invalid_argument); // 负步长
-    EXPECT_THROW(pool.set_param(pool_mode::max, 3, 3, 2, 2, 1, 1, -1, 0), std::invalid_argument); // 负 pad
-    // pad 超过核一半（PyTorch 同款约束）：2*2 > 3
+    EXPECT_THROW(pool.set_param(pool_mode::max, 3, 3, 0, 1), std::invalid_argument);   // kernel 0
+    EXPECT_THROW(pool.set_param(pool_mode::max, 0, 3, 1, 1), std::invalid_argument);   // spatial size 0
+    EXPECT_THROW(pool.set_param(pool_mode::max, 3, 3, 2, 2, -1, 1), std::invalid_argument); // negative stride
+    EXPECT_THROW(pool.set_param(pool_mode::max, 3, 3, 2, 2, 1, 1, -1, 0), std::invalid_argument); // negative pad
+    // pad beyond half the kernel (PyTorch's own rule): 2*2 > 3
     EXPECT_THROW(pool.set_param(pool_mode::max, 5, 5, 3, 3, 1, 1, 2, 2), std::invalid_argument);
-    // 核比 padded 输入还大：h_out = (2 - 5) / 1 + 1 = -2
+    // kernel larger than the padded input: h_out = (2 - 5) / 1 + 1 = -2
     EXPECT_THROW(pool.set_param(pool_mode::max, 2, 2, 5, 5, 1, 1, 0, 0), std::invalid_argument);
     EXPECT_NO_THROW(pool.set_param(pool_mode::max, 5, 5, 3, 3, 1, 1, 1, 1));
 }
 
 TEST(Pool2d, IsStaticLayerNotUpdatableNorReinit)
 {
-    // 无参数层：不参与 set_updator/set_lr，也不占用 reinit 的容器槽位
+    // parameterless layer: it takes part in neither set_updator/set_lr nor a reinit container slot
     static_assert(!is_updatable_net<pool_t>);
     static_assert(!is_reinitable_net<pool_t>);
     SUCCEED();
@@ -424,7 +429,7 @@ TEST(Pool2d, IsStaticLayerNotUpdatableNorReinit)
 
 TEST(Pool2d, ChainInsideComplexNet)
 {
-    // conv -> relu -> maxpool 整条链：前向出形状、反向回到输入形状、step 不炸
+    // the whole conv -> relu -> maxpool chain: forward yields a shape, backward returns to the input shape, step survives
     using conv_relu_pool_t = complex_net_builder_t<double>
         ::push_back_updatable<conv2d_net_t, sgd_t>
         ::push_back_staticnet<relu_net_t>
@@ -459,7 +464,7 @@ TEST(Pool2d, NetTypeReportsConfig)
     EXPECT_NE(s.find("max"), std::string::npos);
     EXPECT_NE(s.find("in:4x6"), std::string::npos);
     EXPECT_NE(s.find("kernel:3x3"), std::string::npos);
-    EXPECT_EQ(s.find("count_include_pad"), std::string::npos);   // max 模式不打印该字段
+    EXPECT_EQ(s.find("count_include_pad"), std::string::npos);   // max mode does not print that field
 
     pool_t avg_pool(pool_mode::average, 4, 6, 3, 3, 2, 2, 1, 1, false);
     const std::string s2 = avg_pool.net_type();
