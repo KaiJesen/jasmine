@@ -57,9 +57,10 @@
 using namespace jasmine;
 using dmat = mat_t<double>;
 
-/** 梯度累加器 + Adam：batch 个样本的梯度平均后再更新一次（库里现成的 mini-batch 机制） */
+/** 梯度累加器 + AdamW：batch 个样本的梯度平均后再更新一次（库里现成的 mini-batch 机制），
+ *  AdamW 的解耦权重衰减用来做正则（见 jas_updator_t.hpp） */
 template <typename val_type>
-using upr_tpl = cache_updator_t<val_type, adam_t>;
+using upr_tpl = cache_updator_t<val_type, adamw_t>;
 
 namespace
 {
@@ -160,10 +161,12 @@ std::string arch_name(arch_t a)
 }
 
 /** Transformer 变体的超参（写成常量便于对照） */
-constexpr int kTrfDModel = 32;
-constexpr int kTrfHeads = 4;
-constexpr int kTrfLayers = 2;
-constexpr int kTrfDff = 64;
+// Transformer 变体的规模：选成与 cnn2（约 10.5 万参数）相当
+//   conv1+conv2 = 3424、proj 17d、每层 8d²+11d、分类头 11d → 3 层 d=64 时约 10.4 万
+constexpr int kTrfDModel = 64;
+constexpr int kTrfHeads = 4;      // d_head = 16（偶数 → RoPE 可用）
+constexpr int kTrfLayers = 3;
+constexpr int kTrfDff = 128;      // = 2 * d_model
 constexpr int kTrfTokens = 7 * 7;                // 两次 2x2 池化后：每个空间位置一个 token → 49
 constexpr int kTrfInChannels = 16;               // patch embedding 的输入通道数（第二次卷积的输出）
 constexpr int kHidden = 128;                     // CNN 变体的 encoder 隐层
@@ -207,11 +210,12 @@ using trf_chain_t = complex_net_builder_t<double>
     ::push_back_staticnet<relu_net_t>                  // 4
     ::push_back_staticnet<pool2d_net_t>                // 5 14→7    → [16, 49]（49 个 token）
     ::push_back_updatable<weight_net_t, upr_tpl>       // 6 patch embedding: 16 → d_model，逐位置
-    ::push_back_impl<encoder_t<double, upr_tpl>>       // 7 Transformer encoder（双向）
-    ::push_back_staticnet<mean_pool_net_t>             // 8 token 平均
-    ::push_back_staticnet<dropout_net_t>               // 9 dropout（正则）
-    ::push_back_updatable<weight_net_t, upr_tpl>       // 10 分类头
-    ::push_back_staticnet<ce_loss_t>                   // 11
+    ::push_back_updatable<cls_token_net_t, upr_tpl>    // 7 拼一个可学习的 CLS 向量
+    ::push_back_impl<encoder_t<double, upr_tpl>>       // 8 Transformer encoder（双向）
+    ::push_back_staticnet<take_token_net_t>            // 9 取 CLS 那一列 → [d_model, 1]
+    ::push_back_staticnet<dropout_net_t>               // 10 dropout（正则）
+    ::push_back_updatable<weight_net_t, upr_tpl>       // 11 分类头
+    ::push_back_staticnet<ce_loss_t>                   // 12
     ::type;
 
 template <arch_t A>
@@ -228,12 +232,13 @@ struct idx_t
     static constexpr int pool2 = 5;                    // cnn2
     static constexpr int flatten = (A == arch_t::cnn2) ? 6 : 3;
     static constexpr int proj = 6;                     // trf: patch embedding
-    static constexpr int encoder = 7;                  // trf
-    static constexpr int meanpool = 8;                 // trf
+    static constexpr int cls = 7;                      // trf: 可学习 CLS 向量
+    static constexpr int encoder = 8;                  // trf
+    static constexpr int taketoken = 9;                // trf
     static constexpr int fc1 = (A == arch_t::cnn2) ? 7 : 4;    // cnn 的 encoder 第一层
-    static constexpr int dropout = (A == arch_t::cnn2) ? 9 : ((A == arch_t::cnn1) ? 6 : 9);
-    static constexpr int fc2 = (A == arch_t::cnn2) ? 10 : ((A == arch_t::cnn1) ? 7 : 10);
-    static constexpr int loss = (A == arch_t::cnn2) ? 11 : ((A == arch_t::cnn1) ? 8 : 11);
+    static constexpr int dropout = (A == arch_t::cnn2) ? 9 : ((A == arch_t::cnn1) ? 6 : 10);
+    static constexpr int fc2 = (A == arch_t::cnn2) ? 10 : ((A == arch_t::cnn1) ? 7 : 11);
+    static constexpr int loss = (A == arch_t::cnn2) ? 11 : ((A == arch_t::cnn1) ? 8 : 12);
 };
 
 /** cnn 变体的 flatten 后特征数 */
@@ -245,7 +250,7 @@ constexpr int features_of()
 }
 
 template <arch_t A>
-mnist_net_t<A> make_net(unsigned seed, double lr, int hidden, double dropout_p)
+mnist_net_t<A> make_net(unsigned seed, double lr, int hidden, double dropout_p, double weight_decay)
 {
     using idx = idx_t<A>;
     mnist_net_t<A> net;
@@ -273,12 +278,15 @@ mnist_net_t<A> make_net(unsigned seed, double lr, int hidden, double dropout_p)
         net.template get<idx::pool2>().set_param(pool_mode::max, 14, 14, 2, 2, 2, 2);           // → [16, 49]
         // patch embedding：把 16 个通道的每个空间位置投影成 d_model 维 token
         net.template get<idx::proj>().reinit(std::vector<int>{kTrfInChannels, kTrfDModel});
-        // Transformer encoder：层数 / 头数 / d_model / d_ff / 序列长度（token 数）
-        net.template get<idx::encoder>().set_param(kTrfLayers, kTrfHeads, kTrfDModel, kTrfDff, kTrfTokens);
+        // CLS 向量：d_model 维，拼在原 49 个 token 之前
+        net.template get<idx::cls>().set_param(kTrfDModel);
+        // Transformer encoder：层数 / 头数 / d_model / d_ff / 序列长度（token 数 + 1 个 CLS）
+        net.template get<idx::encoder>().set_param(kTrfLayers, kTrfHeads, kTrfDModel, kTrfDff, kTrfTokens + 1);
+        net.template get<idx::taketoken>().set_param(0);      // 取 CLS 那一列
         // 逐层挂上 RoPE（mat_mha_t::bind_rope 从注册表按 d_head 取共享条目），
         // 让注意力知道 token 的顺序；不挂的话就是「一袋 patch」，位置信息只能靠卷积 stem。
         for (int i = 0; i < kTrfLayers; ++i)
-            net.template get<idx::encoder>().get_mha(i).bind_rope(kTrfTokens);
+            net.template get<idx::encoder>().get_mha(i).bind_rope(kTrfTokens + 1);
         // 分类头 d_model → 10
         net.template get<idx::fc2>().reinit(std::vector<int>{kTrfDModel, 10});
     }
@@ -293,7 +301,8 @@ mnist_net_t<A> make_net(unsigned seed, double lr, int hidden, double dropout_p)
         net.template get<idx::fc1>().bias() = 0.0;
 
     net.template get<idx::dropout>().set_param(static_cast<typename mnist_net_t<A>::val_type>(dropout_p));
-    net.set_updator(lr);
+    net.set_updator(static_cast<typename mnist_net_t<A>::val_type>(lr),
+                    typename mnist_net_t<A>::val_type(0.9), 0.999, 1e-8, weight_decay);
     return net;
 }
 
@@ -349,6 +358,7 @@ std::size_t param_count(mnist_net_t<A> const& net)
         const int d = kTrfDModel, ff = kTrfDff;
         const std::size_t per_layer = 4 * d * d + 4 * d + d * ff + ff + ff * d + d + 2 * 2 * d;
         n += static_cast<std::size_t>(kTrfLayers) * per_layer;
+        n += static_cast<std::size_t>(d);        // CLS 向量
     }
     return n;
 }
@@ -362,7 +372,11 @@ void save_net(mnist_net_t<A> const& net, std::string const& path, int epochs, do
     weight_writer_t w;
     add_layer_params(w, "conv1", net.template get<idx::conv1>());
     if constexpr (A != arch_t::cnn1) add_layer_params(w, "conv2", net.template get<idx::conv2>());
-    if constexpr (A == arch_t::trf) add_layer_params(w, "proj", net.template get<idx::proj>());
+    if constexpr (A == arch_t::trf)
+    {
+        add_layer_params(w, "proj", net.template get<idx::proj>());
+        w.add("cls.token", net.template get<idx::cls>().token());     // CLS 向量单独存
+    }
     if constexpr (A != arch_t::trf) add_layer_params(w, "fc1", net.template get<idx::fc1>());
     add_layer_params(w, "fc2", net.template get<idx::fc2>());
     w.add_scalar("meta.epochs", static_cast<float>(epochs));
@@ -382,7 +396,11 @@ train_meta_t load_net(mnist_net_t<A>& net, std::string const& path)
     wf.load(path);
     read_layer_params(wf, "conv1", net.template get<idx::conv1>());
     if constexpr (A != arch_t::cnn1) read_layer_params(wf, "conv2", net.template get<idx::conv2>());
-    if constexpr (A == arch_t::trf) read_layer_params(wf, "proj", net.template get<idx::proj>());
+    if constexpr (A == arch_t::trf)
+    {
+        read_layer_params(wf, "proj", net.template get<idx::proj>());
+        wf.read_into("cls.token", net.template get<idx::cls>().token());
+    }
     if constexpr (A != arch_t::trf) read_layer_params(wf, "fc1", net.template get<idx::fc1>());
     read_layer_params(wf, "fc2", net.template get<idx::fc2>());
     train_meta_t meta;
@@ -403,6 +421,7 @@ struct args_t
     int hidden = 128;                          // CNN 变体 encoder 的隐层宽度（--hidden，match 模式会自动求解）
     double lr = 2e-3;
     double dropout = 0.2;                      // 分类头前的 dropout 概率（0 = 关闭）
+    double weight_decay = 0.01;                // AdamW 的解耦权重衰减
     std::string scheduler = "cosine";          // cosine（余弦退火+热重启）| fixed（固定 lr）
     long train_limit = 6000, test_limit = 10000;
     unsigned seed = 1234;
@@ -451,7 +470,7 @@ result_t run_arch(dataset_t const& train, dataset_t const& test, args_t const& a
     r.name = arch_name(A);
     const auto t0 = std::chrono::steady_clock::now();
 
-    auto net = make_net<A>(a.seed, a.lr, a.hidden, a.dropout);
+    auto net = make_net<A>(a.seed, a.lr, a.hidden, a.dropout, a.weight_decay);
     r.params = param_count<A>(net);
 
     if (!load_path.empty())
@@ -531,7 +550,7 @@ result_t run_arch(dataset_t const& train, dataset_t const& test, args_t const& a
     if (!save_path.empty())
     {
         save_net<A>(net, save_path, r.epochs, r.loss, r.test_acc);
-        mnist_net_t<A> reloaded = make_net<A>(a.seed + 999, a.lr, a.hidden, a.dropout);
+        mnist_net_t<A> reloaded = make_net<A>(a.seed + 999, a.lr, a.hidden, a.dropout, a.weight_decay);
         load_net<A>(reloaded, save_path);
         const double acc = evaluate<A>(reloaded, test, test_n);
         std::cout << "[" << r.name << "] [check] 重新载入 test_acc=" << acc;
@@ -585,6 +604,7 @@ int main(int argc, char** argv)
         else if (arg == "--lr") a.lr = std::stod(next());
         else if (arg == "--hidden") a.hidden = std::stoi(next());
         else if (arg == "--dropout") a.dropout = std::stod(next());
+        else if (arg == "--weight-decay") a.weight_decay = std::stod(next());
         else if (arg == "--scheduler") a.scheduler = next();
         else if (arg == "--train-limit") a.train_limit = std::stol(next());
         else if (arg == "--test-limit") a.test_limit = std::stol(next());
@@ -594,7 +614,7 @@ int main(int argc, char** argv)
         {
             std::cout << "usage: mnist_conv [--arch cnn2|cnn1|trf|both|all|match] [--data-dir DIR] [--epochs N]\n"
                          "                  [--batch N] [--lr LR] [--hidden N] [--dropout P] [--train-limit N]\n"
-                         "                  [--scheduler cosine|fixed] [--test-limit N]\n"
+                         "                  [--scheduler cosine|fixed] [--weight-decay WD] [--test-limit N]\n"
                          "                  [--save FILE] [--load FILE] [--synthetic] [--seed N]\n"
                          "  cnn2  = conv->relu->pool->conv->relu->pool->flatten->fc->relu->fc->ce（标准 CNN）\n"
                          "  cnn1  = conv->relu->pool->flatten->fc->relu->fc->ce\n"
@@ -644,7 +664,7 @@ int main(int argc, char** argv)
     if (a.arch == "match")
     {
         // 等容量对比：先算出 Transformer 变体的参数量，再反解 CNN 的隐层宽度
-        const std::size_t trf_params = param_count<arch_t::trf>(make_net<arch_t::trf>(a.seed, a.lr, a.hidden, a.dropout));
+        const std::size_t trf_params = param_count<arch_t::trf>(make_net<arch_t::trf>(a.seed, a.lr, a.hidden, a.dropout, a.weight_decay));
         a.hidden = hidden_matching(trf_params, /*two_conv=*/true);
         std::cout << "[match] trf 参数量 = " << trf_params << "；把 cnn2 隐层裁到 " << a.hidden
                   << "（参数量 " << cnn_params_for_hidden(a.hidden, true) << "）做等容量对比\n";

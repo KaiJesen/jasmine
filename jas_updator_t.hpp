@@ -106,6 +106,86 @@ public:
 
 };
 
+/**
+ * AdamW：Adam 的「解耦权重衰减」变体（Loshchilov & Hutter, 2019）。
+ *
+ * 与 `adam_t` 的唯一区别是衰减作用的位置：
+ *
+ *   Adam : g ← ∇L + wd·θ，再喂给一/二阶矩  →  衰减被矩估计归一化，实际步长随梯度尺度变化
+ *   AdamW: 矩估计只用 ∇L，衰减直接作用在参数上  →  θ ← θ - lr·( m̂/(√v̂+ε) + wd·θ )
+ *
+ * 后者才是「权重衰减」的字面语义（与 L2 正则不等价），在 Transformer / CNN 上通常更稳、更好调。
+ * 其余（矩估计、偏差校正、时间步、按矩阵逐元素更新）与 `adam_t` 完全一致，实现也照它写。
+ */
+template <typename val_type>
+class adamw_t
+{
+private:
+    mat_t<val_type> m_m;        // 一阶矩估计
+    mat_t<val_type> m_v;        // 二阶矩估计
+    val_type m_beta1;
+    val_type m_beta1_t;
+    val_type m_beta2;
+    val_type m_beta2_t;
+    val_type m_learning_rate;
+    val_type m_epsilon;
+    val_type m_weight_decay;
+    int m_t;                    // 时间步长
+
+public:
+    adamw_t(val_type learning_rate = 0.001,
+            val_type beta1 = 0.9, double beta2 = 0.999, double epsilon = 1e-8,
+            double weight_decay = 0.01)
+        : m_beta1(beta1), m_beta1_t(1), m_beta2(beta2), m_beta2_t(1),
+          m_learning_rate(learning_rate), m_epsilon(epsilon),
+          m_weight_decay(static_cast<val_type>(weight_decay)), m_t(0)
+    {
+    }
+
+    void set(val_type learning_rate = 0.001,
+             val_type beta1 = 0.9, double beta2 = 0.999, double epsilon = 1e-8,
+             double weight_decay = 0.01)
+    {
+        m_beta1 = beta1;
+        m_beta1_t = 1;
+        m_beta2 = beta2;
+        m_beta2_t = 1;
+        m_learning_rate = learning_rate;
+        m_epsilon = epsilon;
+        m_weight_decay = static_cast<val_type>(weight_decay);
+        m_t = 0;
+    }
+
+    void set_lr(val_type lr) { m_learning_rate = lr; }
+    void set_weight_decay(val_type wd) { m_weight_decay = wd; }
+    val_type weight_decay() const { return m_weight_decay; }
+
+    void update(const mat_t<val_type>& grad, mat_t<val_type>& mat)
+    {
+        m_t++;
+        if (m_m.valid() == false)
+        {
+            m_m = mat_t<val_type>(grad.row_num(), grad.col_num());
+            m_v = mat_t<val_type>(grad.row_num(), grad.col_num());
+        }
+        m_m = m_beta1 * m_m + (1 - m_beta1) * grad;              // 只吃真实梯度
+        m_v = m_beta2 * m_v + (1 - m_beta2) * grad * grad;
+        m_beta1_t *= m_beta1;
+        m_beta2_t *= m_beta2;
+
+        mat_t<val_type> m_hat = m_m / (1 - m_beta1_t);
+        mat_t<val_type> v_hat = m_v / (1 - m_beta2_t);
+
+        // 解耦衰减：直接作用在参数上，不经过矩估计；wd = 0 时与 adam_t 逐位一致
+        mat = mat - m_learning_rate * (m_hat / (sqrt(v_hat) + m_epsilon) + m_weight_decay * mat);
+    }
+
+    void step()
+    {
+        // adamw 不需要额外的 step 操作
+    }
+};
+
 template <typename val_type>
 class nadam_t
 {

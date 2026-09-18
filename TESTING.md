@@ -1710,3 +1710,43 @@ net.step();
 | **cosine（含热重启）+ dropout 0.2** | **0.9705** | **0.9165** |
 
 各涨约 1.7 个点，差距仍是 5.4 个点，但 trf 只用了 21.4k 参数（cnn2 是 105.2k）。
+
+### 14.7 AdamW、CLS token，以及「同规模」对比
+
+**AdamW**（`jas_updator_t.hpp`，照 `nadam_t` / `adam_t` 的结构写）：矩估计只吃真实梯度，权重衰减
+**直接作用在参数上**：
+
+```text
+Adam : g ← ∇L + wd·θ，再进一/二阶矩      （衰减被矩估计归一化，退化成 L2 正则）
+AdamW: θ ← θ - lr·( m̂/(√v̂+ε) + wd·θ )   （真正的"权重衰减"）
+```
+
+`tests/test_adamw.cpp` 4 例钉住：`wd = 0` 时与 `adam_t` **逐位一致**；梯度为 0 时衰减仍生效
+（θ ← θ·(1-lr·wd) 的解析值）；衰减与矩估计解耦（单步解析值对拍，并与 L2 版本对比不同）；
+`set` / `set_weight_decay` 接口。example 里加了 `--weight-decay`（默认 0.01）。
+
+**CLS token**（`jas_net_t.hpp` 新增两层，ViT 风格）：
+
+| 层 | forward | backward |
+|----|---------|----------|
+| `cls_token_net_t` | `[d, T] → [d, T+1]`，第 0 列是可学习向量 | 第 0 列作为该向量的梯度交给 updator，其余列原样回传 |
+| `take_token_net_t` | `[d, T] → [d, 1]`，取第 `index` 列（默认 0） | 只有第 `index` 列拿到梯度，其余为 0 |
+
+`cls_token_net_t` 是**可更新但不可 reinit**（用 `set_param(d_model)`，不占 `complex_net_t::reinit`
+槽位）；`take_token_net_t` 是无参静态层。`tests/test_cls_token.cpp`（8 例）覆盖拼接/后移、
+梯度分配与回传、越界报错、概念判定（CLS 可更新、take_token 静态）、net_type。
+
+**同规模对比**：把 trf 放大到与 cnn2 同一量级（3 层、d_model=64、ff=128、CLS token）
+→ **105,642 vs 105,194 参数（差 0.4%）**。数据 1500 张 × 4 epoch：
+
+```text
+arch          params  epochs  train_loss   train_acc    test_acc   seconds
+cnn2          105194       4    0.254249    0.917333       0.926   25.88
+trf           105642       4     1.12019    0.571333      0.6365  121.94
+test_acc 差值（trf - cnn2）= -0.2895
+```
+
+**结论：不是容量不够，是数据不够。** trf 的 train_acc 只有 0.57、loss 仍高达 1.12——连训练集都
+没拟合上（而上一轮 21k 参数的小 trf 在 3000 张 × 6 epoch 上能到 91.65%）。同一数据量下给
+Transformer 加容量只会更难训；要给它公平机会需要 ≥20~30k 样本、10+ epoch（本机约 30~60 分钟），
+以及 `--arch match` 提供的等容量对照。

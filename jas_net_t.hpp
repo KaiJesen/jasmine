@@ -1,12 +1,14 @@
 #ifndef __JAS_NET_T_HPP__
 #define __JAS_NET_T_HPP__
 
+#include <random>
 #include <string>
 #include <sstream>
 
 #include "jas_mat_t.hpp"
 #include "jas_mat_express_t.hpp"
 #include "jas_mat_storage.hpp"
+#include "jas_mat_init_t.hpp"      // g_random_engine（dropout 用）
 
 #include "jas_updator_t.hpp"
 
@@ -209,6 +211,181 @@ public:
     void step()
     {
         // 什么也不做
+    }
+};
+
+/**
+ * CLS token 层：给 token 序列前面**拼一个可学习的向量**（ViT 的做法）。
+ *
+ *     forward : [d_model, T] → [d_model, T+1]，第 0 列是学出来的 m_cls，其后是原样搬过来的 token
+ *     backward: 把 delta 的第 0 列作为 m_cls 的梯度交给 updator，其余列原样回传（[d_model, T]）
+ *
+ * 与 Transformer encoder 配合时，序列过完 encoder 后再用 `take_token_net_t(0)` 取回第 0 列
+ * 当作分类向量 —— 比「所有 token 取平均」多了一个可学习的聚合点。
+ *
+ * 形状由 `set_param(d_model)` 给（也可在首次 forward 时懒初始化），刻意不叫 `reinit`：
+ * 这样它在 `complex_net_t::reinit` 里不占容器槽位（与 layer_norm 同理）。
+ */
+template <typename input_type, template <typename> class updator_type>
+class cls_token_net_t
+{
+public:
+    using val_type = typename input_type::ele_type;
+private:
+    mat_t<val_type> m_cls;                  // [d_model, 1]
+    updator_type<val_type> m_updator;
+    mat_t<val_type> m_input;                // forward 缓存（列数用于 backward 校验）
+    int m_d_model = 0;
+
+public:
+    cls_token_net_t() = default;
+
+    void set_param(int const& d_model)
+    {
+        m_d_model = d_model;
+        m_cls = mat_t<val_type>(d_model, 1);
+        m_cls = val_type(0);                // CLS 向量从 0 起（与偏置一样，先不加偏置的偏置）
+    }
+
+    /** CLS 向量 [d_model, 1]；供权重加载器写入 */
+    mat_t<val_type>& token() { return m_cls; }
+    mat_t<val_type> const& token() const { return m_cls; }
+
+    template<typename... upr_arg_types>
+    void set_updator(upr_arg_types&&... args)
+    {
+        m_updator.set(std::forward<upr_arg_types>(args)...);
+    }
+
+    void set_lr(val_type lr) { m_updator.set_lr(lr); }
+
+    template<typename Src>
+    mat_t<val_type> forward(Src&& input)
+    {
+        detail::store_for_backward(m_input, std::forward<Src>(input));
+        if (m_d_model == 0)
+            set_param(m_input.row_num());
+        if (m_input.row_num() != m_d_model)
+            throw std::invalid_argument("cls_token_net_t::forward: input rows must equal d_model");
+
+        mat_t<val_type> out(m_d_model, m_input.col_num() + 1);
+        for (int i = 0; i < m_d_model; ++i)
+        {
+            out(i, 0) = m_cls(i, 0);                       // 拼在最前面
+            for (int t = 0; t < m_input.col_num(); ++t)
+                out(i, t + 1) = m_input(i, t);
+        }
+        return out;
+    }
+
+    template<typename Src>
+    mat_t<val_type> forward_one(Src&& input)
+    {
+        return forward(std::forward<Src>(input));
+    }
+
+    template <typename other_type>
+    mat_t<val_type> backward(const other_type& delta)
+    {
+        if (delta.row_num() != m_d_model || delta.col_num() != m_input.col_num() + 1)
+            throw std::runtime_error("cls_token_net_t::backward: delta shape mismatch");
+
+        mat_t<val_type> grad_cls(m_d_model, 1);
+        mat_t<val_type> out(m_d_model, m_input.col_num());
+        for (int i = 0; i < m_d_model; ++i)
+        {
+            grad_cls(i, 0) = delta(i, 0);
+            for (int t = 0; t < m_input.col_num(); ++t)
+                out(i, t) = delta(i, t + 1);               // 原 token 的梯度原样回传
+        }
+        m_updator.update(grad_cls, m_cls);
+        return out;
+    }
+
+    template<typename init_type>
+    void init_weight()
+    {
+        m_cls = val_type(0);        // CLS 向量固定零初始化（ViT 的常规做法）
+    }
+
+    void step() { m_updator.step(); }
+
+    std::string net_type(int const& indent = 0) const
+    {
+        std::stringstream ss;
+        ss << print_indent(indent) << "cls_token_net_t:(d_model:" << m_d_model << ")";
+        return ss.str();
+    }
+};
+
+/**
+ * 取第 `index` 列（默认第 0 列 = CLS / 首 token）作为输出：Transformer 分类头的前半段。
+ *
+ *     forward : [d_model, T] → [d_model, 1]（复制第 index 列）
+ *     backward: [d_model, 1] → [d_model, T]（只有第 index 列有梯度，其余为 0）
+ *
+ * 与 mean_pool_net_t 是同一位置的两种聚合方式：mean pool 用平均，这里用「某个 token 的表征」。
+ */
+template <typename input_type>
+class take_token_net_t
+{
+public:
+    using val_type = typename input_type::ele_type;
+private:
+    mat_t<val_type> m_input;
+    int m_index = 0;
+
+public:
+    take_token_net_t() = default;
+
+    void set_param(int const& index) { m_index = index; }
+    int index() const { return m_index; }
+
+    template <typename Src>
+    mat_t<val_type> forward(Src&& input)
+    {
+        detail::store_for_backward(m_input, std::forward<Src>(input));
+        if (m_index < 0 || m_index >= m_input.col_num())
+            throw std::out_of_range("take_token_net_t::forward: token index out of range");
+        mat_t<val_type> out(m_input.row_num(), 1);
+        for (int i = 0; i < out.row_num(); ++i)
+            out(i, 0) = m_input(i, m_index);
+        return out;
+    }
+
+    template <typename Src>
+    mat_t<val_type> forward_one(Src&& input)
+    {
+        return forward(std::forward<Src>(input));
+    }
+
+    template <typename other_type>
+    mat_t<val_type> backward(const other_type& delta)
+    {
+        if (delta.row_num() != m_input.row_num() || delta.col_num() != 1)
+            throw std::runtime_error("take_token_net_t::backward: delta must be [d_model, 1]");
+        mat_t<val_type> out(m_input.row_num(), m_input.col_num());
+        for (int i = 0; i < out.row_num(); ++i)
+            out(i, m_index) = delta(i, 0);
+        return out;
+    }
+
+    std::string net_type(int const& indent = 0) const
+    {
+        std::stringstream ss;
+        ss << print_indent(indent) << "take_token_net_t:(index:" << m_index << ")";
+        return ss.str();
+    }
+
+    template<typename init_type>
+    void init_weight()
+    {
+        // 无权重
+    }
+
+    void step()
+    {
+        // 无权重
     }
 };
 

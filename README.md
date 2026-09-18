@@ -28,12 +28,12 @@ mat_t<float> s = q.t().dot(k);               // matrix product (CPU: BLAS / GPU:
 | Operators | Arithmetic, comparisons, `exp` / `log` / `sqrt` / `sigmoid`, `dot`, row/column reductions, row-wise softmax, LayerNorm / RMSNorm |
 | Layers | Linear, **Conv2d (im2col + GEMM, full backward)**, **MaxPool2d / AvgPool2d (full backward)**, **Flatten**, **MeanPool（token 序列）**, **Dropout**, LayerNorm / RMSNorm, SiLU / GELU / ReLU, SwiGLU gating, residual, **Transformer encoder**, Embedding, cross-entropy / MSE |
 | Models | decoder-only base; **GPT-2** (absolute positions + `gelu_new` + tied lm_head); **LLaMA family** (RoPE + RMSNorm + SwiGLU + GQA/MQA); enc-dec stack |
-| Training | Backprop checked against numerical gradients; SGD / Adam / NAdam; gradient accumulation (`cache_updator_t`); **cosine annealing with warm restarts** (`cosine_annealing_decay`) |
+| Training | Backprop checked against numerical gradients; SGD / Adam / NAdam / **AdamW (decoupled weight decay)**; gradient accumulation (`cache_updator_t`); **cosine annealing with warm restarts** (`cosine_annealing_decay`) |
 | Inference | KV-cache prefill + per-token decoding; greedy / top-k / top-p sampling; streaming output |
 | Weights | Single-file `JASMINE_WEIGHTS_V1` format; **training-result serialization** (per-layer params + meta in one file, `save`/`load` round-trip); direct export from HuggingFace (`tools/`); layer-by-layer / logits golden-value alignment |
 | CUDA | Element-wise chains fused into a single kernel launch, cuBLAS GEMM, reductions, device-side KV cache / RoPE / MHA / a whole LLaMA, backwards and optimizers, **fused attention**, **bf16 / fp16 mixed precision** |
 
-**Status**: the host side passes `ctest` 240/240; the CUDA backend has 174 cases (compute-heavy cases
+**Status**: the host side passes `ctest` 251/251; the CUDA backend has 174 cases (compute-heavy cases
 are skipped by default). The CUDA backend is still being iterated on; target-machine vs test-machine
 differences are covered in [`CUDA.md`](CUDA.md), section 11.
 
@@ -258,6 +258,15 @@ cnn2          105194       6    0.132647    0.959333      0.9705   66.86
 trf            21386       6     0.33591    0.899333      0.9165  110.03
 test_acc 差值（trf - cnn2）= -0.0540
 
+# 等容量（trf 放大到 3 层 d=64、CLS token，两者参数差 0.4%），1500 张 x 4 epoch
+arch          params  epochs  train_loss   train_acc    test_acc   seconds
+cnn2          105194       4    0.254249    0.917333       0.926   25.88
+trf           105642       4     1.12019    0.571333      0.6365  121.94
+test_acc 差值（trf - cnn2）= -0.2895
+
+# 等容量（自动求解 CNN 宽度），供手动跑
+--arch match            # 先算 trf 参数量，再把 cnn2 隐层裁到最接近该值的宽度
+
 # 等容量对比：--arch match 自动把 cnn2 的隐层裁到与 trf 参数量相当
 [conv2] params=21719   [trf] params=21386   （相差 1.6%，再跑同样的训练即可比"同容量")
 ```
@@ -273,8 +282,13 @@ test_acc 差值（trf - cnn2）= -0.0540
   步推进，总步数的一半作为第一个周期 → 中途恰好一次热重启），并加了 `dropout_net_t`（inverted
   dropout，评估时显式关闭）。两者一起让 cnn2 95.35% → **97.05%**、trf 89.9% → **91.65%**
   （各涨约 1.7 个点），日志里能看到 `cycle 0 → 1` 的重启点以及重启后精度的跳升。
-- 继续追平/反超的下一步：等容量对比（`--arch match`，已实现）、CLS token 取代 mean pool、
-  以及更多 epoch（Transformer 缺卷积的局部性先验，需要更多数据与步数）。
+- **等容量对比（0.4% 参数差）**：把 trf 放大到 3 层 d=64 + CLS token（105,642 参数）后，
+  在 1500 张 × 4 epoch 上它反而更差（63.7% vs 92.6%）——**不是容量不够，是数据不够**：
+  它的 train_acc 只有 0.57、loss 还有 1.12，连训练集都没拟合上。对比上一行（21k 参数、
+  3000 张 × 6 epoch 拿到 91.65%）可以看出：在这个数据量级，给小 Transformer 加容量只会更难训。
+  要给它公平的机会需要 ≥20~30k 样本、10+ epoch（本机约 30~60 分钟）。
+- 已具备的其它工具：`--weight-decay`（AdamW 解耦衰减）、`--dropout`、`--scheduler cosine|fixed`、
+  `--hidden`、`--arch match`（自动等容量）、`--save/--load`（含 CLS 向量与元信息）。
 
 按样本前向/反向、用 `cache_updator_t` 做 mini-batch 梯度累加，训练完把权重与元信息写进一个
 `JASMINE_WEIGHTS_V1` 文件，再 `--load` 回来验证往返一致：
