@@ -213,6 +213,86 @@ public:
 };
 
 /**
+ * 序列均值池化层：把 [d_model, T] 的 token 序列压成 [d_model, 1]。
+ *
+ * 用途是 Transformer 分类头的前半段（encoder → **mean pool** → linear → CE）：对 T 个 token
+ * 取平均，得到一个与序列长度无关的向量。
+ *
+ * forward: out(i,0) = (1/T) * Σ_t input(i,t)
+ * backward: dL/dinput(i,t) = delta(i,0) / T —— 梯度平均分摊回每一列（与 mean 的定义一致）
+ *
+ * 与 flatten / pooling / relu 一样是无参数静态层：不持有 updator，`init_weight` / `step`
+ * 空实现，也没有 `reinit`（不占 complex_net_t::reinit 的容器槽位）。
+ */
+template <typename input_type>
+class mean_pool_net_t
+{
+public:
+    // 公开：允许该层位于 complex_net 链首（complex_net_t 从首个成员取 val_type）
+    using val_type = typename input_type::ele_type;
+private:
+    mat_t<val_type> m_input;    // forward 缓存（只需要列数，但保持与其它层一致的语义）
+
+public:
+    mean_pool_net_t() = default;
+
+    template <typename Src>
+    mat_t<val_type> forward(Src&& input)
+    {
+        detail::store_for_backward(m_input, std::forward<Src>(input));
+        const int rows = m_input.row_num();
+        const int cols = m_input.col_num();
+        mat_t<val_type> out(rows, 1);
+        for (int i = 0; i < rows; ++i)
+        {
+            val_type s = val_type(0);
+            for (int t = 0; t < cols; ++t)
+                s += m_input(i, t);
+            out(i, 0) = s / static_cast<val_type>(cols);
+        }
+        return out;
+    }
+
+    /** 无状态层：单列输入与整段 forward 相同 */
+    template <typename Src>
+    mat_t<val_type> forward_one(Src&& input)
+    {
+        return forward(std::forward<Src>(input));
+    }
+
+    template <typename other_type>
+    mat_t<val_type> backward(const other_type& delta)
+    {
+        if (delta.row_num() != m_input.row_num() || delta.col_num() != 1)
+            throw std::runtime_error("mean_pool_net_t::backward: delta must be [d_model, 1]");
+        const int cols = m_input.col_num();
+        mat_t<val_type> out(m_input.row_num(), cols);
+        for (int i = 0; i < out.row_num(); ++i)
+            for (int t = 0; t < cols; ++t)
+                out(i, t) = static_cast<val_type>(delta(i, 0)) / static_cast<val_type>(cols);
+        return out;
+    }
+
+    std::string net_type(int const& indent = 0) const
+    {
+        std::stringstream ss;
+        ss << print_indent(indent) << "mean_pool_net_t:(tokens:" << m_input.col_num() << ")";
+        return ss.str();
+    }
+
+    template<typename init_type>
+    void init_weight()
+    {
+        // 无权重
+    }
+
+    void step()
+    {
+        // 无权重
+    }
+};
+
+/**
  * 展平层：把 [C, W] 的特征图按行优先展平成 [C*W, 1] 的单列向量，喂给全连接/编码器。
  *
  * 用途是 CNN 尾部「特征图 → 向量」这一步（conv→relu→pool→**flatten**→encoder）。

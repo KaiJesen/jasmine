@@ -1611,3 +1611,45 @@ test_acc 差值（conv1 - conv2）= -0.0084
 （形状由 `set_param` 给），所以 `complex_net_t::reinit(container)` 只会作用到链里的两个
 `weight_net_t`，容器给 `{特征数, 128, 10}` 就够；`set_updator` / `init_weight` / `step` 会
 自动跳过静态层。
+
+### 14.5 第三种结构：卷积 stem + **Transformer encoder**（`--arch trf`）
+
+上面 14.4 里我把"encoder"理解成了 MLP encoder —— 那是错的：这里的 encoder 指的是 **Transformer
+encoder**。修正后的结构（`--arch trf`）：
+
+```text
+conv 1→8 5x5 pad2 → ReLU → maxpool 2x2            → [8, 196]
+patch embedding: fc 8→d_model（逐位置投影，一个空间位置 = 一个 token）→ [d_model, 196]
+encoder_t：bidirectional Transformer encoder（MHA+LayerNorm+FFN+残差 × n_layers）
+mean_pool：T 个 token 取平均 → [d_model, 1]
+fc d_model→10 → ce
+```
+
+用的都是库里现成的积木，**没有为 Transformer 变体新写任何算子**：
+
+- `encoder_t`（`jas_transformer_kernel_t.hpp`）本身就是用 `residual_net_t` + `mat_mha_t` +
+  `layer_norm_net_t` + `base_ffn_t` 堆出来的；接进链里是
+  `push_back_impl<encoder_t<double, upr_tpl>>`，形状用
+  `set_param(层数, 头数, d_model, d_ff, seq_len)`（seq_len = token 数）给；
+- token 顺序信息用 `mat_mha_t::bind_rope(max_seq_len)` 挂 RoPE（从注册表按 d_head 取共享条目）；
+- 分类头前新加 **`mean_pool_net_t`**（`jas_net_t.hpp`）：把 `[d_model, T]` 平均成 `[d_model, 1]`，
+  backward 把梯度按 `1/T` 摊回每个 token。与 flatten/pool 一样是无参静态层
+  （`tests/test_mean_pool.cpp` 5 例：逐行平均、梯度均摊、形状校验、概念判定、mean pool→linear 链）。
+
+实测（真实 MNIST，同一份数据/超参/种子，2000 张训练 × 2 epoch，2000 张测试图）：
+
+```text
+arch          params  epochs  train_loss   train_acc    test_acc   seconds
+cnn2          105194       2    0.218465       0.936      0.9255    16.65
+trf            17914       2     1.31306       0.514       0.559   104.41
+test_acc 差值（trf - cnn2）= -0.3665
+```
+
+结论与预期一致，也值得记下来：
+
+- **这个规模下 CNN 完胜**（92.6% vs 55.9%），而且快 6 倍——196 个 token 的自注意力是
+  `O(T²·d)`，而 CNN 在这里只有 3×3 卷积；
+- Transformer 的 loss 仍在稳步下降（2.18 → 1.31，train_acc 0.19 → 0.51），是**没训够**而不是没学会：
+  它缺卷积那种局部性/平移等变先验，需要更多数据、更多 epoch、更小学习率或更强正则；
+- 想验证"数据量够时 Transformer 能追上/超过 CNN"，把规模调大即可：
+  `--arch both --epochs 20 --train-limit 20000 --lr 5e-4`（Transformer 那条约 20~30 分钟）。

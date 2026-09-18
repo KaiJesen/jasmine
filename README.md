@@ -26,14 +26,14 @@ mat_t<float> s = q.t().dot(k);               // matrix product (CPU: BLAS / GPU:
 | --- | --- |
 | Matrices & expressions | `mat_t` / `mat_view_t` / `mat_reshape_view_t`; lazy expression trees, compile-time fusion, scalar operands, transposed views, zero-copy subviews and shape views, zero-copy BLAS operands |
 | Operators | Arithmetic, comparisons, `exp` / `log` / `sqrt` / `sigmoid`, `dot`, row/column reductions, row-wise softmax, LayerNorm / RMSNorm |
-| Layers | Linear, **Conv2d (im2col + GEMM, full backward)**, **MaxPool2d / AvgPool2d (full backward)**, **Flatten**, LayerNorm / RMSNorm, SiLU / GELU / ReLU, SwiGLU gating, residual, Embedding, cross-entropy / MSE |
+| Layers | Linear, **Conv2d (im2col + GEMM, full backward)**, **MaxPool2d / AvgPool2d (full backward)**, **Flatten**, **MeanPool（token 序列）**, LayerNorm / RMSNorm, SiLU / GELU / ReLU, SwiGLU gating, residual, **Transformer encoder**, Embedding, cross-entropy / MSE |
 | Models | decoder-only base; **GPT-2** (absolute positions + `gelu_new` + tied lm_head); **LLaMA family** (RoPE + RMSNorm + SwiGLU + GQA/MQA); enc-dec stack |
 | Training | Backprop checked against numerical gradients; SGD / Adam / NAdam; gradient accumulation (`cache_updator_t`) |
 | Inference | KV-cache prefill + per-token decoding; greedy / top-k / top-p sampling; streaming output |
 | Weights | Single-file `JASMINE_WEIGHTS_V1` format; **training-result serialization** (per-layer params + meta in one file, `save`/`load` round-trip); direct export from HuggingFace (`tools/`); layer-by-layer / logits golden-value alignment |
 | CUDA | Element-wise chains fused into a single kernel launch, cuBLAS GEMM, reductions, device-side KV cache / RoPE / MHA / a whole LLaMA, backwards and optimizers, **fused attention**, **bf16 / fp16 mixed precision** |
 
-**Status**: the host side passes `ctest` 228/228; the CUDA backend has 174 cases (compute-heavy cases
+**Status**: the host side passes `ctest` 233/233; the CUDA backend has 174 cases (compute-heavy cases
 are skipped by default). The CUDA backend is still being iterated on; target-machine vs test-machine
 differences are covered in [`CUDA.md`](CUDA.md), section 11.
 
@@ -228,21 +228,39 @@ use the CMake targets instead.
 超参、随机种子下对比：
 
 ```text
-conv2 = conv→relu→pool→conv→relu→pool→flatten→(fc→relu→fc)→ce   "标准 CNN"
-conv1 = conv→relu→pool→flatten→(fc→relu→fc)→ce
+cnn2 = conv→relu→pool→conv→relu→pool→flatten→(fc→relu→fc)→ce      "标准 CNN"
+cnn1 = conv→relu→pool→flatten→(fc→relu→fc)→ce                    （卷积 + MLP encoder）
+trf  = conv→relu→pool→(patch embedding)→Transformer encoder→mean pool→fc→ce
+       其中 Transformer encoder 用的是库里的 encoder_t（双向自注意力 + LayerNorm + FFN + 残差，
+       由 complex_net 堆成），patch embedding 把每个空间位置投影成一个 token，
+       mean_pool 把 T 个 token 平均成分类头要的向量。
 
 # 两条结构各训 3 epoch 后对比（默认 arch=both）
 ./build/examples/mnist_conv --data-dir build/mnist --epochs 3 --train-limit 6000 \
     --batch 16 --lr 2e-3 --arch both --save build/mnist/cmp
 
+# 6000 张 × 3 epoch：CNN 系两变体
 arch          params  epochs  train_loss   train_acc    test_acc   seconds
-conv2         105194       3    0.098669      0.9695      0.9724   120.618
-conv1         202330       3    0.119815    0.962667       0.964   113.324
-test_acc 差值（conv1 - conv2）= -0.0084
+cnn2          105194       3    0.098669      0.9695      0.9724   120.618
+cnn1          202330       3    0.119815    0.962667       0.964   113.324
+test_acc 差值（cnn1 - cnn2）= -0.0084
+
+# 2000 张 × 2 epoch：CNN vs Transformer encoder（--arch both 的默认组合）
+arch          params  epochs  train_loss   train_acc    test_acc   seconds
+cnn2          105194       2    0.218465       0.936      0.9255    16.65
+trf            17914       2     1.31306       0.514       0.559   104.41
+test_acc 差值（trf - cnn2）= -0.3665
 ```
 
-即：**两次下采样的标准 CNN 用一半参数（10.5 万 vs 20.2 万）反而高 0.84 个点**——
-第二个卷积层带来的层级特征比把宽特征直接灌进全连接更划算。
+读法：
+
+- **CNN 系内部**：两次下采样的 `cnn2` 用一半参数（10.5 万 vs 20.2 万）反而高 0.84 个点——
+  第二个卷积层带来的层级特征比把宽特征直接灌进全连接更划算；
+- **CNN vs Transformer**：这个规模下（2000 张 × 2 epoch）Transformer 落后 37 个点，而且慢 6 倍
+  （196 个 token 的自注意力）。它的 loss 仍在稳定下降（2.18 → 1.31，train_acc 0.19 → 0.51），
+  属于**还没训够**：Transformer 没有卷积那样的局部性/平移等变先验，需要更多数据、更多 epoch、
+  更小的学习率或更强正则才能追上。想跑出有意义的曲线就加大 `--epochs` / `--train-limit`
+  （例如 `--arch trf --epochs 20 --train-limit 20000 --lr 5e-4`）。
 
 按样本前向/反向、用 `cache_updator_t` 做 mini-batch 梯度累加，训练完把权重与元信息写进一个
 `JASMINE_WEIGHTS_V1` 文件，再 `--load` 回来验证往返一致：

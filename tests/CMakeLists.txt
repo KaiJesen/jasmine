@@ -21,6 +21,7 @@ add_executable(unit_tests
   test_reshape_view.cpp
   test_model_serialization.cpp
   test_flatten.cpp
+  test_mean_pool.cpp
   test_gqa.cpp
   test_rms_norm.cpp
   test_llama_weights.cpp
