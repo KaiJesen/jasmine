@@ -212,6 +212,99 @@ public:
     }
 };
 
+/**
+ * 展平层：把 [C, W] 的特征图按行优先展平成 [C*W, 1] 的单列向量，喂给全连接/编码器。
+ *
+ * 用途是 CNN 尾部「特征图 → 向量」这一步（conv→relu→pool→**flatten**→encoder）。
+ * 语义上就是 `reshape_view`，但它必须是一个**层**才能参与 `complex_net_t` 的静态层堆叠：
+ * forward 缓存输入形状、backward 把 [C*W, 1] 的梯度还原成 [C, W]。
+ *
+ * 与 relu / pooling 一样是无参数静态层：不持有 updator，`init_weight` / `step` 为空实现
+ * （`complex_net_t::init_weight` / `step` 会对所有成员无条件调用它们），也没有 `reinit`
+ * （形状由 `set_param` 给），所以不占用 `complex_net_t::reinit` 的容器槽位。
+ *
+ * 注意：本层按「单样本一列」的约定工作（T == 1），这与 conv/pool 只认单张图一致；
+ * 多列批处理请走 `cache_updator_t` 的梯度累加，而不是把多个样本塞进一列。
+ */
+template <typename input_type>
+class flatten_net_t
+{
+public:
+    // 公开：允许该层位于 complex_net 链首（complex_net_t 从首个成员取 val_type）
+    using val_type = typename input_type::ele_type;
+private:
+    mat_t<val_type> m_input;    // forward 缓存，backward 用它还原形状
+    int m_rows = 0;             // 期望的输入形状 [rows, cols]
+    int m_cols = 0;
+
+public:
+    flatten_net_t() = default;
+
+    /** 显式指定输入特征图形状（不指定则按首次 forward 的输入懒初始化） */
+    void set_param(int const& rows, int const& cols)
+    {
+        m_rows = rows;
+        m_cols = cols;
+    }
+
+    template <typename Src>
+    mat_t<val_type> forward(Src&& input)
+    {
+        if (m_rows == 0 || m_cols == 0)
+        {
+            m_rows = input.row_num();
+            m_cols = input.col_num();
+        }
+        if (input.row_num() != m_rows || input.col_num() != m_cols)
+            throw std::invalid_argument("flatten_net_t::forward: input must be [rows, cols] of set_param");
+
+        detail::store_for_backward(m_input, std::forward<Src>(input));
+        mat_t<val_type> out(m_rows * m_cols, 1);
+        for (int i = 0; i < m_rows; ++i)
+            for (int j = 0; j < m_cols; ++j)
+                out(i * m_cols + j, 0) = m_input(i, j);     // 行优先展平，与 conv/pool 的布局一致
+        return out;
+    }
+
+    /** 无状态层：单列输入与整段 forward 相同 */
+    template <typename Src>
+    mat_t<val_type> forward_one(Src&& input)
+    {
+        return forward(std::forward<Src>(input));
+    }
+
+    template <typename other_type>
+    mat_t<val_type> backward(const other_type& delta)
+    {
+        if (delta.row_num() != m_rows * m_cols || delta.col_num() != 1)
+            throw std::runtime_error("flatten_net_t::backward: delta must be [rows*cols, 1]");
+        mat_t<val_type> out(m_rows, m_cols);
+        for (int i = 0; i < m_rows; ++i)
+            for (int j = 0; j < m_cols; ++j)
+                out(i, j) = delta(i * m_cols + j, 0);
+        return out;
+    }
+
+    std::string net_type(int const& indent = 0) const
+    {
+        std::stringstream ss;
+        ss << print_indent(indent) << "flatten_net_t:(" << m_rows << "x" << m_cols
+           << " -> " << m_rows * m_cols << "x1)";
+        return ss.str();
+    }
+
+    template<typename init_type>
+    void init_weight()
+    {
+        // 无权重
+    }
+
+    void step()
+    {
+        // 无权重
+    }
+};
+
 // 纵向的标准化层，即对每一列（每个 token）在特征维上做 LayerNorm
 template <typename input_type, template<typename> class updator_type>
 class layer_norm_net_t

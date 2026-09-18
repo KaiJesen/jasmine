@@ -26,14 +26,14 @@ mat_t<float> s = q.t().dot(k);               // matrix product (CPU: BLAS / GPU:
 | --- | --- |
 | Matrices & expressions | `mat_t` / `mat_view_t` / `mat_reshape_view_t`; lazy expression trees, compile-time fusion, scalar operands, transposed views, zero-copy subviews and shape views, zero-copy BLAS operands |
 | Operators | Arithmetic, comparisons, `exp` / `log` / `sqrt` / `sigmoid`, `dot`, row/column reductions, row-wise softmax, LayerNorm / RMSNorm |
-| Layers | Linear, **Conv2d (im2col + GEMM, full backward)**, **MaxPool2d / AvgPool2d (full backward)**, LayerNorm / RMSNorm, SiLU / GELU / ReLU, SwiGLU gating, residual, Embedding, cross-entropy / MSE |
+| Layers | Linear, **Conv2d (im2col + GEMM, full backward)**, **MaxPool2d / AvgPool2d (full backward)**, **Flatten**, LayerNorm / RMSNorm, SiLU / GELU / ReLU, SwiGLU gating, residual, Embedding, cross-entropy / MSE |
 | Models | decoder-only base; **GPT-2** (absolute positions + `gelu_new` + tied lm_head); **LLaMA family** (RoPE + RMSNorm + SwiGLU + GQA/MQA); enc-dec stack |
 | Training | Backprop checked against numerical gradients; SGD / Adam / NAdam; gradient accumulation (`cache_updator_t`) |
 | Inference | KV-cache prefill + per-token decoding; greedy / top-k / top-p sampling; streaming output |
 | Weights | Single-file `JASMINE_WEIGHTS_V1` format; **training-result serialization** (per-layer params + meta in one file, `save`/`load` round-trip); direct export from HuggingFace (`tools/`); layer-by-layer / logits golden-value alignment |
 | CUDA | Element-wise chains fused into a single kernel launch, cuBLAS GEMM, reductions, device-side KV cache / RoPE / MHA / a whole LLaMA, backwards and optimizers, **fused attention**, **bf16 / fp16 mixed precision** |
 
-**Status**: the host side passes `ctest` 222/222; the CUDA backend has 174 cases (compute-heavy cases
+**Status**: the host side passes `ctest` 228/228; the CUDA backend has 174 cases (compute-heavy cases
 are skipped by default). The CUDA backend is still being iterated on; target-machine vs test-machine
 differences are covered in [`CUDA.md`](CUDA.md), section 11.
 
@@ -223,7 +223,27 @@ use the CMake targets instead.
 
 ### 4.1 MNIST 小玩具（卷积 + 编码器 + 序列化）
 
-`examples/mnist_conv.cpp` 用本库的层拼出一个小 CNN（conv→ReLU→maxpool ×2 →flatten→Linear×2→CE），
+`examples/mnist_conv.cpp` **用 `complex_net_builder_t` 把层静态堆叠成 `complex_net_t`**
+（`forward` / `backward` / `step` / `init_weight` 全部走链），并支持两种结构在同一份数据、
+超参、随机种子下对比：
+
+```text
+conv2 = conv→relu→pool→conv→relu→pool→flatten→(fc→relu→fc)→ce   "标准 CNN"
+conv1 = conv→relu→pool→flatten→(fc→relu→fc)→ce
+
+# 两条结构各训 3 epoch 后对比（默认 arch=both）
+./build/examples/mnist_conv --data-dir build/mnist --epochs 3 --train-limit 6000 \
+    --batch 16 --lr 2e-3 --arch both --save build/mnist/cmp
+
+arch          params  epochs  train_loss   train_acc    test_acc   seconds
+conv2         105194       3    0.098669      0.9695      0.9724   120.618
+conv1         202330       3    0.119815    0.962667       0.964   113.324
+test_acc 差值（conv1 - conv2）= -0.0084
+```
+
+即：**两次下采样的标准 CNN 用一半参数（10.5 万 vs 20.2 万）反而高 0.84 个点**——
+第二个卷积层带来的层级特征比把宽特征直接灌进全连接更划算。
+
 按样本前向/反向、用 `cache_updator_t` 做 mini-batch 梯度累加，训练完把权重与元信息写进一个
 `JASMINE_WEIGHTS_V1` 文件，再 `--load` 回来验证往返一致：
 

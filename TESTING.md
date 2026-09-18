@@ -1541,3 +1541,73 @@ $ ./build/examples/mnist_conv ... --seed 7          # 换种子重跑
 | `examples/mnist_conv.cpp` | MNIST IDX 读取（含合成数据退化）、CNN 训练/评估、保存/载入自检 |
 | `tests/test_model_serialization.cpp` | `ModelSerialization.*`：往返一致、文件头、缺失/形状不符抛错 |
 | `tests/test_conv.cpp` | `Conv2d.ZeroCopyColViewForPatchifyGeometry` / `OneDZeroCopyMatchesReference`：零拷贝路径的启用与数值 |
+
+### 14.4 用静态层堆叠重写 MNIST 玩具，并对比两种结构
+
+最初那版 MNIST 例子是把每层写成结构体成员、手工串 forward/backward（能跑，但没用到库的
+「静态层堆叠」）。现在改成 `complex_net_builder_t` → `complex_net_t`：
+
+```cpp
+template <bool two_conv>
+using mnist_net_t = std::conditional_t<two_conv,
+    complex_net_builder_t<double>
+        ::push_back_updatable<conv2d_net_t, upr_tpl>   // 0 conv
+        ::push_back_staticnet<relu_net_t>              // 1
+        ::push_back_staticnet<pool2d_net_t>            // 2
+        ::push_back_updatable<conv2d_net_t, upr_tpl>   // 3 conv
+        ::push_back_staticnet<relu_net_t>              // 4
+        ::push_back_staticnet<pool2d_net_t>            // 5
+        ::push_back_staticnet<flatten_net_t>           // 6
+        ::push_back_updatable<weight_net_t, upr_tpl>   // 7 encoder
+        ::push_back_staticnet<relu_net_t>              // 8
+        ::push_back_updatable<weight_net_t, upr_tpl>   // 9 输出
+        ::push_back_staticnet<ce_loss_t>               // 10 loss
+        ::type,
+    /* 单卷积版：同上但去掉 3~5 */ >;
+```
+
+训练代码对两种结构**完全共用**：
+
+```cpp
+const dmat logits = net.forward(x);     // 链式前向；末端 ce_loss_t 透传并缓存 logits
+epoch_loss += net.back().loss(label);   // 末端损失层
+net.backward(label);                    // 链式反向：net_backward 逆序回传
+net.step();                             // 各层 updator（cache_updator_t）落地
+```
+
+链式反向的顺序我先单独验证过（`net_backward` 是折叠表达式，容易看错结合方向）：
+`net.backward(delta)` 与「手工按逆序逐层 backward」逐位一致。
+
+**为这条链新加的层：`flatten_net_t`**（`jas_net_t.hpp`）。语义就是 reshape，但它必须是**层**
+才能参与堆叠：forward 缓存输入形状并把 `[C, W]` 按行优先展平成 `[C*W, 1]`，backward 再把
+`[C*W, 1]` 的梯度还原成 `[C, W]`。与 relu/pool 一样是无参数静态层（`init_weight`/`step` 空实现、
+`is_reinitable_net` 为假，不占 `reinit` 的容器槽位）。`tests/test_flatten.cpp` 6 例钉住展平顺序、
+反向还原、懒初始化、概念判定，以及 conv→flatten→fc 链的数值与梯度形状。
+
+**对比实验**（真实 MNIST，同一份数据/超参/种子，全量 10000 张测试集）：
+
+```text
+$ ./build/examples/mnist_conv --data-dir build/mnist --arch both --epochs 3 \
+      --train-limit 6000 --batch 16 --lr 2e-3 --seed 1234
+
+arch          params  epochs  train_loss   train_acc    test_acc   seconds
+conv2         105194       3    0.098669      0.9695      0.9724   120.618
+conv1         202330       3    0.119815    0.962667       0.964   113.324
+test_acc 差值（conv1 - conv2）= -0.0084
+```
+
+读法：
+
+- `conv2` = conv→relu→pool→conv→relu→pool→flatten→encoder→ce（两次下采样，特征 16×7×7=784）；
+- `conv1` = conv→relu→pool→flatten→encoder→ce（一次下采样，特征 8×14×14=1568）；
+- **conv2 用一半参数（10.5 万 vs 20.2 万）反而高 0.84 个点**：第二次卷积 + 下采样把「空间特征」
+  换成了「更抽象、更少」的特征，比把宽特征图直接灌进全连接更划算；
+- 两者训练时间接近（121s vs 113s）：conv1 的前向/反向更便宜，但它的第一层全连接大 4 倍
+  （1568×128 = 20 万参数），正好抵掉；
+- 两种结构的保存/载入自检都通过（`--save build/mnist/cmp` 会写成
+  `cmp.conv2.jas` / `cmp.conv1.jas`，`--load` 同样按结构名找文件）。
+
+顺带说明为什么这条链能直接用 `complex_net_t`：conv/pool/flatten 都是**无 `reinit`** 的层
+（形状由 `set_param` 给），所以 `complex_net_t::reinit(container)` 只会作用到链里的两个
+`weight_net_t`，容器给 `{特征数, 128, 10}` 就够；`set_updator` / `init_weight` / `step` 会
+自动跳过静态层。
