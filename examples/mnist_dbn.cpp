@@ -1,18 +1,18 @@
 /**
- * MNIST + DBN（Deep Belief Network）小 demo：**用静态层堆叠**把 RBM 串成 DBN。
+ * A small MNIST + DBN (Deep Belief Network) demo: **static layer stacking** turns RBMs into a DBN.
  *
- *   RBM 0：784 → 256（无监督 CD-1 预训练）
- *   RBM 1：256 → 128（吃第 0 层的隐层概率，继续无监督预训练）
- *   分类头：128 → 10（监督微调时和上面的 RBM 一起反向传播）
+ *   RBM 0: 784 -> 256 (unsupervised CD-1 pretraining)
+ *   RBM 1: 256 -> 128 (eats layer 0's hidden probabilities and keeps pretraining unsupervised)
+ *   classifier head: 128 -> 10 (back-propagated with the RBMs during supervised fine-tuning)
  *
- * 这条链就是 `dbn_net_t<2, mnist_dbn_upr_tpl>`（`jas_rbm_t.hpp`）：2 个 RBM + weight_net + CE 全部由
- * `complex_net_builder_t` 静态堆叠而成，因此：
+ * The chain is `dbn_net_t<2, mnist_dbn_upr_tpl>` (`jas_rbm_t.hpp`): 2 RBMs + weight_net + CE, all
+ * assembled by `complex_net_builder_t` static stacking, therefore:
  *
- *     dbn.reinit({784, 256, 128, 10});       // 容器协议：每个 RBM / 分类头各消费一对数
- *     dbn_pretrain<2>(dbn, data, cd_k, epochs);   // 逐层贪心预训练（RBM 的 CD-k）
- *     dbn.forward(x) / dbn.backward(label) / dbn.step();   // 监督微调走整链反向
+ *     dbn.reinit({784, 256, 128, 10});       // container protocol: each RBM / head consumes one pair
+ *     dbn_pretrain<2>(dbn, data, cd_k, epochs);   // layer-wise greedy pretraining (the RBMs' CD-k)
+ *     dbn.forward(x) / dbn.backward(label) / dbn.step();   // fine-tuning runs the whole-chain backward
  *
- * 用法：
+ * Usage:
  *     ./build/examples/mnist_dbn --data-dir build/mnist --pretrain 3 --finetune 5 \
  *         --train-limit 2000 --save build/mnist/dbn.jas
  *     ./build/examples/mnist_dbn --data-dir build/mnist --load build/mnist/dbn.jas --finetune 0
@@ -45,7 +45,7 @@ constexpr int kClasses = 10;
 
 struct dataset_t
 {
-    std::vector<std::vector<double>> images;   // 每张 784 个 [0,1] 像素（按 0.5 二值化后使用）
+    std::vector<std::vector<double>> images;   // 784 [0,1] pixels per image (binarised at 0.5 before use)
     std::vector<int> labels;
     std::size_t size() const { return labels.size(); }
 };
@@ -67,7 +67,7 @@ dataset_t load_mnist(std::string const& image_path, std::string const& label_pat
     const std::uint32_t rows = read_be_u32(imgs), cols = read_be_u32(imgs);
     const std::uint32_t lbl_magic = read_be_u32(lbls), m = read_be_u32(lbls);
     if (img_magic != 2051u || lbl_magic != 2049u || n != m || rows * cols != kVisible)
-        throw std::runtime_error("bad IDX header (未解压？)");
+        throw std::runtime_error("bad IDX header (is the file still gzipped?)");
 
     dataset_t d;
     d.images.resize(n);
@@ -78,7 +78,7 @@ dataset_t load_mnist(std::string const& image_path, std::string const& label_pat
         imgs.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
         d.images[i].resize(kVisible);
         for (std::size_t p = 0; p < kVisible; ++p)
-            d.images[i][p] = buf[p] > 127 ? 1.0 : 0.0;      // RBM 是 Bernoulli 可见单元 → 二值化
+            d.images[i][p] = buf[p] > 127 ? 1.0 : 0.0;      // the RBM has Bernoulli visible units -> binarise
         unsigned char label = 0;
         lbls.read(reinterpret_cast<char*>(&label), 1);
         d.labels[i] = static_cast<int>(label);
@@ -86,7 +86,7 @@ dataset_t load_mnist(std::string const& image_path, std::string const& label_pat
     return d;
 }
 
-/** 把一批样本组装成 [784, B] 的矩阵（列 = 样本） */
+/** Assemble a batch of samples into a [784, B] matrix (columns are samples) */
 dmat batch_matrix(dataset_t const& d, std::vector<std::size_t> const& idx, std::size_t from,
                   std::size_t count)
 {
@@ -121,7 +121,7 @@ double evaluate(net_type& dbn, dataset_t const& d, std::size_t limit)
     return n ? static_cast<double>(correct) / static_cast<double>(n) : 0.0;
 }
 
-/** DBN 的序列化：每个 RBM 的 W/b/c + 分类头 + 元信息 */
+/** DBN serialization: each RBM's W/b/c + the classifier head + metadata */
 void save_dbn(dbn_net_t<2, mnist_dbn_upr_tpl> const& dbn, std::string const& path, int epochs, double acc)
 {
     weight_writer_t w;
@@ -206,11 +206,11 @@ int main(int argc, char** argv)
     }
     catch (std::exception const& e)
     {
-        std::cerr << "[data] " << e.what() << "\\n（先在 build/mnist 放好解压后的 IDX 文件）\\n";
+        std::cerr << "[data] " << e.what() << "\\n(put the uncompressed IDX files under build/mnist first)\\n";
         return 1;
     }
 
-    // ---- 静态层堆叠出 DBN：RBM(784→256) → RBM(256→128) → 分类头(128→10) → CE ----
+    // ---- static stacking builds the DBN: RBM(784->256) -> RBM(256->128) -> head(128->10) -> CE ----
     dbn_net_t<2, mnist_dbn_upr_tpl> dbn;
     dbn.reinit(std::vector<int>{kVisible, kHidden1, kHidden2, kClasses});
 
@@ -225,7 +225,7 @@ int main(int argc, char** argv)
         int epochs = 0;
         double acc = 0.0;
         load_dbn(dbn, load_path, epochs, acc);
-        std::cout << "[load] " << load_path << "（记录 epochs=" << epochs << " acc=" << acc << "）\\n";
+        std::cout << "[load] " << load_path << " (recorded epochs=" << epochs << " acc=" << acc << "）\\n";
     }
 
     std::vector<std::size_t> order(train.size());
@@ -234,10 +234,10 @@ int main(int argc, char** argv)
     std::shuffle(order.begin(), order.end(), rng);
     const std::size_t n_train = std::min(static_cast<std::size_t>(train_limit), train.size());
 
-    // ---- 1) 逐层贪心无监督预训练（CD-k）----
+    // ---- 1) layer-wise greedy unsupervised pretraining (CD-k) ----
     if (pretrain_epochs > 0)
     {
-        std::cout << "\\n[pretrain] 逐层 CD-" << cd_k << "，每层 " << pretrain_epochs << " 个 epoch\\n";
+        std::cout << "\\n[pretrain] layer-wise CD-" << cd_k << ", " << pretrain_epochs << " epochs per layer\\n";
         for (int epoch = 0; epoch < pretrain_epochs; ++epoch)
         {
             double recon = 0.0;
@@ -246,15 +246,15 @@ int main(int argc, char** argv)
                 const dmat chunk = batch_matrix(train, order, b, static_cast<std::size_t>(batch));
                 recon = dbn_pretrain<2>(dbn, chunk, cd_k, 1);
             }
-            std::cout << "  epoch " << (epoch + 1) << " 重建误差≈" << recon << std::endl;
+            std::cout << "  epoch " << (epoch + 1) << " reconstruction error ~" << recon << std::endl;
         }
     }
 
-    // ---- 2) 监督微调（整链反向）----
+    // ---- 2) supervised fine-tuning (whole-chain backward) ----
     if (finetune_epochs > 0)
     {
         dbn.set_updator(static_cast<double>(ft_lr));
-        std::cout << "\\n[finetune] " << finetune_epochs << " 个 epoch（mini-batch = " << batch << "）\\n";
+        std::cout << "\\n[finetune] " << finetune_epochs << " epochs (mini-batch = " << batch << "）\\n";
         for (int epoch = 0; epoch < finetune_epochs; ++epoch)
         {
             double loss_sum = 0.0;
@@ -283,20 +283,20 @@ int main(int argc, char** argv)
     }
 
     const double acc = evaluate(dbn, test, static_cast<std::size_t>(test_limit));
-    std::cout << "\\n[result] test_acc=" << acc << "（" << std::min(static_cast<std::size_t>(test_limit), test.size())
-              << " 张测试图）\\n";
+    std::cout << "\\n[result] test_acc=" << acc << " (" << std::min(static_cast<std::size_t>(test_limit), test.size())
+              << " test images)\\n";
 
     if (!save_path.empty())
     {
         save_dbn(dbn, save_path, pretrain_epochs + finetune_epochs, acc);
-        // 往返自检
+        // round-trip self-check
         dbn_net_t<2, mnist_dbn_upr_tpl> reloaded;
         reloaded.reinit(std::vector<int>{kVisible, kHidden1, kHidden2, kClasses});
         int e = 0;
         double a = 0.0;
         load_dbn(reloaded, save_path, e, a);
         const double acc2 = evaluate(reloaded, test, static_cast<std::size_t>(test_limit));
-        std::cout << "[save] " << save_path << "；重新载入 test_acc=" << acc2
+        std::cout << "[save] " << save_path << "; reloaded test_acc=" << acc2
                   << (std::abs(acc2 - acc) < 1e-12 ? "  OK" : "  FAILED") << "\\n";
     }
     return 0;
