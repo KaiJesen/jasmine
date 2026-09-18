@@ -246,7 +246,9 @@ cd ../..
 ./build/examples/mnist_conv --synthetic --epochs 2 --train-limit 500 --test-limit 200
 ```
 
-实测（本机、参考 BLAS、单线程）：6000 张 × 3 epoch 约 84 秒收敛到 **96.2%** 测试精度；
+实测（本机、参考 BLAS、单线程）：训练集 60000 张里随机抽 6000 张、3 个 epoch 约 85~115 秒，
+在**完整 10000 张测试集**上达到 **96.2%（seed 1234）/ 97.5%（seed 7）**；训练与测试用的是
+官方 IDX 划分的两个文件（按图像内容比对，两集仅 1 张重复，属 MNIST 自身的已知瑕疵）。
 保存/载入后的预测与保存前完全一致。序列化的读写接口是 `jas_weight_io.hpp` 里已有的
 `weight_writer_t` / `weight_file_t`，本轮补上了按层命名的黏合层（`add_layer_params` /
 `read_layer_params`）与标量元信息（`add_scalar`）。

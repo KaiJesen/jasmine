@@ -1488,18 +1488,31 @@ safetensors）的理由：Python 侧的 `tools/jasmine_weights.py` 已经能解�
 - 数据优先读 `--data-dir` 下的未压缩 MNIST IDX 文件；找不到就退化成内置的合成数字图案，
   所以无网络/无数据时这个 demo 仍然能跑通整条链路（也方便当冒烟测试）。
 
-实测（本机、参考 BLAS、单线程、`-O3 -march=native`）：
+实测（本机、参考 BLAS、单线程、`-O3 -march=native`，评估都在**完整 10000 张测试集**上）：
 
 ```text
-./build/examples/mnist_conv --data-dir build/mnist --epochs 3 --train-limit 6000 --batch 16 --lr 2e-3
+$ ./build/examples/mnist_conv --data-dir build/mnist --epochs 3 --train-limit 6000 --batch 16 --lr 2e-3 --seed 1234
 [epoch 1] train_loss=0.3472 train_acc=0.8917 test_acc=0.9350
 [epoch 2] train_loss=0.1444 train_acc=0.9537 test_acc=0.9535
 [epoch 3] train_loss=0.0987 train_acc=0.9695 test_acc=0.9615
 [save] build/mnist/model.jas  (12 tensors: 4 层参数 + 4 元信息)
 [check] OK: 保存/载入往返一致
+
+$ ./build/examples/mnist_conv ... --seed 7          # 换种子重跑
+[epoch 1] test_acc=0.9418    [epoch 2] test_acc=0.9684    [epoch 3] test_acc=0.9747
 ```
 
-（6000 张 × 3 epoch 约 84 秒；把 `--train-limit` 调到 60000 就是完整 MNIST，数量级上约 15 分钟。）
+**为什么 6000 张 × 3 epoch 就有 96~97%**：MNIST 本身很容易，而这个网络只有约 10.5 万参数
+（conv1 208 + conv2 3216 + fc1 100480 + fc2 1290），20 个 epoch 都远没到过拟合；3 个 epoch
+已经足以把明显可分的手写数字学会。要更高的数字就把 `--train-limit` 调到 60000（约 15 分钟）。
+
+**训练/测试是真分开的**：
+
+- 数据来自官方 IDX 两个文件：`train-*-idx3/idx1-ubyte`（60000 张）与 `t10k-*`（10000 张），
+  训练循环只访问 `train.images[order[k]]`，评估只访问 `test.images`，两条路径不交叉；
+- 按**图像内容**（md5）比对两集：交集只有 1 张，是 MNIST 数据集自身的已知瑕疵，不足以解释精度；
+- `--train-limit 6000` 不是文件前 6000 张，而是先用 `std::shuffle` 打乱全部 60000 的索引再取前 6000，
+  所以子集是有代表性的（标签分布 ≈ 每类 600 张）；默认评估用全部 10000 张测试图。
 
 ### 14.3 顺带修掉的三处「表达式包住 dot」
 

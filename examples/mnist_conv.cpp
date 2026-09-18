@@ -22,6 +22,7 @@
  *
  * 用法：
  *     ./build/examples/mnist_conv --data-dir build/mnist --epochs 3 --save build/mnist/model.jas
+ *       默认在全量测试集（10000 张）上评估；训练用训练集里随机抽的 6000 张。
  *     ./build/examples/mnist_conv --data-dir build/mnist --load build/mnist/model.jas
  *     ./build/examples/mnist_conv --synthetic          # 无数据时的冒烟测试
  */
@@ -282,7 +283,8 @@ int main(int argc, char** argv)
     std::string save_path, load_path;
     int epochs = 3, batch = 8;
     double lr = 1e-3;
-    long train_limit = 6000, test_limit = 2000;
+    // 默认在完整测试集（MNIST t10k 全部 10000 张）上评估，不做子集挑选
+    long train_limit = 6000, test_limit = 10000;
     unsigned seed = 1234;
     bool synthetic = false;
 
@@ -312,8 +314,8 @@ int main(int argc, char** argv)
     dataset_t train, test;
     if (synthetic)
     {
-        train = make_synthetic(static_cast<std::size_t>(std::max(1l, train_limit)), seed);
-        test = make_synthetic(static_cast<std::size_t>(std::max(1l, test_limit)), seed + 1);
+        train = make_synthetic(static_cast<std::size_t>(std::max(1l, std::min(train_limit, 1000l))), seed);
+        test = make_synthetic(static_cast<std::size_t>(std::max(1l, std::min(test_limit, 500l))), seed + 1);
         std::cout << "[data] 合成数据集（--synthetic）：train=" << train.size()
                   << " test=" << test.size() << "\n";
     }
@@ -330,8 +332,8 @@ int main(int argc, char** argv)
         {
             std::cout << "[data] " << e.what() << "\n"
                       << "[data] 退化为合成数据集（用 --data-dir 指向 MNIST IDX 文件可训练真实数据）\n";
-            train = make_synthetic(static_cast<std::size_t>(std::max(1l, train_limit)), seed);
-            test = make_synthetic(static_cast<std::size_t>(std::max(1l, test_limit)), seed + 1);
+            train = make_synthetic(static_cast<std::size_t>(std::max(1l, std::min(train_limit, 1000l))), seed);
+            test = make_synthetic(static_cast<std::size_t>(std::max(1l, std::min(test_limit, 500l))), seed + 1);
         }
     }
 
