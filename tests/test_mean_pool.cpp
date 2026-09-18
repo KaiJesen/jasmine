@@ -1,8 +1,9 @@
 /**
- * mean_pool_net_t 单测：把 [d_model, T] 的 token 序列压成 [d_model, 1]。
+ * Unit tests for mean_pool_net_t: compresses a [d_model, T] token sequence into [d_model, 1].
  *
- * 它是「Transformer encoder → 分类头」之间的那一层：forward 对 token 取平均，
- * backward 把梯度平均分摊回每个 token（与 mean 的定义一致），并且必须是无参数静态层。
+ * This is the layer between a Transformer encoder and the classification head: forward averages the
+ * tokens, backward spreads the gradient evenly back over them (which is the definition of a mean),
+ * and the layer has to be a parameterless static layer.
  */
 
 #include <cmath>
@@ -48,11 +49,11 @@ TEST(MeanPool, BackwardSpreadsGradientEvenly)
     ExpectShape(dx, 2, 4);
     for (int t = 0; t < 4; ++t)
     {
-        EXPECT_DOUBLE_EQ(dx(0, t), 8.0 / 4.0);    // 每个 token 分摊 1/T
+        EXPECT_DOUBLE_EQ(dx(0, t), 8.0 / 4.0);    // every token receives 1/T
         EXPECT_DOUBLE_EQ(dx(1, t), 12.0 / 4.0);
     }
 
-    // 形状不符抛错
+    // mismatched shapes must throw
     EXPECT_THROW(mp.backward(dmat(2, 2)), std::runtime_error);
     EXPECT_THROW(mp.backward(dmat(3, 1)), std::runtime_error);
 }
@@ -66,13 +67,13 @@ TEST(MeanPool, IsStaticLayerWithoutReinit)
 
 TEST(MeanPool, ChainWithLinearHead)
 {
-    // mean pool → linear 的小链：反向要能穿过池化回到序列
+    // a tiny mean pool -> linear chain: backward has to pass through the pooling to the sequence
     using chain_t = complex_net_builder_t<double>
         ::push_back_staticnet<mean_pool_net_t>
         ::push_back_updatable<weight_net_t, sgd_t>
         ::type;
     chain_t net;
-    net.reinit(std::vector<int>{4, 3});          // fc: 4 → 3（容器只作用于 weight_net）
+    net.reinit(std::vector<int>{4, 3});          // fc: 4 -> 3 (the container only feeds weight_net)
     net.get<1>().set_updator(1.0);
     net.get<1>().weight() = 0.5;
     net.get<1>().bias() = 0.0;
@@ -88,7 +89,7 @@ TEST(MeanPool, ChainWithLinearHead)
 
     const dmat delta(3, 1, {1, 2, 3});
     const dmat dx = net.backward(delta);
-    ExpectShape(dx, 4, 5);                       // 梯度回到了原始序列形状
+    ExpectShape(dx, 4, 5);                       // the gradient is back in the original sequence shape
 }
 
 TEST(MeanPool, NetTypeMentionsTokenCount)

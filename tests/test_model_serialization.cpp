@@ -1,11 +1,12 @@
 /**
- * 训练结果的序列化：权重 + 元信息往返（JASMINE_WEIGHTS_V1）。
+ * Serialization of training results: a weights + metadata round-trip (JASMINE_WEIGHTS_V1).
  *
- * 覆盖三件事：
- *   1. add_layer_params / read_layer_params 对 conv2d_net_t 与 weight_net_t 都能用；
- *   2. 往返后**前向输出一致**（文件是 float32，所以用 1e-6 量级的容差而不是逐位）；
- *   3. 元信息（epoch/loss/精度）以 1x1 tensor 存进同一个文件，能原样读回；
- *      缺 tensor 时读取会抛错，而不是悄悄给 0。
+ * Three things are covered:
+ *   1. add_layer_params / read_layer_params work for both conv2d_net_t and weight_net_t;
+ *   2. after the round-trip the **forward output matches** (the file is float32, hence a 1e-6
+ *      tolerance instead of bit-exactness);
+ *   3. the metadata (epoch / loss / accuracy) is stored as 1x1 tensors in the same file and read back
+ *      unchanged; a missing tensor throws instead of silently yielding 0.
  */
 
 #include <cmath>
@@ -41,11 +42,11 @@ dmat make_mat(int rows, int cols, double scale, unsigned seed)
     return m;
 }
 
-/** 被测模型：一个小卷积 + 一个小全连接 */
+/** The model under test: a small convolution plus a small fully-connected layer */
 struct toy_model_t
 {
     conv2d_net_t<dmat, sgd_t> conv{1, 2, 4, 4, 3, 3, 1, 1, 1, 1};   // → [2, 16]
-    weight_net_t<dmat, sgd_t> fc{2, 3};                              // 2 → 3（conv 的输出行数=通道数）
+    weight_net_t<dmat, sgd_t> fc{2, 3};                              // 2 -> 3 (conv's output rows = channels)
 
     dmat forward(dmat const& x)
     {
@@ -81,10 +82,10 @@ TEST(ModelSerialization, RoundTripPreservesForwardOutput)
         w.add_scalar("meta.loss", 0.125);
         w.add_scalar("meta.accuracy", 0.9375);
         w.write(path);
-        EXPECT_EQ(w.size(), 4u + 3u);      // 4 个参数张量 + 3 个元信息
+        EXPECT_EQ(w.size(), 4u + 3u);      // 4 parameter tensors + 3 metadata entries
     }
 
-    // 文件头必须是文档里写的格式（格式稳定性）
+    // the header must be the format the documentation describes (format stability)
     {
         std::ifstream in(path, std::ios::binary);
         ASSERT_TRUE(in.good());
@@ -98,7 +99,7 @@ TEST(ModelSerialization, RoundTripPreservesForwardOutput)
         EXPECT_EQ(count, 7);
     }
 
-    // 换一组完全不同的权重，再载入，确认输出被还原
+    // load into a model holding completely different weights and confirm the output is restored
     toy_model_t loaded;
     loaded.conv.weight() = make_mat(2, 9, 0.5, 91);
     loaded.conv.bias() = make_mat(2, 1, 0.3, 92);
@@ -117,11 +118,11 @@ TEST(ModelSerialization, RoundTripPreservesForwardOutput)
         EXPECT_NEAR(wf.read_scalar<float>("meta.loss"), 0.125f, 1e-7f);
         EXPECT_NEAR(wf.read_scalar<float>("meta.accuracy"), 0.9375f, 1e-7f);
 
-        // 缺 tensor 必须抛错（不能静默给 0）
+        // a missing tensor must throw (no silent zeros)
         EXPECT_THROW(wf.read_scalar<float>("meta.missing"), std::runtime_error);
     }
 
-    // float32 存储 + 读回 double：容差用 1e-6
+    // float32 storage read back into double: tolerance 1e-6
     ExpectNearMat(loaded.forward(x), y_ref, 1e-6);
     std::remove(path.c_str());
 }
@@ -136,7 +137,7 @@ TEST(ModelSerialization, ShapeMismatchIsRejected)
     }
 
     toy_model_t other;
-    other.conv.set_param(1, 3, 4, 4, 3, 3, 1, 1, 1, 1);   // 输出通道数不同 → 权重张量形状不同
+    other.conv.set_param(1, 3, 4, 4, 3, 3, 1, 1, 1, 1);   // different output channels -> different weight shape
     weight_file_t wf;
     wf.load(path);
     EXPECT_THROW(read_layer_params(wf, "conv", other.conv), std::runtime_error);

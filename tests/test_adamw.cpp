@@ -1,10 +1,12 @@
 /**
- * adamw_t 单测：解耦权重衰减（decoupled weight decay）。
+ * Unit tests for adamw_t: decoupled weight decay.
  *
- * 三个关键性质：
- *   1. wd = 0 时必须与 adam_t 逐位一致（说明差别只在衰减项）；
- *   2. 梯度为 0 时，衰减仍然生效：θ ← θ·(1 - lr·wd)（这正是「解耦」的语义）；
- *   3. 衰减强度与矩估计无关：θ₁ = θ₀ - lr·(ĝ + wd·θ₀)，ĝ 是 Adam 的归一化梯度步。
+ * Three key properties:
+ *   1. with wd = 0 it must match adam_t bit for bit (proving that the only difference is the decay);
+ *   2. with a zero gradient the decay still applies: theta <- theta * (1 - lr*wd) -- exactly what
+ *      "decoupled" means;
+ *   3. the decay does not pass through the moment estimate: theta1 = theta0 - lr*(g_hat + wd*theta0),
+ *      where g_hat is Adam's normalised gradient step.
  */
 
 #include <cmath>
@@ -45,7 +47,7 @@ TEST(AdamW, MatchesAdamWhenWeightDecayIsZero)
         adam.update(g, w_adam);
         adamw.update(g, w_adamw);
     }
-    ExpectNearMat(w_adamw, w_adam, 0.0);          // 逐位一致
+    ExpectNearMat(w_adamw, w_adam, 0.0);          // bit for bit
 }
 
 TEST(AdamW, DecayAppliesWithZeroGradient)
@@ -55,7 +57,7 @@ TEST(AdamW, DecayAppliesWithZeroGradient)
     dmat zero(1, 3);
     zero = 0.0;
     opt.update(zero, w);
-    // 矩估计为 0 → ĝ = 0；只剩解耦衰减 θ·(1 - lr·wd) = θ·0.95
+    // the moments are zero, so g_hat = 0 and only the decoupled decay remains: theta*(1-lr*wd)
     EXPECT_NEAR(w(0, 0), 0.95, 1e-12);
     EXPECT_NEAR(w(0, 1), 1.90, 1e-12);
     EXPECT_NEAR(w(0, 2), 2.85, 1e-12);
@@ -66,14 +68,15 @@ TEST(AdamW, DecayIsDecoupledFromTheMomentEstimate)
     dmat w(1, 1, {2.0});
     const double lr = 0.1, wd = 0.25;
     adamw_t<double> opt(lr, 0.9, 0.999, 1e-8, wd);
-    dmat g(1, 1, {0.5});                          // 一步之后：m̂ = g, v̂ = g², ĝ = g/(|g|+ε) ≈ 1
+    dmat g(1, 1, {0.5});                          // after one step: m_hat = g, v_hat = g^2, g_hat = g/(|g|+eps) ~ 1
     opt.update(g, w);
 
     const double g_hat = 0.5 / (0.5 + 1e-8);
-    const double expected = 2.0 - lr * (g_hat + wd * 2.0);   // 衰减直接作用在 θ 上
+    const double expected = 2.0 - lr * (g_hat + wd * 2.0);   // the decay acts directly on theta
     EXPECT_NEAR(w(0, 0), expected, 1e-9) << "expected=" << expected;
 
-    // 对照：Adam 的 L2 版本会把 wd·θ 加进梯度，衰减被 |g| 归一化后强度完全不同
+    // for contrast: the L2 form of Adam adds wd*theta to the gradient, so |g| normalises the decay
+    // and its strength is completely different
     dmat w_l2(1, 1, {2.0});
     adam_t<double> adam(lr);
     dmat g_l2(1, 1, {0.5 + wd * 2.0});
@@ -89,7 +92,7 @@ TEST(AdamW, SetAndAccessors)
     EXPECT_NEAR(opt.weight_decay(), 0.5, 1e-15);
     opt.set(0.001, 0.9, 0.999, 1e-8, 0.03);
     EXPECT_NEAR(opt.weight_decay(), 0.03, 1e-15);
-    opt.set_lr(0.002);                            // 不抛异常即可
+    opt.set_lr(0.002);                            // not throwing is all we check
     opt.step();
     SUCCEED();
 }

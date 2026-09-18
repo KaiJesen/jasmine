@@ -1,7 +1,9 @@
 /**
- * cls_token_net_t（拼接可学习 CLS 向量）与 take_token_net_t（取某一列）单测。
+ * Unit tests for cls_token_net_t (prepends a learnable CLS vector) and take_token_net_t (takes one
+ * column).
  *
- * 这两层是 ViT 风格分类头的一对：encoder 前拼 CLS，encoder 后取 CLS 列。
+ * Together they form a ViT-style classification head: prepend CLS before the encoder and take the
+ * CLS column after it.
  */
 
 #include <stdexcept>
@@ -28,17 +30,17 @@ TEST(ClsToken, ForwardPrependsTheLearnedVector)
 {
     cls_t cls;
     cls.set_param(3);
-    cls.token() = dmat(3, 1, {9, 8, 7});          // 直接写 CLS 向量，便于校验
+    cls.token() = dmat(3, 1, {9, 8, 7});          // write the CLS vector directly so the check is exact
     const dmat x(3, 4, {1, 2, 3, 4,
                         5, 6, 7, 8,
                         9, 10, 11, 12});
     const dmat y = cls.forward(x);
-    ExpectShape(y, 3, 5);                          // 4 个 token + 1 个 CLS
+    ExpectShape(y, 3, 5);                          // 4 tokens + 1 CLS
     EXPECT_DOUBLE_EQ(y(0, 0), 9.0);
     EXPECT_DOUBLE_EQ(y(2, 0), 7.0);
     for (int i = 0; i < 3; ++i)
         for (int t = 0; t < 4; ++t)
-            EXPECT_DOUBLE_EQ(y(i, t + 1), x(i, t)) << "token 必须原样后移一位";
+            EXPECT_DOUBLE_EQ(y(i, t + 1), x(i, t)) << "tokens must be shifted by one, unchanged";
 }
 
 TEST(ClsToken, BackwardFeedsTheTokenUpdatorAndPassesTokensThrough)
@@ -54,10 +56,10 @@ TEST(ClsToken, BackwardFeedsTheTokenUpdatorAndPassesTokensThrough)
                             5, 6, 7, 8});
     const dmat dx = cls.backward(delta);
 
-    // CLS 的梯度就是 delta 的第 0 列
+    // the CLS gradient is column 0 of delta
     EXPECT_NEAR(cls.token()(0, 0), 0.5 - 1.0, 1e-12);
     EXPECT_NEAR(cls.token()(1, 0), -0.5 - 5.0, 1e-12);
-    // 返回的梯度是 delta 去掉第 0 列
+    // the returned gradient is delta without column 0
     ExpectShape(dx, 2, 3);
     for (int i = 0; i < 2; ++i)
         for (int t = 0; t < 3; ++t)
@@ -69,7 +71,7 @@ TEST(ClsToken, BackwardFeedsTheTokenUpdatorAndPassesTokensThrough)
 TEST(ClsToken, IsUpdatableButNotReinitDetected)
 {
     static_assert(is_updatable_net<cls_t>);
-    static_assert(!is_reinitable_net<cls_t>);      // set_param 而非 reinit → 不占容器槽位
+    static_assert(!is_reinitable_net<cls_t>);      // set_param instead of reinit -> no container slot
     SUCCEED();
 }
 
@@ -89,7 +91,7 @@ TEST(TakeToken, PicksTheRequestedColumn)
     const dmat y2 = third.forward(x);
     EXPECT_DOUBLE_EQ(y2(0, 0), 3.0);
 
-    EXPECT_THROW(third.forward(dmat(2, 2)), std::out_of_range);   // index 2 >= 2 列
+    EXPECT_THROW(third.forward(dmat(2, 2)), std::out_of_range);   // index 2 >= 2 columns
 }
 
 TEST(TakeToken, BackwardScattersIntoOneColumn)

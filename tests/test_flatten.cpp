@@ -1,9 +1,10 @@
 /**
- * flatten_net_t 单测：CNN 尾部「特征图 → 向量」那一层，也是 conv+relu+pool+flatten+encoder
- * 这条静态层堆叠链里唯一新增的层。
+ * Unit tests for flatten_net_t: the "feature map -> vector" layer at the end of a CNN, and the only
+ * new layer in the conv+relu+pool+flatten+encoder static stacking chain.
  *
- * 三件事：展平顺序（行优先，与 conv/pool 的布局一致）、反向还原形状、以及它必须被识别为
- * 无参数静态层（否则会占掉 complex_net_t::reinit 的容器槽位）。
+ * Three things: the flatten order (row-major, matching the conv/pool layout), restoring the shape
+ * during backward, and that it is recognised as a parameterless static layer (otherwise it would
+ * consume a complex_net_t::reinit container slot).
  */
 
 #include <stdexcept>
@@ -53,17 +54,17 @@ TEST(Flatten, BackwardRestoresShape)
     EXPECT_DOUBLE_EQ(dx(1, 0), 40.0);
     EXPECT_DOUBLE_EQ(dx(1, 2), 60.0);
 
-    // 形状不符必须抛错
+    // mismatched shapes must throw
     EXPECT_THROW(flatten.backward(dmat(5, 1)), std::runtime_error);
     EXPECT_THROW(flatten.backward(dmat(6, 2)), std::runtime_error);
 }
 
 TEST(Flatten, LazyShapeFromFirstForwardAndRejectsMismatch)
 {
-    flat_t flatten;                       // 不调用 set_param
+    flat_t flatten;                       // set_param is deliberately not called
     const dmat x(3, 2, {1, 2, 3, 4, 5, 6});
     ExpectShape(flatten.forward(x), 6, 1);
-    EXPECT_THROW(flatten.forward(dmat(2, 3)), std::invalid_argument);   // 形状变了要显式 set_param
+    EXPECT_THROW(flatten.forward(dmat(2, 3)), std::invalid_argument);   // the shape changed, so set_param is required
 }
 
 TEST(Flatten, IsStaticLayerWithoutReinit)
@@ -75,7 +76,7 @@ TEST(Flatten, IsStaticLayerWithoutReinit)
 
 TEST(Flatten, ChainWithConvAndLinear)
 {
-    // conv → flatten → fc 的静态层堆叠链：反向要能穿过 flatten 回到卷积
+    // a conv -> flatten -> fc static stacking chain: backward has to pass through flatten
     using chain_t = complex_net_builder_t<double>
         ::push_back_updatable<conv2d_net_t, test_flatten_upr_tpl>
         ::push_back_staticnet<flatten_net_t>
@@ -98,8 +99,8 @@ TEST(Flatten, ChainWithConvAndLinear)
     const dmat y = net.forward(x);
     ExpectShape(y, 4, 1);
 
-    // 手工前向核对：conv → 展平 → fc
-    const dmat conv_out = net.get<0>().forward(x);   // 注意：这会再次缓存，仅用于数值核对
+    // manual forward check: conv -> flatten -> fc
+    const dmat conv_out = net.get<0>().forward(x);   // note: this caches again; only used for the check
     dmat flat(18, 1);
     for (int i = 0; i < 2; ++i)
         for (int j = 0; j < 9; ++j)
@@ -109,7 +110,7 @@ TEST(Flatten, ChainWithConvAndLinear)
 
     const dmat delta(4, 1, {1, 2, 3, 4});
     const dmat dx = net.backward(delta);
-    ExpectShape(dx, 1, 9);                            // 梯度穿过了 flatten 回到卷积输入
+    ExpectShape(dx, 1, 9);                            // the gradient travelled through flatten back to the conv input
 }
 
 TEST(Flatten, NetTypeReportsShape)
