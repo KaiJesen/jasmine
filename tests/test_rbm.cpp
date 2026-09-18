@@ -7,6 +7,7 @@
  */
 
 #include <cmath>
+#include <cstdio>
 #include <vector>
 
 #include <cstdio>
@@ -232,14 +233,11 @@ TEST(Dbn, GreedyPretrainReducesReconstruction)
     ExpectShape(dbn.template get<0>().weight(), 5, 8);   // 形状没被 updator 改掉
     ExpectShape(dbn.template get<1>().weight(), 4, 5);
     ExpectShape(dbn.template get<2>().weight(), 3, 4);
+
 }
 
 TEST(Dbn, FullChainBackward)
 {
-    // 已知问题（不假装通过）：整条 DBN 链的 backward（CE → 分类头 → RBM → RBM）在**单独编译
-    // 本文件时通过**，链接进完整 unit_tests 后会抛 "mat_dot_t: inner dimensions do not match"。
-    // 两个二进制编译参数完全相同（-O3 -DNDEBUG -fopenmp -DJASMINE_USE_BLAS），所以怀疑是新代码
-    // 里某处依赖内存布局的 UB（只在跨 TU 的大二进制里暴露）。单层 RBM 的反向已由
-    // Rbm.LayerBackwardMatchesNumericalGradient 用数值梯度钉住；整链反向待单独排查。
-    GTEST_SKIP() << "整链反向在完整 unit_tests 二进制里失败（跨 TU 才暴露），待排查";
+    GTEST_SKIP() << "整链反向在完整 unit_tests 里失败：分类头的前向缓存 m_input 在 backward 时是空的"
+                 "（same this、前向时为 (4,3)），已缩小到「缓存被清空」这一步，根因待查；见 TESTING.md 15.3";
 }

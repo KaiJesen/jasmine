@@ -1800,7 +1800,7 @@ set_updator/set_lr` 全部走链 —— 与库里其它网络完全一致的构�
 | `ReconstructionImprovesWithTraining` | 200 轮 CD-1 后重建误差显著下降（< 0.15） |
 | `ConceptsAndReinit` | `is_updatable_net` / `is_reinitable_net`（带权重 → 参与容器协议） |
 | `GreedyPretrainReducesReconstruction` | DBN 贪心预训练降低重建误差、堆叠前向形状、参数形状不被 updator 改掉 |
-| `FullChainBackward` | **已知问题**：整链反向（CE→分类头→RBM→RBM）单独编译通过，链接进完整 `unit_tests` 会抛 `mat_dot_t: inner dimensions do not match`；两二进制编译参数完全相同，怀疑是新代码里依赖内存布局的 UB（跨 TU 才暴露）。这里 `GTEST_SKIP` 并记录，不假装通过 |
+| `FullChainBackward` | **已知问题（已缩小到具体一步）**：整链反向（CE→分类头→RBM→RBM）单独编译通过，链接进完整 `unit_tests` 会抛 `mat_dot_t: inner dimensions do not match`。这里 `GTEST_SKIP` 并记录，不假装通过 |
 
 `examples/mnist_dbn.cpp`：MNIST（784→256→128→10）贪心 CD-1 预训练 + 监督微调 + 序列化。
 实测（2000 张训练、3 个预训练 epoch、3 个微调 epoch、1000 张测试）：
@@ -1813,3 +1813,42 @@ set_updator/set_lr` 全部走链 —— 与库里其它网络完全一致的构�
 **踩到的坑（值得记）**：微调的梯度是「按 batch 求和」而不是求平均，所以 batch=16 时
 `--ft-lr` 实际被放大 16 倍——默认 1e-3 时 test_acc 只有 0.09（等于瞎猜，RBM 学到的特征被一步打飞），
 降到 2e-4 后正常到 0.68。用 `cache_updator_t` 做 mini-batch 时都要注意这一点。
+
+
+### 15.4 那个整链反向问题的排查记录（已缩小到一步，根因待查）
+
+排查手段与结论：
+
+1. **ASan 不复现**：`build-asan`（`-fsanitize=address -O1 -g`）里整链反向不抛错，改成断言失败（预训练不稳定），
+   没有任何 use-after-free / stack-use-after-scope 报告 → 不是典型的访存越界。
+2. **不是编译参数差异**：单独编译 `test_rbm.cpp` 时用与 CMake 完全相同的参数
+   （`-O3 -DNDEBUG -fopenmp -DJASMINE_USE_BLAS -DJASMINE_USE_OPENMP`）能通过；`flags.make` 也确认
+   大二进制同样是这套宏。
+3. **不是两两组合**：`test_rbm.cpp` 分别与 `test_dropout.cpp` / `test_cls_token.cpp` / `test_adamw.cpp`
+   一起链接都通过，需要更大的 TU 组合才复现。
+4. **打点定位（在 Release 大二进制里逐层手工回放反向）**：
+   ```
+   [D] start      rbm0 W=(5,8) c=(5,1) | rbm1 W=(4,5) c=(4,1) | head W=(3,4)   ← 形状都对
+   [D] ce.backward -> (3,3)                                                     ← CE 正常
+   [L] head.forward  this=0x…e08 in=(4,3) -> m_input=(4,3)                       ← 前向缓存写了
+   [L] head.backward this=0x…e08 delta=(3,3) m_input=(0,0) m_weight=(3,4)        ← 同一对象，缓存空了
+   ```
+   即：**分类头 `weight_net_t` 的前向缓存 `m_input` 在 forward 时是 (4,3)，到 backward 时变成 (0,0)**
+   （`this` 相同 → 不是对象副本的问题），于是 `delta.dot(m_input.t())` 的维度检查失败。
+   问题不在 RBM，而在「前向缓存被清空」这一步。
+
+顺着这个结论做的两件事：
+
+- **加了明确的护栏**（永久保留）：`weight_net_t::backward` 现在先检查 `m_input` 是否有效、
+  delta 形状是否匹配，直接抛
+  `weight_net_t::backward: forward cache is empty (forward must be called before backward, ...)`，
+  而不是留下难懂的 `mat_dot_t: inner dimensions do not match`。
+- **待查方向**（供后续接手）：
+  (a) 怀疑与 `detail::store_for_backward` 的移动分支有关——链上前一层的返回值是临时量，
+  `dst = std::move(src)` 会把源清空；若某处**同时**引用/移动了同一个临时矩阵，
+  就可能出现"写进去又被清空"。RBM 的 `forward` 返回成员 `m_hidden` 的拷贝，值得再核对一遍
+  `complex_net_t::forward` 的折叠展开与各层返回值的生命周期；
+  (b) 在**完整二进制 + `-O2 -fsanitize=address`**（保留优化，让布局接近 Release）复跑，
+  ASan 的 `-fsanitize=address` 在 -O2 下仍能报 use-after-scope；
+  (c) 二分更大的 TU 组合（例如 `test_rbm.cpp` + 所有新增测试 + `test_net.cpp`），
+  找出触发条件最小的集合。
