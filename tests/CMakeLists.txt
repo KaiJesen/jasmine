@@ -16,6 +16,10 @@ add_executable(unit_tests
   test_gpt2_weights.cpp
   test_silu.cpp
   test_gated.cpp
+  test_conv.cpp
+  test_pool.cpp
+  test_reshape_view.cpp
+  test_model_serialization.cpp
   test_gqa.cpp
   test_rms_norm.cpp
   test_llama_weights.cpp

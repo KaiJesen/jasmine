@@ -101,8 +101,10 @@ public:
             m_k = m_rope->forward_at(m_k, k_pos);
         }
 
-        mat_t<val_type> attn_scores =
-            m_q.t().dot(m_k) / std::sqrt(static_cast<val_type>(m_q.row_num()));
+        // 先裸 dot（走 GEMM），再单独缩放：写成 `dot(...) / scale` 会让表达式逐元素求值、
+        // 把 O(T^2 d) 的打分矩阵乘退回朴素循环（同 TESTING.md 第 11 节的坑）。
+        mat_t<val_type> attn_scores = m_q.t().dot(m_k);
+        attn_scores = attn_scores / std::sqrt(static_cast<val_type>(m_q.row_num()));
         /*!ANCHOR 掩码规则说明
         * 由于scores=Q'K，也就是说scores中的i行j列元素表示的是Q序列中第i个值与K序列中第j个值之间的分数；
         * Q是表示的是当前的查询，K是可关注的历史。那么就需要就针对每个Q让他只能看到之前发生的K。也就是j > i的都设置为无效的
@@ -144,8 +146,8 @@ public:
         auto k_cached = cache.keys();
         auto v_cached = cache.values();
 
-        mat_t<val_type> attn_scores =
-            m_q.t().dot(k_cached) / std::sqrt(static_cast<val_type>(m_q.row_num()));
+        mat_t<val_type> attn_scores = m_q.t().dot(k_cached);
+        attn_scores = attn_scores / std::sqrt(static_cast<val_type>(m_q.row_num()));
         /*!ANCHOR forward_one 掩码
          * scores 行 = 本步 query（绝对位置 pos..pos+q_len-1），列 = cache 中全部 key（0..len-1）。
          * 多列 prefill 时仍需屏蔽「未来 key」：对 query 行 i，绝对位置 p=pos+i，屏蔽 j > p。
@@ -182,8 +184,8 @@ public:
         auto k_cached = cache.keys();
         auto v_cached = cache.values();
 
-        mat_t<val_type> attn_scores =
-            m_q.t().dot(k_cached) / std::sqrt(static_cast<val_type>(m_q.row_num()));
+        mat_t<val_type> attn_scores = m_q.t().dot(k_cached);
+        attn_scores = attn_scores / std::sqrt(static_cast<val_type>(m_q.row_num()));
         // cross-attn 通常 m_mask=false；若误开 mask，多列时按绝对位置屏蔽未来 key
         if (m_mask && attn_scores.row_num() > 1)
         {
@@ -219,8 +221,10 @@ public:
             }
         }
         const val_type scale = static_cast<val_type>(std::sqrt(m_q.row_num()));
-        mat_t<val_type> delta_q = m_k.dot(delta_qt_k.t()) / scale;
-        mat_t<val_type> delta_k = m_q.dot(delta_qt_k) / scale;
+        mat_t<val_type> delta_q = m_k.dot(delta_qt_k.t());
+        mat_t<val_type> delta_k = m_q.dot(delta_qt_k);
+        delta_q = delta_q / scale;
+        delta_k = delta_k / scale;
         if (m_rope)
         {
             delta_q = m_rope->backward(delta_q);

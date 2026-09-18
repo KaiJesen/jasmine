@@ -19,6 +19,10 @@ target_link_libraries(gpt2_chat PRIVATE jasmine_headers)
 add_executable(llama_chat llama_chat.cpp)
 target_link_libraries(llama_chat PRIVATE jasmine_headers)
 
+# MNIST 小玩具：卷积 + 编码器的训练 / 评估 / 序列化
+add_executable(mnist_conv mnist_conv.cpp)
+target_link_libraries(mnist_conv PRIVATE jasmine_headers)
+
 if(JASMINE_USE_CUDA)
   add_executable(cuda_fused_demo cuda_fused_demo.cu)
   target_link_libraries(cuda_fused_demo PRIVATE jasmine_headers jasmine_cuda_headers)

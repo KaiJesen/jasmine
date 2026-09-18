@@ -24,16 +24,16 @@ mat_t<float> s = q.t().dot(k);               // matrix product (CPU: BLAS / GPU:
 
 | Area | What's in it |
 | --- | --- |
-| Matrices & expressions | `mat_t` / `mat_view_t`; lazy expression trees, compile-time fusion, scalar operands, transposed views, zero-copy subviews |
+| Matrices & expressions | `mat_t` / `mat_view_t` / `mat_reshape_view_t`; lazy expression trees, compile-time fusion, scalar operands, transposed views, zero-copy subviews and shape views, zero-copy BLAS operands |
 | Operators | Arithmetic, comparisons, `exp` / `log` / `sqrt` / `sigmoid`, `dot`, row/column reductions, row-wise softmax, LayerNorm / RMSNorm |
-| Layers | Linear, LayerNorm / RMSNorm, SiLU / GELU / ReLU, SwiGLU gating, residual, Embedding, cross-entropy / MSE |
+| Layers | Linear, **Conv2d (im2col + GEMM, full backward)**, **MaxPool2d / AvgPool2d (full backward)**, LayerNorm / RMSNorm, SiLU / GELU / ReLU, SwiGLU gating, residual, Embedding, cross-entropy / MSE |
 | Models | decoder-only base; **GPT-2** (absolute positions + `gelu_new` + tied lm_head); **LLaMA family** (RoPE + RMSNorm + SwiGLU + GQA/MQA); enc-dec stack |
 | Training | Backprop checked against numerical gradients; SGD / Adam / NAdam; gradient accumulation (`cache_updator_t`) |
 | Inference | KV-cache prefill + per-token decoding; greedy / top-k / top-p sampling; streaming output |
-| Weights | Single-file `JASMINE_WEIGHTS_V1` format; direct export from HuggingFace (`tools/`); layer-by-layer / logits golden-value alignment |
+| Weights | Single-file `JASMINE_WEIGHTS_V1` format; **training-result serialization** (per-layer params + meta in one file, `save`/`load` round-trip); direct export from HuggingFace (`tools/`); layer-by-layer / logits golden-value alignment |
 | CUDA | Element-wise chains fused into a single kernel launch, cuBLAS GEMM, reductions, device-side KV cache / RoPE / MHA / a whole LLaMA, backwards and optimizers, **fused attention**, **bf16 / fp16 mixed precision** |
 
-**Status**: the host side passes `ctest` 178/178; the CUDA backend has 174 cases (compute-heavy cases
+**Status**: the host side passes `ctest` 222/222; the CUDA backend has 174 cases (compute-heavy cases
 are skipped by default). The CUDA backend is still being iterated on; target-machine vs test-machine
 differences are covered in [`CUDA.md`](CUDA.md), section 11.
 
@@ -196,8 +196,11 @@ jasmine/
 ├── jas_*.hpp              the library itself (header-only)
 │   ├── jas_mat_t.hpp          matrices and views
 │   ├── jas_mat_express_t.hpp  expression templates and operators
+│   ├── jas_mat_view_t.hpp    sub-views, transposes and zero-copy reshape views
 │   ├── jas_mat_gemm.hpp       GEMM (BLAS / blocked fallback)
 │   ├── jas_net_t.hpp          layer shell (weights + updater + cache)
+│   ├── jas_conv_t.hpp         2-D convolution (im2col + GEMM, forward/backward)
+│   ├── jas_pool_t.hpp         2-D max / average pooling (forward/backward)
 │   ├── jas_mha_t.hpp          multi-head attention (RoPE, causal mask, KV cache)
 │   ├── jas_RoPE_t.hpp         rotary positional embeddings and the shared registry
 │   ├── jas_kv_cache_t.hpp     KV cache
@@ -217,6 +220,36 @@ jasmine/
 
 `main.cpp` / `makefile` / `run.sh` are early standalone entry points kept only for compatibility;
 use the CMake targets instead.
+
+### 4.1 MNIST 小玩具（卷积 + 编码器 + 序列化）
+
+`examples/mnist_conv.cpp` 用本库的层拼出一个小 CNN（conv→ReLU→maxpool ×2 →flatten→Linear×2→CE），
+按样本前向/反向、用 `cache_updator_t` 做 mini-batch 梯度累加，训练完把权重与元信息写进一个
+`JASMINE_WEIGHTS_V1` 文件，再 `--load` 回来验证往返一致：
+
+```bash
+# 真实 MNIST（IDX 文件未压缩；放到 build/mnist/）
+mkdir -p build/mnist && cd build/mnist
+for f in train-images-idx3-ubyte train-labels-idx1-ubyte \
+         t10k-images-idx3-ubyte t10k-labels-idx1-ubyte; do
+  curl -sSLO "https://ossci-datasets.s3.amazonaws.com/mnist/$f.gz" && gunzip -f "$f.gz"
+done
+cd ../..
+
+./build/examples/mnist_conv --data-dir build/mnist --epochs 3 --train-limit 6000 \
+    --batch 16 --lr 2e-3 --save build/mnist/model.jas
+# -> [epoch 3] train_loss=0.0987 train_acc=0.9695 test_acc=0.9615
+# -> [check] OK: 保存/载入往返一致
+./build/examples/mnist_conv --data-dir build/mnist --load build/mnist/model.jas --epochs 0
+
+# 没有数据/没有网络时：内置合成数字图案，整条链路照样跑通
+./build/examples/mnist_conv --synthetic --epochs 2 --train-limit 500 --test-limit 200
+```
+
+实测（本机、参考 BLAS、单线程）：6000 张 × 3 epoch 约 84 秒收敛到 **96.2%** 测试精度；
+保存/载入后的预测与保存前完全一致。序列化的读写接口是 `jas_weight_io.hpp` 里已有的
+`weight_writer_t` / `weight_file_t`，本轮补上了按层命名的黏合层（`add_layer_params` /
+`read_layer_params`）与标量元信息（`add_scalar`）。
 
 ---
 

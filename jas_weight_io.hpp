@@ -233,12 +233,41 @@ public:
             throw std::runtime_error("weight_writer_t: write failed for " + path);
     }
 
+    /** 存一个标量（1x1 tensor），用于把训练元信息（epoch/损失/精度）一起写进同一个文件 */
+    template <typename val_type>
+    void add_scalar(std::string const& name, val_type value)
+    {
+        mat_t<val_type> m(1, 1, {static_cast<val_type>(value)});
+        add(name, m);
+    }
+
     std::size_t size() const { return m_records.size(); }
 
 private:
     std::vector<record_t> m_records;
     std::vector<float> m_data;
 };
+
+/**
+ * 按 `<prefix>.weight` / `<prefix>.bias` 的命名存取「权重 + 偏置」型层的参数。
+ *
+ * conv2d_net_t / weight_net_t / output_proj_net_t 都是这个形状约定，所以这几个模板
+ * 就是模型序列化的通用黏合层：训练完把每层按名字写进一个 JASMINE_WEIGHTS_V1 文件，
+ * 之后用同名读回来即可（格式与 GPT-2 / LLaMA 权重完全相同，Python 侧也能直接解析）。
+ */
+template <typename layer_type>
+void add_layer_params(weight_writer_t& w, std::string const& prefix, layer_type const& layer)
+{
+    w.add(prefix + ".weight", layer.weight());
+    w.add(prefix + ".bias", layer.bias());
+}
+
+template <typename layer_type>
+void read_layer_params(weight_file_t const& wf, std::string const& prefix, layer_type& layer)
+{
+    wf.read_into(prefix + ".weight", layer.weight());
+    wf.read_into(prefix + ".bias", layer.bias());
+}
 
 /**
  * 按 GPT-2 张量命名把权重写入模型。

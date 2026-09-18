@@ -49,7 +49,12 @@ public:
     mat_t<val_type> forward(Src&& input)
     {
         detail::store_for_backward(m_input, std::forward<Src>(input));
-        return m_weight.dot(m_input) + m_bias;
+        // 偏置必须分两步加：`W.dot(x) + b` 会让 mat_add_t::clone() 逐元素求值，
+        // 每个输出元素自己去扫一遍 K，整次矩阵乘退回朴素循环、**碰不到 BLAS**。
+        // 实测（M=64,N=1024,K=288）：表达式 ~100ms，拆两句 7.2ms。详见 TESTING.md 第 11 节。
+        mat_t<val_type> out = m_weight.dot(m_input);
+        out += m_bias;
+        return out;
     }
 
     /** 无状态层：单列输入与整段 forward 相同 */
