@@ -30,3 +30,8 @@ prof.data
 *.swp
 .DS_Store
 __pycache__/
+
+# Scratch notes / local release bundles (not part of the source tree)
+temp/
+dist/
+bench_bpe

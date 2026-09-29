@@ -85,8 +85,14 @@ Tokenizer **不在** embedding 内：文本 → **离散 id**；embedding 只做
   - 明确 `bos` / `eos` / `pad` / `unk`（及 chat 模板若有）
 - [ ] **编解码闭环**
   - `encode(text) → ids → model → next_id → decode` 往返可测
-- [—] **库内 BPE 实现**
-  - 可继续用 HuggingFace / SentencePiece 在库外；jasmine 只吃 `1×T` id
+- [x] **库内 BPE 实现**（`jas_bpe_t.hpp`，byte-level BPE，纯 C++ 无 Python 依赖）
+  - 直接读 HuggingFace 原生的 `vocab.json` + `merges.txt`；预分词用 `jas_unicode_class.hpp` 的
+    Unicode 分类表（`std::regex` 表达不了 `\p{L}`/`\p{N}`）
+  - 合并循环两套实现：短块走无分配的**重扫**，长块走**双向链表 + 惰性删除堆**（阈值 32，实测给出）
+    - 病态单块 8000 字符：**59.7 ms → 0.66 ms（90×）**，常规文本无回退
+  - 验收：`tests/test_bpe.cpp`（17 例，含两套实现 4000 次随机对拍）；与 HF 官方 tokenizer
+    差分 **4045 条零不一致**（含 CJK / emoji / 跨阈值长块）；`benches/bench_bpe.cpp` 给出块长分布与伸缩
+  - 使用方：`examples/gpt2_chat.cpp` 进程内 tokenizer；`tools/gpt2_tokenizer_server.py` 降级为测试基准
 
 **BPE 词表从哪来（概念）**：在大规模语料上做预分词 + 高频字节/字符对合并，得到固定大小词表；推理按同一规则切分查 id。开源模型（如 DeepSeek BBPE≈128K）随仓库发布词表文件，合并规则与预训练语料配方通常不完整公开。
 
@@ -198,7 +204,7 @@ Tokenizer **不在** embedding 内：文本 → **离散 id**；embedding 只做
 - [x] **cli 闭环**
   - `tools/gpt2_tokenize.py encode/decode` 负责文本 ↔ id，jasmine 只吃 `1×T` id
 - [x] **交互式对话 REPL**（`examples/gpt2_chat.cpp`）
-  - 模型只加载一次、KV cache 跨轮复用；常驻 tokenizer 子进程
+  - 模型只加载一次、KV cache 跨轮复用；tokenizer 由 `jas_bpe_t.hpp` **进程内**完成（纯 C++，无 Python）
   - `/reset /context /params /set` 运行中可调参；支持 raw / chat 两种模板
   - 不变量由 `Gpt2Structure.MultiTurnCacheMatchesFullForward` 守住
     （跨轮复用 cache 的 logits ≡ 整段一次 forward）
@@ -353,7 +359,7 @@ LLaMA 系的四块积木 —— **RMSNorm / RoPE / GQA / SwiGLU** —— 已拼�
 | `lm_head` 有 bias | logits 整体偏移 | 显式置 0，且与 `wte` 绑定 |
 | **`transformers>=5` 的 `hidden_states[-1]` 是 `ln_f` 之后的值** | 最后一层「黄金值」看似量级相近却对不上（`max_abs_diff` 达 483）；LayerNorm 会掩盖仿射差异，极易误判为己方有 bug | 导出脚本手动跑最后一个 block 取真正的 pre-`ln_f` 输出，并自检 `ln_f(last) == hidden_states[-1]` |
 | 逐 token `decode` 做流式输出 | 多字节字符被切成半个 token 时 HF 会替换成 U+FFFD，原始字节丢失，终端显示 `I��m`，且与全量 decode 不一致 | 每步重解**全量** token 列表，只输出相对上次的新增部分，并掐掉末尾 U+FFFD（详见 `gpt2_chat.cpp` 注释） |
-| 每轮起一个 Python 进程做 tokenize | `transformers` 冷启动约 2 秒，每轮两次调用 → 对话卡到不可用 | 常驻 tokenizer 子进程（`gpt2_tokenizer_server.py`），行协议 + base64 传输 |
+| 每轮起一个 Python 进程做 tokenize | `transformers` 冷启动约 2 秒，每轮两次调用 → 对话卡到不可用 | 先加常驻 tokenizer 子进程（行协议 + base64），最终改为**进程内纯 C++ BPE**（`jas_bpe_t.hpp`），Python 侧只留作测试基准 |
 | raw 续写模式不补分隔符 | 上一轮结尾与这一轮开头粘成 `stillWhat`，模型困惑，下一个 token 直接预测 `endoftext`（表现为「0 个新 token」） | 轮与轮之间补一个换行 |
 | 门控 FFN 的反向：两分支**共享**同一输入 | 若把两条分支的 `backward` 结果取平均/只留一条，梯度就错了 | `gated_net_t::backward` 返回两条路径梯度**之和**；`∂L/∂gate = delta⊙up`、`∂L/∂up = delta⊙gate`（逐元素乘的梯度就是乘对方） |
 | 门控 FFN 用矩阵乘合并 | 维度能凑上（方阵时）但数值全错、且 `silu(x)*x` 与矩阵积在语义上完全不同 | 合并算子必须是**逐元素乘**（`operator*` 即 Hadamard），单测 `Gated.ForwardIsElementwiseProductNotMatmul` 专门钉住这一点 |

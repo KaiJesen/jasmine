@@ -50,7 +50,7 @@ differences are covered in [`CUDA.md`](CUDA.md), section 11.
 | OpenMP | optional | Disable with `-DJASMINE_USE_OPENMP=OFF` |
 | BLAS (OpenBLAS / BLAS) | optional | Large matmuls go through `cblas_*gemm`; falls back to a blocked GEMM when absent |
 | CUDA Toolkit 12.4 | optional | Only to build the CUDA backend (`-DJASMINE_USE_CUDA=ON`) |
-| Python 3 + `transformers` / `torch` | optional | Only for exporting weights and running the tokenizer services; **the C++ side does not depend on Python** |
+| Python 3 + `transformers` / `torch` | optional | Only for exporting weights and running the LLaMA tokenizer service; `gpt2_chat` tokenizes in-process, and **the C++ side does not depend on Python** |
 
 googletest and Google Benchmark are fetched automatically by CMake `FetchContent`
 (the first configure step needs network access).
@@ -114,12 +114,16 @@ python3 tools/export_llama.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
                               --out build/tinyllama_weights.bin
 ```
 
-Then just start chatting (the tokenizer is provided by a long-lived Python subprocess):
+Then just start chatting (`gpt2_chat` tokenizes in-process, `llama_chat` still uses a long-lived
+Python subprocess because LLaMA's chat template must be rendered by SentencePiece):
 
 ```bash
-./build/examples/gpt2_chat  build/gpt2_weights.bin
+# gpt2_chat needs the tokenizer files: a directory with vocab.json + merges.txt
+./build/examples/gpt2_chat  build/gpt2_weights.bin --tokenizer-dir <snapshot-dir>
 ./build/examples/llama_chat build/tinyllama_weights.bin
 ```
+
+`gpt2_chat` also accepts the tokenizer directory through `JASMINE_GPT2_TOKENIZER_DIR`.
 
 The main options for `llama_chat`:
 
@@ -209,6 +213,7 @@ jasmine/
 │   ├── jas_gpt2_t.hpp         GPT-2 forward
 │   ├── jas_llama_t.hpp        LLaMA-family forward
 │   ├── jas_weight_io.hpp      weight file I/O
+│   ├── jas_bpe_t.hpp          byte-level BPE tokenizer (GPT-2 family)
 │   └── jas_cuda_*.hpp         the CUDA backend (only built when CUDA is enabled)
 ├── examples/              runnable examples and the interactive demos
 ├── tests/                 unit tests (host unit_tests / device cuda_tests)

@@ -192,11 +192,12 @@ REPL 内命令：
 | `--template raw\|chat` | raw | `raw`=直接续写；`chat`=包一层 User/Assistant 并遇换行停止 |
 | `--max-context N` | 模型 `n_pos` | 上下文上限；超出后丢最早内容并**重建 cache**（绝对位置编码，位置会整体前移） |
 | `--no-stream` | 关 | 关掉逐 token 流式输出 |
-| `--model NAME` | 从 manifest 读 | tokenizer 用哪个 HF 模型 |
+| `--tokenizer-dir DIR` | 环境变量 `JASMINE_GPT2_TOKENIZER_DIR` | tokenizer 目录（含 `vocab.json` + `merges.txt`） |
 
-实现要点：tokenizer 由常驻子进程 `tools/gpt2_tokenizer_server.py` 提供（`transformers`
-冷启动约 2 秒，每轮起进程会慢到不可用）；文本走 base64 传输以避开所有转义问题。
-流式输出不能逐 token `decode`（多字节字符会被切成半个、HF 会替换成 U+FFFD），
+实现要点：tokenizer 由 `jas_bpe_t.hpp` 在**进程内**完成，不再依赖 Python 子进程——
+`llama_chat` 仍用 `tools/llama_tokenizer_server.py`，因为 LLaMA 的 chat 模板必须交给
+SentencePiece 整段渲染。加载时会校验词表大小与权重一致，不一致直接报错（否则只会表现为
+乱码）。流式输出不能逐 token `decode`（多字节字符会被切成半个、HF 会替换成 U+FFFD），
 而是每步重解全量并按新增部分输出，详见 `examples/gpt2_chat.cpp` 顶部注释。
 
 实测响应速度：权重加载约 2.5 秒（一次性），之后每轮"用户输入 + 生成 40 token"约 1 秒。
@@ -211,7 +212,8 @@ REPL 内命令：
 | `tools/export_gpt2.py` | HF → jasmine 权重导出（含黄金值） |
 | `tools/verify_gpt2.py` | 与 HF 的端到端对撞（生成逐 token + logits 数值） |
 | `tools/jasmine_weights.py` | 权重文件格式的 Python 读写（导出与校验共用） |
-| `tools/gpt2_tokenizer_server.py` | 常驻 tokenizer 服务（供 `gpt2_chat` 调用） |
+| `jas_bpe_t.hpp` | byte-level BPE tokenizer（`gpt2_chat` 进程内使用） |
+| `tools/gpt2_tokenizer_server.py` | 常驻 tokenizer 服务——现仅作**测试基准**，供与 `jas_bpe_t.hpp` 差分对拍 |
 | `tools/gpt2_tokenize.py` | 文本 ↔ id（命令行） |
 | `tests/test_gpt2_weights.cpp` | GELU / 加载器读写 / 结构 / 黄金对齐单测 |
 | `examples/gpt2_generate.{hpp,cpp}` | KV-cache 生成 demo（`--dump-logits` 供 verify 脚本比对） |

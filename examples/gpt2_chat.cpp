@@ -2,7 +2,7 @@
  * GPT-2 交互式对话 demo（终端 REPL）。
  *
  * 模型权重只加载一次，KV cache 跨轮复用，因此每轮响应只需算新 token；
- * tokenizer 由常驻的 Python 子进程提供（见 tools/gpt2_tokenizer_server.py）。
+ * tokenizer 由 jas_bpe_t.hpp 在**进程内**完成，不依赖 Python 子进程。
  *
  * ⚠️ GPT-2 是 **base 语言模型，不是指令微调模型**：它不会「回答问题」，而是
  * **续写**你给的文字。--template chat 只是用 "User:/Assistant:" 这种文本格式
@@ -10,12 +10,15 @@
  * 指令微调模型；这个 demo 的价值在于验证 jasmine 的推理链路端到端可用。
  *
  * 用法：
- *   ./gpt2_chat build/distilgpt2_weights.bin [选项]
+ *   ./gpt2_chat build/distilgpt2_weights.bin --tokenizer-dir <DIR> [选项]
+ *
+ * tokenizer 目录 DIR 必须含 `vocab.json` 和 `merges.txt`，例如 HuggingFace 快照：
+ *   <hf_cache>/models--distilgpt2/snapshots/<rev>/
+ * 也可以用环境变量 JASMINE_GPT2_TOKENIZER_DIR 指定（与测试、benchmark 同一个变量）。
+ * 词表必须与权重同源，否则 id 对不上，输出会是乱码。
  *
  * 选项：
- *   --model NAME         tokenizer 用的 HF 模型名（默认从权重 manifest 读）
- *   --tokenizer-script P tokenizer 服务脚本路径（默认 tools/gpt2_tokenizer_server.py）
- *   --python CMD         python 解释器（默认 python3）
+ *   --tokenizer-dir DIR   tokenizer 目录（含 vocab.json + merges.txt）
  *   --max-new N          每轮最多生成 N 个 token（默认 40）
  *   --temperature T      采样温度（默认 0.9；--greedy 时忽略）
  *   --top-k K            top-k 截断（默认 40）
@@ -44,6 +47,7 @@
 #include <string>
 #include <vector>
 
+#include "jas_bpe_t.hpp"
 #include "jas_gpt2_t.hpp"
 #include "jas_updator_t.hpp"
 #include "jas_weight_io.hpp"
@@ -87,9 +91,7 @@ int main(int argc, char** argv)
     }
 
     const std::string weights_path = argv[1];
-    std::string model_id;
-    std::string tokenizer_script = "tools/gpt2_tokenizer_server.py";
-    std::string python_cmd = "python3";
+    std::string tokenizer_dir;
     chat_params_t params;
     int max_context = 0;            // 0 = 用模型 n_pos
     std::vector<int> stop_tokens;
@@ -104,9 +106,7 @@ int main(int argc, char** argv)
             return argv[++i];
         };
         if (a == "--help")               { std::printf("see the header of examples/gpt2_chat.cpp\n"); return 0; }
-        else if (a == "--model")         model_id = next_arg();
-        else if (a == "--tokenizer-script") tokenizer_script = next_arg();
-        else if (a == "--python")        python_cmd = next_arg();
+        else if (a == "--tokenizer-dir") tokenizer_dir = next_arg();
         else if (a == "--max-new")       params.max_new = std::stoi(next_arg());
         else if (a == "--temperature")   params.temperature = std::stod(next_arg());
         else if (a == "--top-k")         params.top_k = std::stoi(next_arg());
@@ -133,10 +133,21 @@ int main(int argc, char** argv)
         wf.load(weights_path);
         const auto cfg = read_gpt2_config(wf);
 
-        if (model_id.empty())
+        if (tokenizer_dir.empty())
         {
-            model_id = read_model_from_manifest(weights_path);
-            if (model_id.empty()) model_id = "distilgpt2";
+            if (const char* env = std::getenv("JASMINE_GPT2_TOKENIZER_DIR");
+                env != nullptr && *env != '\0')
+                tokenizer_dir = env;
+        }
+        if (tokenizer_dir.empty())
+        {
+            std::fprintf(stderr,
+                         "%s[gpt2_chat] error:%s no tokenizer directory\n"
+                         "  pass --tokenizer-dir DIR, or set JASMINE_GPT2_TOKENIZER_DIR\n"
+                         "  DIR must contain vocab.json and merges.txt (e.g. a distilgpt2\n"
+                         "  snapshot directory), and must match the exported weights.\n",
+                         pal.red(), pal.reset());
+            return 2;
         }
 
         std::printf("%s[gpt2_chat]%s weights  %s (%d layers, d_model=%d, vocab=%d)\n",
@@ -148,10 +159,19 @@ int main(int argc, char** argv)
         load_gpt2(model, wf);
         model.reserve_kv_cache(cfg.n_pos);
 
-        // ---- tokenizer（常驻子进程）----
-        std::printf("%s[gpt2_chat]%s tokenizer %s\n",
-                    pal.dim(), pal.reset(), model_id.c_str());
-        tokenizer_client_t tokenizer(python_cmd, tokenizer_script, model_id);
+        // ---- tokenizer（进程内，纯 C++）----
+        // Loading here also cross-checks the vocabulary size against the weights:
+        // a mismatch means the two came from different models, which would
+        // otherwise show up only as garbled output much later.
+        bpe_t tokenizer;
+        tokenizer.load(tokenizer_dir, {"<|endoftext|>"});
+        if (tokenizer.vocab_size() != cfg.vocab)
+            throw std::runtime_error(
+                "vocab mismatch: tokenizer has " + std::to_string(tokenizer.vocab_size()) +
+                " tokens but the weights expect " + std::to_string(cfg.vocab) +
+                "; the tokenizer directory does not match the weights");
+        std::printf("%s[gpt2_chat]%s tokenizer %s (vocab=%d)\n",
+                    pal.dim(), pal.reset(), tokenizer_dir.c_str(), tokenizer.vocab_size());
 
         if (max_context <= 0) max_context = cfg.n_pos;
         max_context = std::min(max_context, cfg.n_pos);
@@ -174,7 +194,11 @@ int main(int argc, char** argv)
         // ---- 对话状态 ----
         std::vector<int> ctx_ids;       // 全部已喂给模型的 token（跨轮）
         chat_model_t* m = &model;
-        const int eos_id = 50256;
+        // Stop id comes from the vocabulary rather than a hard-coded 50256, so a
+        // tokenizer without <|endoftext|> fails loudly instead of never stopping.
+        const int eos_id = tokenizer.special_id("<|endoftext|>");
+        if (eos_id < 0)
+            throw std::runtime_error("tokenizer has no <|endoftext|> token");
         std::mt19937 rng(params.seed);
 
         auto reset = [&]() {

@@ -29,6 +29,7 @@ add_executable(unit_tests
   test_gqa.cpp
   test_rms_norm.cpp
   test_llama_weights.cpp
+  test_bpe.cpp
 )
 
 target_link_libraries(unit_tests
