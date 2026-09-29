@@ -224,18 +224,34 @@ int main(int argc, char** argv)
             std::vector<int> kept(ctx_ids.end() - n_keep, ctx_ids.end());
             ctx_ids.clear();
             m->clear_kv_cache();
-            for (std::size_t i = 0; i < kept.size(); ++i)
+            if (!kept.empty())
             {
-                mat_t<double> id(1, 1, {static_cast<double>(kept[i])});
-                m->forward_one(id, static_cast<int>(i));
-                ctx_ids.push_back(kept[i]);
+                // 整段一次喂入：位置从 0 连续，模型的 forward_one 支持多列
+                mat_t<double> seq(1, static_cast<int>(kept.size()));
+                for (std::size_t i = 0; i < kept.size(); ++i)
+                    seq(0, static_cast<int>(i)) = static_cast<double>(kept[i]);
+                m->forward_one(seq, 0);
+                ctx_ids = kept;
             }
             return true;
         };
 
-        auto feed = [&](int id) {
+        // 一次追加一段（整段只启动一次 GEMM），返回最后一个位置的 logits。
+        // 与逐 token 循环等价，调用方拿到的仍是「喂完这段之后」的预测。
+        auto feed_chunk = [&](const std::vector<int>& ids) {
+            mat_t<double> seq(1, static_cast<int>(ids.size()));
+            for (std::size_t i = 0; i < ids.size(); ++i)
+                seq(0, static_cast<int>(i)) = static_cast<double>(ids[i]);
+            mat_t<double> logits =
+                m->forward_one(seq, static_cast<int>(ctx_ids.size()));
+            ctx_ids.insert(ctx_ids.end(), ids.begin(), ids.end());
+            return logits.view(0, logits.col_num() - 1, logits.row_num(), 1).clone();
+        };
+
+        // 单 token 追加：解码每一步走这里，避免每步构造一个 vector
+        auto feed_one = [&](int id) {
             mat_t<double> one(1, 1, {static_cast<double>(id)});
-            auto logits = m->forward_one(one, static_cast<int>(ctx_ids.size()));
+            mat_t<double> logits = m->forward_one(one, static_cast<int>(ctx_ids.size()));
             ctx_ids.push_back(id);
             return logits;
         };
@@ -345,10 +361,8 @@ int main(int argc, char** argv)
 
             std::fflush(stdout);
 
-            // 前向喂入本轮用户输入，拿到第一个预测
-            mat_t<double> logits;
-            for (int id : user_ids)
-                logits = feed(id);
+            // 前向喂入本轮用户输入，拿到第一个预测（整段一次，不是逐 token）
+            mat_t<double> logits = feed_chunk(user_ids);
 
             std::printf("%sgpt2>%s ", pal.cyan(), pal.reset());
             std::fflush(stdout);
@@ -368,7 +382,7 @@ int main(int argc, char** argv)
                 reply.push_back(next);
                 if (stream)
                     printed = emit_increment(tokenizer.decode(reply), printed);
-                logits = feed(next);
+                logits = feed_one(next);
             }
 
             if (!stream)

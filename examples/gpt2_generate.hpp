@@ -103,15 +103,14 @@ std::vector<int> gpt2_generate(model_type& model,
                                  std::to_string(n_pos) + ")");
 
     std::mt19937 rng(opt.seed);
-    model.clear_kv_cache();
 
-    // prefill：逐 token 前向并填充 KV cache
-    mat_t<val_type> logits;
-    for (int t = 0; t < static_cast<int>(prompt.size()); ++t)
-    {
-        mat_t<val_type> id(1, 1, {static_cast<val_type>(prompt[t])});
-        logits = model.forward_one(id, t);
-    }
+    // prefill：整段一次前向并填充 KV cache。模型内部走多列路径，算术与逐 token 相同，
+    // 但只启动一次 GEMM 而不是 prompt 长度那么多次。
+    const int prompt_len = static_cast<int>(prompt.size());
+    mat_t<val_type> prompt_ids(1, prompt_len);
+    for (int t = 0; t < prompt_len; ++t)
+        prompt_ids(0, t) = static_cast<val_type>(prompt[t]);
+    mat_t<val_type> logits = model.prefill(prompt_ids);
 
     std::vector<int> out = prompt;
     const int limit = std::min(opt.max_new_tokens, n_pos - static_cast<int>(prompt.size()));

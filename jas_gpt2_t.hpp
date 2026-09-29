@@ -2,6 +2,7 @@
 #define __JAS_GPT2_T_HPP__
 
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -175,14 +176,17 @@ public:
     }
 
     /**
-     * 增量推理：ids 1×1（单个新 token），pos 为其绝对位置（用于索引 wpe）。
-     * 各层 self-attn 走 KV cache；调用前需 clear_kv_cache()，预填阶段先用 forward_one 喂 prompt。
+     * 增量推理：ids 1×T，pos 为第一列的绝对位置（用于索引 wpe，位置取 pos..pos+T-1）。
+     * T=1 是常规逐 token 解码；T>1 表示一次追加一段（例如用户输入的一轮）。
+     * 各层 self-attn 走 KV cache；调用前需 clear_kv_cache()，或续接已有 cache。
      */
     mat_t<val_type> forward_one(const mat_t<val_type>& ids, int pos)
     {
+        const int T = ids.col_num();
         mat_t<val_type> h = m_wte.forward(ids);
-        mat_t<val_type> pos_ids(1, 1);
-        pos_ids(0, 0) = static_cast<val_type>(pos);
+        mat_t<val_type> pos_ids(1, T);
+        for (int t = 0; t < T; ++t)
+            pos_ids(0, t) = static_cast<val_type>(pos + t);
         h = (h + m_wpe.forward(pos_ids)).clone();
 
         for (auto& block : m_blocks)
@@ -192,15 +196,25 @@ public:
         return m_lm_head.forward_one(h);
     }
 
-    /** prompt 预填：整段前向并填充 KV cache（等价于对 0..T-1 逐步 forward_one） */
+    /**
+     * prompt 预填：整段**一次**前向，并把各层的 K/V 写进 cache。返回最后一个位置的
+     * logits（vocab×1），与逐步 forward_one 的末步结果逐元素一致。
+     *
+     * 为什么不能「先 forward() 再补 cache」：K/V 只有在注意力内部投影后才拿得到，
+     * 而 forward() 不回填。所以这里走 forward_one 的批量路径——mat_mha_t::forward_one
+     * 接受多列输入，并按绝对位置做 causal mask。算术与逐步喂入完全相同，
+     * 区别只是把 T 次 GEMM 启动合并成 1 次（实测 prefill 快约 7.5×；见
+     * doc/bench/gpt2_infer_vs_torch.md）。
+     */
     mat_t<val_type> prefill(const mat_t<val_type>& ids)
     {
         clear_kv_cache();
         const int T = ids.col_num();
-        mat_t<val_type> logits;
-        for (int t = 0; t < T; ++t)
-            logits = forward_one(ids.view(0, t, 1, 1).clone(), t);
-        return logits;
+        if (T <= 0)
+            throw std::runtime_error("prefill: empty id sequence");
+        mat_t<val_type> logits = forward_one(ids, 0);
+        // 保持既有契约：只返回最后一个位置（vocab×1）
+        return logits.view(0, T - 1, logits.row_num(), 1).clone();
     }
 
     void clear_kv_cache()

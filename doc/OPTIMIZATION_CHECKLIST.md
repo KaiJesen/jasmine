@@ -68,6 +68,18 @@
 - [x] **Teacher forcing 路径不强制走 cache API**
   - 整段一次前向保持简单；cache 仅 inference / AR 使用（`forward` 训练 vs `infer` 推理，结构同一 `net_type`）
 
+- [x] **prompt 预填走批量路径（不是逐 token 循环）**
+  - `gpt2_model_t::prefill` 现在是整段一次前向：`mat_mha_t::forward_one` 本就接受多列并按
+    绝对位置做 causal mask，逐 token 循环白付了 T 次 GEMM 启动
+  - `gpt2_model_t::forward_one` 同时支持多列（T>1），供交互式路径把一整轮用户输入
+    一次追加进已有 cache（跨轮复用不能 clear）
+  - 验收：`Gpt2Structure.PrefillCacheMatchesStepByStepFeeding`（prefill 后的 cache 继续解码 ≡ 整段
+    forward）、`Gpt2Structure.MultiColumnForwardOneMatchesPerTokenLoop`；
+    真实权重下 `Gpt2AlignmentTest` 三例仍全绿，`tools/verify_gpt2.py` 逐 token 一致
+  - 实测（distilgpt2 / fp32 / 128 token prefill / 4 线程）：2085.40 ms → 282.08 ms（**7.39×**），
+    且 prefill 与整段 `forward` 同价（282.08 vs 272.66）——见 `doc/bench/gpt2_infer_vs_torch.md`
+
+- [x] **评估 OpenMP 落点（有收益再开）**
 - [x] **评估 OpenMP 落点（有收益再开）**
   - `jas_mat_gemm.hpp`：大 GEMM（`MNK≥64³`）对单线程 BLAS 按行分片并行；blocked fallback 外层并行
   - `jas_mha_t.hpp`：大 shape 下 QKV 三投影 `sections` 并行；多 head attend `parallel for`（阈值：`heads·seq·d_head≥4·32·32`）

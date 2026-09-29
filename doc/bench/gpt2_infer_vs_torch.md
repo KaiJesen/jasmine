@@ -38,18 +38,18 @@ python tools/compare_gpt2_torch.py \
 
 | metric | jasmine (netlib) | jasmine (OpenBLAS) | PyTorch (MKL) |
 |---|---|---|---|
-| full forward, 128 tokens | 986.04 ms | 278.02 ms | **44.38 ms** |
-| prefill through cache, 128 tokens | 4413.65 ms | 2085.40 ms | **44.37 ms** |
-| decode, ms per token | 34.66 ms | 16.00 ms | **7.36 ms** |
-| prefill + 32 decode steps | 5522.87 ms | 2597.54 ms | **279.83 ms** |
+| full forward, 128 tokens | 990.93 ms | 272.66 ms | **44.51 ms** |
+| prefill through cache, 128 tokens | 988.35 ms | 282.08 ms | **44.46 ms** |
+| decode, ms per token | 34.77 ms | 16.83 ms | **7.34 ms** |
+| prefill + 32 decode steps | 2101.08 ms | 820.64 ms | **279.21 ms** |
 
 Slowdown vs PyTorch:
 
 | metric | jasmine (netlib) | jasmine (OpenBLAS) |
 |---|---|---|
-| full forward | 22.2x | 6.27x |
-| prefill through cache | 99.5x | 47.0x |
-| decode per token | 4.71x | 2.18x |
+| full forward | 22.3x | 6.13x |
+| prefill through cache | 22.2x | 6.34x |
+| decode per token | 4.74x | 2.29x |
 
 ## Thread scaling
 
@@ -57,20 +57,20 @@ jasmine (OpenBLAS) vs PyTorch, ms:
 
 | metric | threads | jasmine | PyTorch | ratio |
 |---|---|---|---|---|
-| full forward | 1 | 646.94 | 162.92 | 3.97x |
-| full forward | 4 | 278.02 | 44.38 | 6.27x |
-| full forward | 8 | 257.24 | 62.88 | 4.09x |
-| decode per token | 1 | 43.76 | 11.30 | 3.87x |
-| decode per token | 4 | 16.00 | 7.36 | 2.18x |
-| decode per token | 8 | 13.22 | 8.00 | 1.65x |
-| prefill through cache | 1 | 5664.16 | 162.62 | 34.83x |
-| prefill through cache | 4 | 2085.40 | 44.37 | 47.00x |
-| prefill through cache | 8 | 1663.59 | 62.26 | 26.72x |
+| full forward | 1 | 642.77 | 163.10 | 3.94x |
+| full forward | 4 | 272.66 | 44.51 | 6.13x |
+| full forward | 8 | 259.04 | 61.93 | 4.18x |
+| prefill through cache | 1 | 646.25 | 162.82 | 3.97x |
+| prefill through cache | 4 | 282.08 | 44.46 | 6.34x |
+| prefill through cache | 8 | 257.01 | 62.20 | 4.13x |
+| decode per token | 1 | 44.85 | 11.15 | 4.02x |
+| decode per token | 4 | 16.83 | 7.34 | 2.29x |
+| decode per token | 8 | 12.75 | 8.25 | 1.55x |
 
-jasmine's forward scales 2.33x from 1 to 4 threads and then flattens (1.08x from 4 to 8). PyTorch
-peaks at 4 threads and **regresses at 8** (44.38 ms to 62.88 ms). Both point at the same thing:
+jasmine's forward scales 2.36x from 1 to 4 threads and then flattens (1.05x from 4 to 8). PyTorch
+peaks at 4 threads and **regresses at 8** (44.51 ms to 61.93 ms). Both point at the same thing:
 past 4 threads this machine is contended, so the 1- and 4-thread rows are the trustworthy ones.
-Fixing the thread count also keeps the comparison meaningful; jasmine splits GEMMs across OpenMP
+Pinning the thread count also keeps the comparison meaningful; jasmine splits GEMMs across OpenMP
 row panels in `jas_mat_gemm.hpp` while PyTorch parallelizes inside BLAS, so an unpinned run would
 be measuring thread policy rather than code.
 
@@ -88,34 +88,57 @@ the last position's logits:
 That is fp32 accumulation noise, so both sides ran the same weights and the timings describe the
 same computation. `tools/compare_gpt2_torch.py` fails the run if this check does not hold.
 
+Note the jasmine checksum is **identical before and after** the batched-prefill change described
+below (-2518023.4670), which is the evidence that batching changed only how many GEMM launches
+happen, not the arithmetic.
+
+## The batched prefill fix
+
+The first version of this comparison showed prefill at 47x PyTorch, but that was not a like-for-like
+number: `gpt2_model_t::prefill` looped `forward_one` once per prompt token, while PyTorch's
+`use_cache=True` prefill is a single batched forward. jasmine's own `forward()` on the same 128
+tokens took 278.02 ms against its 2085.40 ms prefill, so 7.5x was self-inflicted.
+
+`mat_mha_t::forward_one` already accepted multi-column input and applied the causal mask by absolute
+position, so the fix was to stop stepping one token at a time and run the whole prompt through it in
+one pass (`jas_gpt2_t.hpp::prefill`). `forward_one` at the model level was also generalized to T
+columns, which is what lets the interactive path append a whole user turn to an existing cache
+without clearing it.
+
+| metric (4 threads, OpenBLAS) | before | after | change |
+|---|---|---|---|
+| prefill through cache, 128 tokens | 2085.40 ms | 282.08 ms | **7.39x faster** |
+| prefill + 32 decode steps | 2597.54 ms | 820.64 ms | 3.17x faster |
+| slowdown vs PyTorch, prefill | 47.00x | 6.34x | — |
+| full forward | 278.02 ms | 272.66 ms | unchanged (noise) |
+| decode per token | 16.00 ms | 16.83 ms | unchanged (noise) |
+
+prefill now costs about the same as `forward` on both sides (282.08 vs 272.66 for jasmine, 44.46 vs
+44.51 for PyTorch), which is what it should be: prefill is a full forward plus writing K/V into the
+cache.
+
 ## What the numbers say
 
 **1. The BLAS choice dominates the as-shipped gap.** jasmine links whatever `CBLAS` CMake finds, and
 on a stock Debian/Ubuntu that is the reference netlib BLAS. Swapping in OpenBLAS alone: full forward
-986.04 → 278.02 ms (3.5x), decode 34.66 → 16.00 ms (2.2x). Most of the "22x slower than PyTorch"
+990.93 → 272.66 ms (3.6x), decode 34.77 → 16.83 ms (2.1x). Most of the "22x slower than PyTorch"
 headline is a packaging accident, not a transformer implementation problem. Either ship an
 optimized BLAS or document the dependency; a benchmark against MKL with netlib underneath is not
 an implementation comparison.
 
-**2. With a comparable BLAS, the remaining gaps are 6.3x (batched forward) and 2.2x (single-token
-decode).** The decode figure is the most apples-to-apples number here, and 2.2x is a much better
-place to be than the raw comparison suggests.
+**2. With a comparable BLAS the remaining gaps are 6.1x (batched forward) and 2.3x (single-token
+decode).** The decode figure is the most apples-to-apples number here, and 2.3x is a much better
+place to be than the raw comparison suggests. Both multipliers describe real headroom in
+`jas_mat_gemm.hpp` / `jas_mha_t.hpp`, not measurement artifacts.
 
-**3. Prefill is not the same computation, and this is the biggest available win.** jasmine's
-`prefill()` loops `forward_one` once per prompt token, while PyTorch's `use_cache=True` prefill is a
-single batched forward. jasmine's own `forward()` on the same 128 tokens takes 278.02 ms against
-its 2085.40 ms prefill: **7.5x is self-inflicted by stepping the prompt token by token**. This is a
-missing code path, not a tuning problem — filling the KV cache from one batched forward would
-remove it. PyTorch confirms the two should cost the same: 44.37 ms prefill vs 44.38 ms full forward.
-
-**4. Decode is memory-bandwidth bound, and jasmine reaches about half the bandwidth.** One token
-must read all 82M parameters (328 MB in fp32). jasmine's 16.00 ms implies ~20 GB/s, PyTorch's
-7.36 ms ~44 GB/s. For a single token the GEMMs are effectively matrix-vector products, and jasmine
+**3. Decode is memory-bandwidth bound, and jasmine reaches about half the bandwidth.** One token
+must read all 82M parameters (328 MB in fp32). jasmine's 16.83 ms implies ~19 GB/s, PyTorch's
+7.34 ms ~45 GB/s. For a single token the GEMMs are effectively matrix-vector products, and jasmine
 routes them through `cblas_sgemm` while splitting the output rows across OpenMP threads; both the
 GEMM packing and the row-panel split are poor fits for a skin-deep matrix. A `gemv` path for the
-decode case is the obvious thing to try next.
+decode case is the obvious next thing to try.
 
-**5. Thread scaling saturates early and PyTorch also regresses at 8 threads**, so neither
+**4. Thread scaling saturates early and PyTorch also regresses at 8 threads**, so neither
 implementation is a scaling win to celebrate on this machine. Any follow-up should fix threads at 4.
 
 ## Raw logs

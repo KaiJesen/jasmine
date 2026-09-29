@@ -359,6 +359,76 @@ TEST(Gpt2Structure, PrefillMatchesForward)
         EXPECT_NEAR(last(i, 0), ref(i, 3), 1e-9) << "row=" << i;
 }
 
+TEST(Gpt2Structure, PrefillCacheMatchesStepByStepFeeding)
+{
+    // prefill 现在是整段一次前向（走 mat_mha_t 的多列路径），而不是逐 token 循环。
+    // 这里检查两件事，缺一不可：
+    //   1. cache 建对了 —— prefill 之后继续逐步解码，必须与「整段 forward」逐位一致；
+    //   2. 多列路径的 causal mask 没错 —— 若 mask 漏了，第 t 列会看到 t 之后的 key，
+    //      而最后一列的 logits 仍然正确，所以只比 prefill 的返回值查不出这个 bug。
+    //      逐个位置对比能查出来。
+    constexpr int kT = 6;
+    auto model = make_small_gpt2(2, 2, 8, 32, 11, 16);
+    mat_t<double> ids(1, kT, {1.0, 4.0, 2.0, 7.0, 3.0, 5.0});
+    const auto ref = model.forward(ids);
+
+    // 批量 prefill 一次，然后逐步解码；每一步都要对上 forward 的对应列
+    model.reserve_kv_cache(16);
+    model.prefill(ids);
+    EXPECT_EQ(model.kv_cache_length(), kT) << "prefill must leave T entries in the cache";
+
+    // 先检查 prefill 返回值本身（最后一列）
+    {
+        const auto last = model.prefill(ids);
+        ExpectShape(last, 11, 1);
+        for (int r = 0; r < last.row_num(); ++r)
+            EXPECT_NEAR(last(r, 0), ref(r, kT - 1), 1e-9) << "row=" << r;
+    }
+
+    // 再检查 cache 内容：从 T 开始继续解码，每步对 forward 的对应列
+    model.clear_kv_cache();
+    model.prefill(ids);
+    for (int t = kT; t < kT + 3; ++t)
+    {
+        mat_t<double> next(1, 1, {static_cast<double>((t * 3) % 11)});
+        const auto step = model.forward_one(next, t);
+        // 参考值：把新 token 拼到序列上重算整段
+        mat_t<double> extended(1, t + 1);
+        for (int i = 0; i < kT; ++i)
+            extended(0, i) = ids(0, i);
+        for (int i = kT; i <= t; ++i)
+            extended(0, i) = static_cast<double>((i * 3) % 11);
+        const auto full = model.forward(extended);
+        for (int r = 0; r < step.row_num(); ++r)
+            EXPECT_NEAR(step(r, 0), full(r, t), 1e-9)
+                << "decode step t=" << t << " row=" << r;
+    }
+}
+
+TEST(Gpt2Structure, MultiColumnForwardOneMatchesPerTokenLoop)
+{
+    // forward_one 现在接受多列。一次喂 T 列与分 T 次喂，位置编码和 cache 都必须一致。
+    constexpr int kT = 5;
+    auto model = make_small_gpt2(2, 2, 8, 32, 11, 16);
+    mat_t<double> ids(1, kT, {3.0, 1.0, 4.0, 1.0, 5.0});
+
+    // 逐 token
+    model.clear_kv_cache();
+    mat_t<double> step_logits;
+    for (int t = 0; t < kT; ++t)
+        step_logits = model.forward_one(ids.view(0, t, 1, 1).clone(), t);
+    const int step_len = model.kv_cache_length();
+
+    // 一次多列
+    model.clear_kv_cache();
+    const auto chunk_logits = model.forward_one(ids, 0);
+
+    EXPECT_EQ(model.kv_cache_length(), step_len);
+    ExpectShape(chunk_logits, 11, kT);
+    for (int r = 0; r < chunk_logits.row_num(); ++r)
+        EXPECT_NEAR(chunk_logits(r, kT - 1), step_logits(r, 0), 1e-9) << "row=" << r;
+}
+
 TEST(Gpt2Structure, MultiTurnCacheMatchesFullForward)
 {
     // 交互式对话的关键不变量：跨轮复用 KV cache（中途不 clear）得到的 logits，
