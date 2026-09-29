@@ -21,3 +21,14 @@ target_link_libraries(bench_bpe
     jasmine_headers
     benchmark::benchmark
 )
+
+# Also separate: needs exported GPT-2 weights, so it cannot run on a clean
+# checkout. Used for the PyTorch comparison (see tools/compare_gpt2_torch.py).
+add_executable(bench_gpt2_infer
+  bench_gpt2_infer.cpp
+)
+
+target_link_libraries(bench_gpt2_infer
+  PRIVATE
+    jasmine_headers
+)
