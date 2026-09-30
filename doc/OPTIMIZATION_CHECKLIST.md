@@ -92,13 +92,23 @@
   - 基线（Release，优化前）→ 优化后对比见 `doc/bench/`
 
 - [x] **确认 BLAS 真的在用本机的最优内核（不是「链上了就算完」）**
-  - 问题：OpenBLAS 在**运行时**按检测到的 CPU 选内核。本机 OpenBLAS 0.3.15 编进了
-    `sgemm_kernel_HASWELL/SKYLAKEX`，但在 13600KF 上 `openblas_get_corename()` 返回 **`Prescott`**
-    （2004 年、仅 SSE3）——0.3.15 早于 Raptor Lake，检测没命中，于是跑的是 SSE3 内核
-  - 修法：`OPENBLAS_CORETYPE=HASWELL`（**无需改一行代码**）
-  - 实测（4 线程）：forward 189.54 → **111.46 ms（1.70×）**，prefill 186.47 → 112.78 ms，
-    decode 10.73 → 9.78 ms
-  - `tools/compare_gpt2_torch.py` 默认钉住该变量（`--blas-coretype`，传空串可关闭）并打印所用值
+  - 问题：OpenBLAS 在**运行时**按检测到的 CPU 选内核。本机那份 0.3.15（来自一个无关安装）
+    在 13600KF 上 `openblas_get_corename()` 返回 **`Prescott`**（2004 年、仅 SSE3），
+    尽管库里带着 `sgemm_kernel_HASWELL/SKYLAKEX`——0.3.15 早于 Raptor Lake，检测没命中
+  - 三种解法实测（4 线程，整段 forward）：
+
+    | 配置 | forward | 相对自动检测 |
+    |---|---|---|
+    | OpenBLAS 0.3.15，自动检测（Prescott） | 190.6 ms | — |
+    | OpenBLAS 0.3.15 + `OPENBLAS_CORETYPE=HASWELL` | 111.4 ms | **1.71×** |
+    | **OpenBLAS 0.3.26（Ubuntu 24.04 `libopenblas0-pthread`），自动检测（Haswell）** | **106.5 ms** | **1.79×** |
+
+  - **结论：换一个新版 OpenBLAS 即可，无需任何配置**；0.3.26 自动识别正确，且内核比旧库强制
+    Haswell 再快约 4%。环境变量只是旧版本下的权宜之计
+  - **务必验证实际用的是哪一份**：两个库可以同名 `libopenblas.so.0`，而 `LD_LIBRARY_PATH`
+    会把其中一个悄悄替换掉（本轮就踩过一次，差点得出错误结论）：
+    `ldd ... | grep libopenblas` 看解析到哪个文件，`OPENBLAS_VERBOSE=2` 看选了哪个内核
+  - `tools/compare_gpt2_torch.py` 默认钉住 `OPENBLAS_CORETYPE=haswell` 并打印所用值
   - **教训**：这条比同期任何代码优化都大。做性能对比前必须先确认 BLAS 的实际内核，
     否则测的是打包/CPU 检测，不是实现
 

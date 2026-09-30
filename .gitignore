@@ -5,6 +5,8 @@ build-cuda/
 build-tsan/
 build-openblas/
 build-openblas-nogemv/
+build-ob326/
+build-ob326-nogemv/
 cmake-build-*/
 *.o
 *.a

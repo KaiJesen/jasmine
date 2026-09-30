@@ -1,23 +1,23 @@
 threads=1  prefill=128 tokens  decode=32 tokens  repeats=3  warmup=1
 weights=build/distilgpt2_weights.bin  HF model=distilgpt2
 [jasmine] OPENBLAS_CORETYPE=haswell
-[jasmine] build-openblas/benches/bench_gpt2_infer build/distilgpt2_weights.bin --dtype float --prefill 128 --decode 32 --repeats 3 --warmup 1
+[jasmine] build-ob326/benches/bench_gpt2_infer build/distilgpt2_weights.bin --dtype float --prefill 128 --decode 32 --repeats 3 --warmup 1
 [jasmine] OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
-Loading weights:   0%|          | 0/76 [00:00<?, ?it/s]Loading weights: 100%|██████████| 76/76 [00:00<00:00, 38157.42it/s]
+Loading weights:   0%|          | 0/76 [00:00<?, ?it/s]Loading weights: 100%|██████████| 76/76 [00:00<00:00, 21595.22it/s]
 
 ==============================================================================
 metric                                         jasmine               pytorch
 ------------------------------------------------------------------------------
-full forward, tokens                          234.6781       165.3346 ( 1.42x)
-prefill (cache), tokens                       232.8982       163.4350 ( 1.43x)
-decode, ms per token                           27.6432        11.5883 ( 2.39x)
+full forward, tokens                          227.8591       165.3761 ( 1.38x)
+prefill (cache), tokens                       226.4449       163.6622 ( 1.38x)
+decode, ms per token                           27.6085        11.4195 ( 2.42x)
 ------------------------------------------------------------------------------
-prefill + decode total                       1117.4806              534.2603
+prefill + decode total                       1109.9169              529.0853
 
-logits checksum (must agree)             -2518024.3780         -2518023.0000
+logits checksum (must agree)             -2518024.1170         -2518023.0000
 
   BLAS for jasmine                      openblas
   BLAS for pytorch                      torch 2.9.0+cu128 (MKL/OpenBLAS bundled)
 ==============================================================================
-checksum spread = 1.378 (relative 5.47e-07)
+checksum spread = 1.117 (relative 4.44e-07)
 checksums agree within fp32 accumulation noise, so both sides ran the same model

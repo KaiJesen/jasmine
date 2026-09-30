@@ -22,6 +22,11 @@ python tools/compare_gpt2_torch.py \
     --weights build/distilgpt2_weights.bin --threads 4 --prefill 128 --decode 32
 ```
 
+Use a recent OpenBLAS. The build linked here is Ubuntu 24.04's `libopenblas0-pthread` (0.3.26); on this
+machine it detects the CPU correctly and is 1.79x faster on the forward than the older OpenBLAS that
+was initially linked, purely because that one fell back to SSE3 kernels. Check with
+`OPENBLAS_VERBOSE=2` before trusting any comparison.
+
 ## Environment
 
 | | |
@@ -30,68 +35,78 @@ python tools/compare_gpt2_torch.py \
 | Measured peak read bandwidth | ~50 GB/s at 14 threads, ~55 GB/s two-stream |
 | Compiler | g++ 13.3.0, CMake 3.28.3, `-O3 -DNDEBUG` (no `-march=native`) |
 | jasmine default BLAS | netlib reference BLAS 3.12.0 (`libblas3`) — **single-threaded, unoptimized** |
-| jasmine comparison BLAS | OpenBLAS 0.3.15, `OPENBLAS_CORETYPE=haswell` forced (see below) |
+| jasmine comparison BLAS | **OpenBLAS 0.3.26** (Ubuntu 24.04 `libopenblas0-pthread`), auto-detects `Haswell` |
 | PyTorch | 2.9.0+cu128, CPU, MKL |
 | transformers | 5.17.0 |
 
-**The BLAS core type is not a detail.** OpenBLAS chooses its kernels at runtime from the CPU it
-detects. This build contains `sgemm_kernel_HASWELL` and `sgemm_kernel_SKYLAKEX` (AVX2/FMA) but on a
-13600KF it reports `openblas_get_corename() == "Prescott"` — a 2004 SSE3-era part — and runs the
-corresponding kernels. OpenBLAS 0.3.15 predates Raptor Lake, so the detection misses. Pinning
-`OPENBLAS_CORETYPE=HASWELL` is worth **1.70x on the full forward** with no code change:
+**The BLAS core type was worth more than any code change in this document.** OpenBLAS selects kernels
+at runtime from the CPU it detects, and the version on this machine (0.3.15, bundled with an
+unrelated install) does not recognise a 13600KF: it reports `openblas_get_corename() == "Prescott"`
+— a 2004 SSE3-era part — and runs the corresponding kernels, even though the library contains
+`sgemm_kernel_HASWELL` and `sgemm_kernel_SKYLAKEX`. Three ways out, measured on the 4-thread forward:
 
-| 4 threads | core type auto-detected ("Prescott") | pinned "HASWELL" |
+| configuration | full forward | vs auto-detected |
 |---|---|---|
-| full forward, 128 tokens | 189.54 ms | **111.46 ms** |
-| prefill through cache | 186.47 ms | **112.78 ms** |
-| decode, ms per token | 10.73 ms | **9.78 ms** |
+| OpenBLAS 0.3.15, auto-detected ("Prescott") | 190.6 ms | — |
+| OpenBLAS 0.3.15, `OPENBLAS_CORETYPE=HASWELL` | 111.4 ms | **1.71x** |
+| **OpenBLAS 0.3.26, auto-detected ("Haswell")** | **106.5 ms** | **1.79x** |
 
-`tools/compare_gpt2_torch.py` pins it by default (`--blas-coretype`, pass `""` to opt out) and prints
-which value it used. Every number below has it pinned. On a machine whose OpenBLAS does recognise its
-CPU this changes nothing; on this one it is the single largest lever in the whole document.
+So the fix is simply to use a recent OpenBLAS: 0.3.26 detects this CPU correctly with no
+configuration, and its kernels are ~4% faster than forcing the older library's Haswell path. The
+environment variable remains the workaround when the installed version is too old.
 
-The netlib BLAS is unaffected by this (it has no kernels to choose from), which makes the
-"netlib vs MKL" row below a fair picture of a stock Debian/Ubuntu build.
+Verifying which one is actually in use matters, because two libraries can both be named
+`libopenblas.so.0` and `LD_LIBRARY_PATH` silently redirects one to the other:
 
-Frequency scaling is enabled, so absolute numbers carry a few percent of run-to-run noise (the
-PyTorch decode figure moved between 7.6 and 8.4 ms across sessions); ratios within one run are
-reliable.
+```bash
+ldd ./build/benches/bench_gpt2_infer | grep libopenblas            # which file resolves
+OPENBLAS_VERBOSE=2 ... 2>&1 | head -1                              # which core was picked
+```
+
+`tools/compare_gpt2_torch.py` pins `OPENBLAS_CORETYPE=haswell` by default (`--blas-coretype`, pass
+`""` to opt out) and prints the value it used, so the trap cannot return unnoticed.
+
+The netlib BLAS is unaffected by any of this — it has no kernels to choose from — which makes the
+"netlib vs MKL" column a fair picture of a stock Debian/Ubuntu build.
+
+Frequency scaling is enabled, so absolute numbers carry a few percent of run-to-run noise; ratios
+within one run are reliable.
 
 ## Four threads
 
-| metric | jasmine (netlib) | jasmine (OpenBLAS) | PyTorch (MKL) |
+| metric | jasmine (netlib) | jasmine (OpenBLAS 0.3.26) | PyTorch (MKL) |
 |---|---|---|---|
-| full forward, 128 tokens | 990.93 ms | 112.35 ms | **48.24 ms** |
-| prefill through cache, 128 tokens | 988.35 ms | 111.92 ms | **45.17 ms** |
-| decode, ms per token | 34.77 ms | 10.12 ms | **7.70 ms** |
-| prefill + 32 decode steps | 2101.08 ms | 435.83 ms | **291.49 ms** |
+| full forward, 128 tokens | 990.93 ms | 106.46 ms | **45.09 ms** |
+| prefill through cache, 128 tokens | 988.35 ms | 108.24 ms | **44.64 ms** |
+| decode, ms per token | 34.77 ms | 9.54 ms | **7.50 ms** |
+| prefill + 32 decode steps | 2101.08 ms | 413.37 ms | **284.61 ms** |
 
 Slowdown vs PyTorch:
 
-| metric | jasmine (netlib) | jasmine (OpenBLAS) |
+| metric | jasmine (netlib) | jasmine (OpenBLAS 0.3.26) |
 |---|---|---|
-| full forward | 20.5x | **2.33x** |
-| prefill through cache | 21.9x | **2.48x** |
-| decode per token | 4.51x | **1.31x** |
+| full forward | 20.5x | **2.36x** |
+| prefill through cache | 21.9x | **2.42x** |
+| decode per token | 4.51x | **1.27x** |
 
 ## Thread scaling
 
-jasmine (OpenBLAS, core type pinned) vs PyTorch, ms:
+jasmine (OpenBLAS 0.3.26) vs PyTorch, ms:
 
 | metric | threads | jasmine | PyTorch | ratio |
 |---|---|---|---|---|
-| full forward | 1 | 234.68 | 165.33 | **1.42x** |
-| full forward | 4 | 112.35 | 48.24 | 2.33x |
-| full forward | 8 | 119.61 | 68.14 | 1.76x |
-| prefill through cache | 1 | 232.90 | 163.44 | 1.43x |
-| prefill through cache | 4 | 111.92 | 45.17 | 2.48x |
-| prefill through cache | 8 | 129.73 | 65.70 | 1.97x |
-| decode per token | 1 | 27.64 | 11.59 | 2.39x |
-| decode per token | 4 | 10.12 | 7.70 | 1.31x |
-| decode per token | 8 | 9.05 | 8.58 | **1.05x** |
+| full forward | 1 | 227.86 | 165.38 | **1.38x** |
+| full forward | 4 | 106.46 | 45.09 | 2.36x |
+| full forward | 8 | 115.45 | 64.39 | 1.79x |
+| prefill through cache | 1 | 226.44 | 163.66 | 1.38x |
+| prefill through cache | 4 | 108.24 | 44.64 | 2.42x |
+| prefill through cache | 8 | 125.17 | 63.30 | 1.98x |
+| decode per token | 1 | 27.61 | 11.42 | 2.42x |
+| decode per token | 4 | 9.54 | 7.50 | 1.27x |
+| decode per token | 8 | 8.94 | 8.43 | **1.06x** |
 
 Single-thread, where neither side's threading policy can confuse the comparison, jasmine is within
-**1.42x** on the forward. At 4 and 8 threads the ratios are worse because PyTorch scales better
+**1.38x** on the forward. At 4 and 8 threads the ratios are worse because PyTorch scales better
 inside MKL than jasmine does across its OpenMP row panels.
 
 jasmine's forward scales 2.30x from 1 to 4 threads and then flattens (1.04x from 4 to 8). PyTorch
@@ -347,25 +362,36 @@ kernel).
 
 | metric | at the start | now | change |
 |---|---|---|---|
-| full forward | 990.93 ms (20.5x vs PyTorch) | 112.35 ms (**2.33x**) | 8.8x |
-| prefill through cache | 988.35 ms (21.9x) | 111.92 ms (**2.48x**) | 8.8x |
-| decode per token | 34.77 ms (4.51x) | 10.12 ms (**1.31x**) | 3.4x |
+| full forward | 990.93 ms (20.5x vs PyTorch) | 106.46 ms (**2.36x**) | 9.3x |
+| prefill through cache | 988.35 ms (21.9x) | 108.24 ms (**2.42x**) | 9.1x |
+| decode per token | 34.77 ms (4.51x) | 9.54 ms (**1.27x**) | 3.6x |
 
-At one thread, where no threading policy can confuse the comparison, the forward is within **1.42x**.
+At one thread, where no threading policy can confuse the comparison, the forward is within **1.38x**.
 
-**4. What is left is not one thing.** With a correctly-tuned BLAS the projection GEMMs are roughly
-55-60 ms of the 112 ms forward, and MKL does the same shapes in 40.66 ms, so GEMM efficiency is the
-larger remaining piece and it is bounded by the BLAS we are allowed to link. The other ~50 ms is
-attention, normalization and elementwise work spread across many small operations; no single one of
-them is large enough to move the total, which is why further micro-tuning here has stopped paying.
+**4. A note on the GEMV threshold after the BLAS change.** A better BLAS moves the sgemm-vs-gemv
+crossover up: with 0.3.26, sgemm still wins at 36 MB (45.7 vs 42.8 GB/s) and only loses clearly by
+48 MB, where 0.3.15 with the core pinned already lost at 36 MB. The threshold in `jas_mat_gemm.hpp` is
+16 MiB, so it is now conservative. It is left alone because the aggregate still favours the GEMV
+path, and by a wide margin: on the double path (where the mlp matrices are 18.9 MB and do fall in the
+shifted band) GEMV on gives 13.8-15.0 ms/token against 19.3-19.6 with it off, because `lm_head` at
+154 MB (fp32) or 309 MB (double) dominates the weight stream and always belongs on the GEMV path. For
+fp32 nothing changes at all, since the largest non-`lm_head` matrix is 9.4 MB, below the threshold
+either way. Re-tuning it would be worth a few percent on the double path only.
 
-**5. We have not beaten PyTorch on the forward, and on this machine we probably cannot.** Closing
-2.33x would need a BLAS at MKL's level plus removing essentially all of the 50 ms of non-GEMM work.
-Decode at 8 threads is at parity (1.05x), and single-token decode is bandwidth-bound and within 1.31x
-at four threads. Those are the honest numbers.
+**5. What is left is not one thing.** With a correctly-tuned BLAS the projection GEMMs are roughly
+55-60 ms of the 106 ms forward, and MKL does the same shapes in 40.66 ms, so GEMM efficiency is the
+larger remaining piece and it is bounded by the BLAS we link. The other ~50 ms is attention,
+normalization and elementwise work spread across many small operations; no single one of them is
+large enough to move the total, which is why micro-tuning there stopped paying.
+
+**6. We have not beaten PyTorch on the forward, and on this machine probably cannot.** Closing 2.36x
+would need a BLAS at MKL's level plus removing essentially all of the 50 ms of non-GEMM work. Decode
+at 8 threads is at parity (1.06x), and single-token decode is bandwidth-bound and within 1.27x at
+four threads. Those are the honest numbers.
 
 ## Raw logs
 
 `gpt2_vs_torch_1threads.txt`, `gpt2_vs_torch_4threads.txt`, `gpt2_vs_torch_8threads.txt`,
-`gpt2_gemv_ab.txt` (the GEMV A/B run). The three `gpt2_vs_torch_*.txt` logs were recorded with
-`OPENBLAS_CORETYPE` pinned; earlier versions of them (auto-detected core type) are in the git history.
+`gpt2_gemv_ab.txt` (the GEMV A/B run). The three `gpt2_vs_torch_*.txt` logs were recorded against
+OpenBLAS 0.3.26 with the core type auto-detected; earlier versions of them (older OpenBLAS,
+auto-detected or forced) are in the git history.
