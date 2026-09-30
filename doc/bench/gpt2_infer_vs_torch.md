@@ -42,18 +42,18 @@ reliable, and the A/B rows below were measured in a single run against the same 
 
 | metric | jasmine (netlib) | jasmine (OpenBLAS) | PyTorch (MKL) |
 |---|---|---|---|
-| full forward, 128 tokens | 990.93 ms | 278.39 ms | **49.41 ms** |
-| prefill through cache, 128 tokens | 988.35 ms | 288.60 ms | **49.00 ms** |
-| decode, ms per token | 34.77 ms | 12.01 ms | **8.44 ms** |
-| prefill + 32 decode steps | 2101.08 ms | 672.93 ms | **318.99 ms** |
+| full forward, 128 tokens | 990.93 ms | 210.83 ms | **44.64 ms** |
+| prefill through cache, 128 tokens | 988.35 ms | 216.92 ms | **44.60 ms** |
+| decode, ms per token | 34.77 ms | 11.42 ms | **7.53 ms** |
+| prefill + 32 decode steps | 2101.08 ms | 582.48 ms | **285.48 ms** |
 
 Slowdown vs PyTorch:
 
 | metric | jasmine (netlib) | jasmine (OpenBLAS) |
 |---|---|---|
-| full forward | 22.3x | 5.63x |
-| prefill through cache | 22.2x | 5.89x |
-| decode per token | 4.74x | **1.42x** |
+| full forward | 22.3x | 4.72x |
+| prefill through cache | 22.2x | 4.86x |
+| decode per token | 4.74x | **1.52x** |
 
 ## Thread scaling
 
@@ -61,15 +61,20 @@ jasmine (OpenBLAS) vs PyTorch, ms:
 
 | metric | threads | jasmine | PyTorch | ratio |
 |---|---|---|---|---|
-| full forward | 1 | 640.74 | 169.37 | 3.78x |
-| full forward | 4 | 278.39 | 49.41 | 5.63x |
-| full forward | 8 | 267.16 | 79.33 | 3.37x |
-| prefill through cache | 1 | 641.91 | 169.64 | 3.78x |
-| prefill through cache | 4 | 288.60 | 49.00 | 5.89x |
-| prefill through cache | 8 | 272.17 | 79.56 | 3.42x |
-| decode per token | 1 | 35.47 | 12.01 | 2.95x |
-| decode per token | 4 | 12.01 | 8.44 | 1.42x |
-| decode per token | 8 | 11.41 | 8.91 | 1.28x |
+| full forward | 1 | 561.99 | 164.72 | 3.41x |
+| full forward | 4 | 210.83 | 44.64 | 4.72x |
+| full forward | 8 | 195.10 | 66.79 | 2.92x |
+| prefill through cache | 1 | 561.46 | 164.04 | 3.42x |
+| prefill through cache | 4 | 216.92 | 44.60 | 4.86x |
+| prefill through cache | 8 | 187.24 | 70.67 | 2.65x |
+| decode per token | 1 | 33.43 | 11.58 | 2.89x |
+| decode per token | 4 | 11.42 | 7.53 | 1.52x |
+| decode per token | 8 | 10.42 | 8.40 | 1.24x |
+
+The absolute PyTorch numbers move between sessions (frequency scaling is on), so the ratio is only
+meaningful within a row: PyTorch's decode reads 7.53 ms here and 8.44 ms in the earlier run, which is
+why the decode ratio wanders between 1.24x and 1.55x across sessions. The jasmine side is the one
+that changed.
 
 jasmine's forward scales 2.30x from 1 to 4 threads and then flattens (1.04x from 4 to 8). PyTorch
 peaks at 4 threads and **regresses at 8** (49.41 ms to 79.33 ms). Both point at the same thing:
@@ -168,6 +173,72 @@ and the ~50 GB/s the machine can deliver. The remaining 1.42x is not in the big 
 per-layer matrices, which are cache-resident and deliberately left on BLAS, plus the attention and
 elementwise work that does not stream weights at all.
 
+## Change 3: the matrix index accessor
+
+The forward profile pointed at something much broader than decode. Splitting `forward` into its
+phases on distilgpt2 at T=128:
+
+| phase | ms | share |
+|---|---|---|
+| forward (total) | 266.75 | 100% |
+| embed | 1.13 | 0.4% |
+| 6 blocks, each | ~30.8 | 69% |
+| head (ln_f + lm_head) | 77.14 | 28.9% |
+
+Raw BLAS GEMMs of the same shapes sum to 115.74 ms, so **151 ms of the 267 ms was not GEMM at all**.
+Drilling into one block:
+
+| sub-layer | ms | note |
+|---|---|---|
+| ln_1 | 2.82 | a 0.4 MB matrix; a fused hand-written version does it in 0.60 |
+| attn | 7.68 | |
+| ln_2 | 2.82 | |
+| mlp_fc | 4.14 | 3.20 of it is the GEMM |
+| mlp_proj | 3.50 | 3.20 of it is the GEMM |
+| residual + gelu | 7.54 | |
+
+Isolating the cause on a plain `a - b` pass over 3 MB:
+
+| accessor | ms | GB/s |
+|---|---|---|
+| raw pointer loop | 0.129 | **48.9** |
+| raw pointer loop, 4 threads | 0.067 | 93.7 |
+| **`mat_t::operator()` loop** | **4.700** | **1.3** |
+| `(x - y).clone()` | 3.771 | 1.7 |
+| copy ctor | 0.158 | 39.9 |
+
+`operator()` was doing two integer modulo operations per element:
+
+```cpp
+int i = r % row_num();
+int j = c % col_num();
+```
+
+An integer division is ~20-40 cycles on x86 and does not pipeline, and the accessor is called once
+per element per operand, so a three-operand expression paid six divisions per element. Measured in
+isolation the column index is the expensive one (it is the inner loop): protecting both indices with
+a range check gives 6.8 → 22.0 GB/s.
+
+The wraparound is deliberate — it is how the expression layer broadcasts `[R,1]` and `[1,C]` operands
+and how periodic indexing works — so it stays; only the common in-range case takes the new branch.
+The change is semantics-preserving for every input, including negative indices (the unsigned compare
+fails for those, so they still reach the modulo).
+
+| metric | before | after | change |
+|---|---|---|---|
+| full forward, 128 tokens | 278.39 ms | 210.83 ms | **1.32x faster** |
+| prefill through cache | 288.60 ms | 216.92 ms | 1.33x faster |
+| decode per token | 12.01 ms | 11.42 ms | 1.05x faster |
+| block | 28.49 ms | 20.51 ms | 1.39x faster |
+| ln_1 / ln_2, each | 2.82 ms | 0.96 ms | 2.95x faster |
+| attention core, per layer | 4.71 ms | 2.04 ms | 2.31x faster |
+| slowdown vs PyTorch, forward | 5.63x | **4.72x** | — |
+
+It helps batched forward more than decode, because `operator()` is on every elementwise layer and
+those dominate the batch-128 path, while decode is dominated by the weight stream. All 280 tests
+pass, the three golden alignment tests against real weights pass, and `tools/verify_gpt2.py` still
+matches HuggingFace token for token.
+
 ## What the numbers say
 
 **1. The BLAS choice dominated the as-shipped gap.** jasmine links whatever `CBLAS` CMake finds, and
@@ -177,18 +248,22 @@ headline was a packaging accident, not a transformer implementation problem. Eit
 optimized BLAS or document the dependency; a benchmark against MKL with netlib underneath is not
 an implementation comparison.
 
-**2. Two real code problems accounted for most of the rest**, and both were "the arithmetic is fine,
-the scheduling is not": stepping the prompt token by token (7.2x on prefill) and asking GEMM to do a
-matrix-vector product (1.42x on decode). Together they took decode from 22.2x on the prefill side and
-4.74x on the decode side down to 5.89x and **1.42x**.
+**2. Three real code problems accounted for most of the rest**, and all three were "the arithmetic is
+fine, the scheduling is not": stepping the prompt token by token (7.2x on prefill), asking GEMM to do
+a matrix-vector product (1.42x on decode), and paying two integer divisions per element in the matrix
+index accessor (1.32x on the whole forward). Together they took the batched forward from 22.3x to
+4.72x and single-token decode from 4.74x to 1.52x.
 
-**3. What is left splits by bottleneck.** The batched forward is compute-bound and sits at 5.63x:
-that is GEMM efficiency, and jasmine's own hand-written blocked fallback and its BLAS usage are the
-places to look. Single-token decode is bandwidth-bound at 1.42x, and it is now within 40% of the
-bus's measured capability. Neither number is a measurement artifact.
+**3. The accessor fix is the broadest of the three**, because `mat_t::operator()` is called by every
+elementwise layer, so the whole forward paid it, not just decode. It also improved prefill and the
+attention core by more than it improved decode, which is the signature of a CPU-bound per-element
+cost rather than a memory or GEMM one.
 
-**4. Thread scaling saturates early and PyTorch also regresses at 8 threads**, so neither
-implementation is a scaling win on this machine. Any follow-up should fix threads at 4.
+**4. What is left is compute-bound and spread out.** After the accessor fix the forward is 204.73 ms
+(profiler) of which the projection GEMMs are 115.74 ms, so ~89 ms is still non-GEMM elementwise and
+attention work. The largest remaining single item is LayerNorm at 0.96 ms per instance — down from
+2.82 ms but still only ~1.2 GB/s of a matrix that now has 22 GB/s of headroom, so its multi-pass
+structure (six allocations, a `std::pow` per element) is the next target, not the accessor.
 
 ## Raw logs
 
