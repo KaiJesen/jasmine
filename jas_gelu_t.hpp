@@ -64,10 +64,14 @@ public:
     mat_t<val_type> forward(Src&& input)
     {
         detail::store_for_backward(m_input, std::forward<Src>(input));
-        mat_t<val_type> out(m_input.row_num(), m_input.col_num());
-        for (int i = 0; i < m_input.row_num(); ++i)
-            for (int j = 0; j < m_input.col_num(); ++j)
-                out(i, j) = gelu(m_input(i, j));
+        // Hoisted bounds and a fold-free accessor: this runs once per element of
+        // every FFN hidden state, so it is on the hot path of a batch forward.
+        const int rows = m_input.row_num();
+        const int cols = m_input.col_num();
+        mat_t<val_type> out(rows, cols);
+        for (int i = 0; i < rows; ++i)
+            for (int j = 0; j < cols; ++j)
+                out.unchecked(i, j) = gelu(m_input.unchecked(i, j));
         return out;
     }
 

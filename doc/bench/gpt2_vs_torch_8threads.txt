@@ -1,22 +1,23 @@
 threads=8  prefill=128 tokens  decode=32 tokens  repeats=3  warmup=1
 weights=build/distilgpt2_weights.bin  HF model=distilgpt2
+[jasmine] OPENBLAS_CORETYPE=haswell
 [jasmine] build-openblas/benches/bench_gpt2_infer build/distilgpt2_weights.bin --dtype float --prefill 128 --decode 32 --repeats 3 --warmup 1
 [jasmine] OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=1
-Loading weights:   0%|          | 0/76 [00:00<?, ?it/s]Loading weights: 100%|██████████| 76/76 [00:00<00:00, 27482.29it/s]
+Loading weights:   0%|          | 0/76 [00:00<?, ?it/s]Loading weights: 100%|██████████| 76/76 [00:00<00:00, 19146.32it/s]
 
 ==============================================================================
 metric                                         jasmine               pytorch
 ------------------------------------------------------------------------------
-full forward, tokens                          169.0990        64.8712 ( 2.61x)
-prefill (cache), tokens                       166.4169        65.7157 ( 2.53x)
-decode, ms per token                            9.8736        10.2030 ( 0.97x)
+full forward, tokens                          119.6068        68.1430 ( 1.76x)
+prefill (cache), tokens                       129.7250        65.6966 ( 1.97x)
+decode, ms per token                            9.0504         8.5815 ( 1.05x)
 ------------------------------------------------------------------------------
-prefill + decode total                        482.3721              392.2129
+prefill + decode total                        419.3378              340.3037
 
-logits checksum (must agree)             -2518023.4670         -2518022.7500
+logits checksum (must agree)             -2518024.3780         -2518022.7500
 
   BLAS for jasmine                      openblas
   BLAS for pytorch                      torch 2.9.0+cu128 (MKL/OpenBLAS bundled)
 ==============================================================================
-checksum spread = 0.717 (relative 2.85e-07)
+checksum spread = 1.628 (relative 6.47e-07)
 checksums agree within fp32 accumulation noise, so both sides ran the same model

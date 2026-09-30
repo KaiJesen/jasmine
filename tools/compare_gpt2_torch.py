@@ -57,6 +57,15 @@ def run_jasmine(binary, weights, args, threads, label):
     env["OMP_NUM_THREADS"] = str(threads)
     env["OPENBLAS_NUM_THREADS"] = "1"
     env["MKL_NUM_THREADS"] = "1"
+    # OpenBLAS picks its kernels at runtime from the detected CPU. Older builds do
+    # not recognise recent parts and silently fall back to an ancient kernel set:
+    # on this machine OpenBLAS 0.3.15 reports corename "Prescott" (SSE3, 2004) on a
+    # 13600KF even though the library contains Haswell/SkylakeX AVX2 kernels, and
+    # pinning OPENBLAS_CORETYPE=HASWELL is worth 1.70x on the full forward. Set it
+    # only when it is not already set, so a caller can override or opt out.
+    if env.get("OPENBLAS_CORETYPE") is None and args.blas_coretype:
+        env["OPENBLAS_CORETYPE"] = args.blas_coretype
+    log(f"[{label}] OPENBLAS_CORETYPE={env.get('OPENBLAS_CORETYPE', '(auto-detect)')}")
 
     cmd = [
         str(binary), str(weights),
@@ -221,6 +230,11 @@ def main():
     ap.add_argument("--decode", type=int, default=32)
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--warmup", type=int, default=1)
+    ap.add_argument("--blas-coretype", default="haswell",
+                    help="pin OPENBLAS_CORETYPE for the jasmine runs (openblas only; "
+                         "pass an empty string to let the library auto-detect). Older "
+                         "OpenBLAS builds fall back to SSE-only kernels on recent CPUs, "
+                         "which costs ~1.7x on this model.")
     args = ap.parse_args()
 
     for path in (args.jasmine_bin, args.weights):

@@ -890,19 +890,43 @@ auto softmax(val_type&& val)
     return mat_softmax_t<val_type&&>(std::forward<val_type>(val));
 }
 
+/**
+ * Row-wise softmax: each row is normalised across its columns, matching the
+ * hmax/hsum convention this replaced (see vmean/vsum for the other convention,
+ * which reduces along rows instead).
+ *
+ * Written as one fused pass per row instead of the four intermediate matrices the
+ * expression form needs (`hmax`, `input - max`, `exp`, `hsum`, then the division).
+ * Attention calls this once per head per layer, so on a [T,T] score matrix the
+ * temporaries were the dominant cost of the softmax, not the transcendentals.
+ * The arithmetic is the same three steps in the same order -- row max, then
+ * exp/sum, then scale -- so the result matches the unfused form.
+ */
 template <typename input_type>
 auto hsoftmax(const input_type& input)
 {
     using val_type = typename std::decay_t<input_type>::ele_type;
-    // 求得每行的最大值
-    mat_t<val_type> max_val = hmax(input);
-    // 求矩阵减去每行的最大值后的指数
-    mat_t<val_type> exp_val = exp(input - max_val);
-    // 求得每行的指数和
-    mat_t<val_type> sum_exp = hsum(exp_val);
-    // 求得每行的softmax值
-    mat_t<val_type> softmax_val = exp_val / sum_exp;
-    return softmax_val;
+    const int rows = input.row_num();
+    const int cols = input.col_num();
+    mat_t<val_type> out(rows, cols);
+    for (int i = 0; i < rows; ++i)
+    {
+        val_type mx = at_fast(input, i, 0);
+        for (int j = 1; j < cols; ++j)
+            mx = std::max(mx, static_cast<val_type>(at_fast(input, i, j)));
+
+        val_type sum = val_type(0);
+        for (int j = 0; j < cols; ++j)
+        {
+            const val_type e = std::exp(static_cast<val_type>(at_fast(input, i, j)) - mx);
+            out.unchecked(i, j) = e;
+            sum += e;
+        }
+        const val_type inv = val_type(1) / sum;
+        for (int j = 0; j < cols; ++j)
+            out.unchecked(i, j) *= inv;
+    }
+    return out;
 }
 
 template<typename lval_type, typename rval_type>

@@ -91,6 +91,17 @@
   - 验收：`tests/test_gemm.cpp`；`doc/bench/matmul_*.txt` 中 `BM_MatDot` 在 `n≥256` 有数量级加速
   - 基线（Release，优化前）→ 优化后对比见 `doc/bench/`
 
+- [x] **确认 BLAS 真的在用本机的最优内核（不是「链上了就算完」）**
+  - 问题：OpenBLAS 在**运行时**按检测到的 CPU 选内核。本机 OpenBLAS 0.3.15 编进了
+    `sgemm_kernel_HASWELL/SKYLAKEX`，但在 13600KF 上 `openblas_get_corename()` 返回 **`Prescott`**
+    （2004 年、仅 SSE3）——0.3.15 早于 Raptor Lake，检测没命中，于是跑的是 SSE3 内核
+  - 修法：`OPENBLAS_CORETYPE=HASWELL`（**无需改一行代码**）
+  - 实测（4 线程）：forward 189.54 → **111.46 ms（1.70×）**，prefill 186.47 → 112.78 ms，
+    decode 10.73 → 9.78 ms
+  - `tools/compare_gpt2_torch.py` 默认钉住该变量（`--blas-coretype`，传空串可关闭）并打印所用值
+  - **教训**：这条比同期任何代码优化都大。做性能对比前必须先确认 BLAS 的实际内核，
+    否则测的是打包/CPU 检测，不是实现
+
 - [x] **单列输出（解码）走 GEMV，不走 GEMM**
   - 问题：解码恒为 `N=1`，每个权重只用一次，GEMM 的分块打包（把 A/B 复制成缓存友好的副本）
     收益为零，却把「必须搬 328 MB」变成搬了更多——时间没花在读权重，花在复制权重
