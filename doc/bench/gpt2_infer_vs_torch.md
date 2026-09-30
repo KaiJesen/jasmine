@@ -145,19 +145,22 @@ cache-resident take the GEMV path. Nothing else in GPT-2 reaches it: the largest
 `mlp.fc` at 9 MB.
 
 A/B on the real model, both binaries built from the same source with `-DJASMINE_USE_GEMV=0` for the
-baseline, run in one session:
+baseline, 5 repeats and 2 warmup runs each:
 
 | metric (4 threads) | GEMV off | GEMV on | change |
 |---|---|---|---|
-| decode, ms per token (float) | 16.33 ms | 12.41 ms | **1.32x faster** |
+| decode, ms per token (float) | 16.81 ms | 11.85 ms | **1.42x faster** |
 | decode, ms per token (double) | 20.10 ms | 15.76 ms | 1.28x faster |
-| full forward | 270.66 ms | 270.15 ms | unchanged |
-| prefill through cache | 280.98 ms | 282.03 ms | unchanged |
+| full forward | 272.88 ms | 277.22 ms | unchanged (2% is noise) |
+| prefill through cache | 276.73 ms | 275.57 ms | unchanged |
 | logits checksum | -2518023.4670 | -2518023.4670 | **identical** |
 
 `forward` and `prefill` are unaffected because they run `N = 128`, which does not take the path —
-that is the point of scoping it to `N == 1`. The double case benefits too, and the examples
-(`gpt2_generate`, `gpt2_chat`) run in double, so they get the same ~1.3x.
+that is the point of scoping it to `N == 1`. An earlier run of this A/B showed prefill 13% slower
+with GEMV on, which would have contradicted the design; repeating it with the two binaries
+alternated showed that was a thermal outlier (the row now reads 1.00x), so the numbers above are
+from the repeated run. Decode was consistent across all five alternations (1.35–1.42x), and the
+double case matters because `gpt2_generate` and `gpt2_chat` run in double.
 
 Decode bandwidth: 328 MB per token, so 12.01 ms is 27.3 GB/s against PyTorch's 8.44 ms at 38.9 GB/s
 and the ~50 GB/s the machine can deliver. The remaining 1.42x is not in the big weights any more:
@@ -176,7 +179,7 @@ an implementation comparison.
 
 **2. Two real code problems accounted for most of the rest**, and both were "the arithmetic is fine,
 the scheduling is not": stepping the prompt token by token (7.2x on prefill) and asking GEMM to do a
-matrix-vector product (1.32x on decode). Together they took decode from 22.2x on the prefill side and
+matrix-vector product (1.42x on decode). Together they took decode from 22.2x on the prefill side and
 4.74x on the decode side down to 5.89x and **1.42x**.
 
 **3. What is left splits by bottleneck.** The batched forward is compute-bound and sits at 5.63x:
