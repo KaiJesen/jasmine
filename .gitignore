@@ -40,3 +40,7 @@ __pycache__/
 temp/
 dist/
 bench_bpe
+
+# Local BLAS used by build-chat / the comparison builds (see doc/bench/gpt2_infer_vs_torch.md)
+.blas/
+build-chat/
