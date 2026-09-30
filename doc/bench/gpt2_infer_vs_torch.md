@@ -42,18 +42,18 @@ reliable, and the A/B rows below were measured in a single run against the same 
 
 | metric | jasmine (netlib) | jasmine (OpenBLAS) | PyTorch (MKL) |
 |---|---|---|---|
-| full forward, 128 tokens | 990.93 ms | 210.83 ms | **44.64 ms** |
-| prefill through cache, 128 tokens | 988.35 ms | 216.92 ms | **44.60 ms** |
-| decode, ms per token | 34.77 ms | 11.42 ms | **7.53 ms** |
-| prefill + 32 decode steps | 2101.08 ms | 582.48 ms | **285.48 ms** |
+| full forward, 128 tokens | 990.93 ms | 191.41 ms | **44.80 ms** |
+| prefill through cache, 128 tokens | 988.35 ms | 187.88 ms | **44.61 ms** |
+| decode, ms per token | 34.77 ms | 11.13 ms | **7.58 ms** |
+| prefill + 32 decode steps | 2101.08 ms | 543.95 ms | **287.10 ms** |
 
 Slowdown vs PyTorch:
 
 | metric | jasmine (netlib) | jasmine (OpenBLAS) |
 |---|---|---|
-| full forward | 22.3x | 4.72x |
-| prefill through cache | 22.2x | 4.86x |
-| decode per token | 4.74x | **1.52x** |
+| full forward | 22.3x | 4.27x |
+| prefill through cache | 22.2x | 4.21x |
+| decode per token | 4.74x | **1.47x** |
 
 ## Thread scaling
 
@@ -61,20 +61,23 @@ jasmine (OpenBLAS) vs PyTorch, ms:
 
 | metric | threads | jasmine | PyTorch | ratio |
 |---|---|---|---|---|
-| full forward | 1 | 561.99 | 164.72 | 3.41x |
-| full forward | 4 | 210.83 | 44.64 | 4.72x |
-| full forward | 8 | 195.10 | 66.79 | 2.92x |
-| prefill through cache | 1 | 561.46 | 164.04 | 3.42x |
-| prefill through cache | 4 | 216.92 | 44.60 | 4.86x |
-| prefill through cache | 8 | 187.24 | 70.67 | 2.65x |
-| decode per token | 1 | 33.43 | 11.58 | 2.89x |
-| decode per token | 4 | 11.42 | 7.53 | 1.52x |
-| decode per token | 8 | 10.42 | 8.40 | 1.24x |
+| full forward | 1 | 543.24 | 164.83 | 3.30x |
+| full forward | 4 | 191.41 | 44.80 | 4.27x |
+| full forward | 8 | 169.10 | 64.87 | 2.61x |
+| prefill through cache | 1 | 540.27 | 163.24 | 3.31x |
+| prefill through cache | 4 | 187.88 | 44.61 | 4.21x |
+| prefill through cache | 8 | 166.42 | 65.72 | 2.53x |
+| decode per token | 1 | 33.71 | 11.57 | 2.91x |
+| decode per token | 4 | 11.13 | 7.58 | 1.47x |
+| decode per token | 8 | 9.87 | 10.20 | **0.97x** |
 
-The absolute PyTorch numbers move between sessions (frequency scaling is on), so the ratio is only
-meaningful within a row: PyTorch's decode reads 7.53 ms here and 8.44 ms in the earlier run, which is
-why the decode ratio wanders between 1.24x and 1.55x across sessions. The jasmine side is the one
-that changed.
+At 8 threads single-token decode is now **faster than PyTorch** on this machine. PyTorch regresses
+past 4 threads while jasmine keeps improving, so the crossover is real but it is a statement about
+thread scheduling on a contended memory bus, not about a 2x algorithmic win. The 4-thread row is
+still the fairer headline.
+
+The absolute PyTorch numbers move between sessions (frequency scaling is on), so ratios are only
+meaningful within a row.
 
 jasmine's forward scales 2.30x from 1 to 4 threads and then flattens (1.04x from 4 to 8). PyTorch
 peaks at 4 threads and **regresses at 8** (49.41 ms to 79.33 ms). Both point at the same thing:
@@ -238,6 +241,48 @@ It helps batched forward more than decode, because `operator()` is on every elem
 those dominate the batch-128 path, while decode is dominated by the weight stream. All 280 tests
 pass, the three golden alignment tests against real weights pass, and `tools/verify_gpt2.py` still
 matches HuggingFace token for token.
+
+## Change 4: a fold-free accessor for validated loops
+
+`mat_t::operator()` folds out-of-range indices with `%`. That is deliberate and stays — it is how the
+expression layer broadcasts a `[R,1]` or `[1,C]` operand, and how periodic indexing works. But it
+also means no loop that uses it can be vectorized, because folding is a data-dependent branch plus a
+division. Measured on a plain `(a - b)` pass over 3 MB:
+
+| accessor | GB/s | compiler verdict |
+|---|---|---|
+| raw pointer loop | 48.9 | `loop vectorized using 16 byte vectors` |
+| `operator()`, folding range check | 22.0 | `not vectorized: control flow in loop` |
+| `operator()`, unconditional `%` | 6.8 | `couldn't vectorize` |
+
+So a range check alone is not enough — the branch itself blocks vectorization, and a loop that
+promises folding can never drop it. `mat_t::unchecked(r, c)` was added for loops that have already
+validated their shapes: identical addressing without the fold, asserting the precondition in debug
+builds and compiling away under `NDEBUG`. The broadcast guarantee is untouched; the promise simply
+moves into the hot paths that can actually keep it.
+
+Applied to the elementwise kernel of the expression layer (output store, plus hoisting the loop
+bounds, which for an expression node meant re-walking the subtree every iteration) and to the
+`sum` / `vsum` / `pow` helpers:
+
+| metric | before | after | change |
+|---|---|---|---|
+| `(x - y).clone()`, 3 MB | 3.771 ms | 0.971 ms | **3.9x faster** |
+| full forward, 128 tokens | 210.83 ms | 191.41 ms | 1.10x faster |
+| prefill through cache | 216.92 ms | 187.88 ms | 1.15x faster |
+| ln_1 / ln_2, each | 0.958 ms | 0.757 ms | 1.27x faster |
+| slowdown vs PyTorch, forward | 4.72x | **4.27x** | — |
+| slowdown vs PyTorch, prefill | 4.86x | **4.21x** | — |
+
+Two things to be honest about. First, the safe subset of this change (output store and hoisted
+bounds) only bought 1.3% on the forward, because the *operands* still fold — making those fold-free
+requires per-operand shape checks, since a broadcast operand is genuinely smaller than the result.
+Second, `pow(x, 2.0)` now computes `x * x`; that is a numerical change, not just a scheduling one.
+It is what LayerNorm's variance step wants, and the golden alignment tests plus the HuggingFace
+cross-check both still pass, but it is not bit-identical to the library call in principle.
+
+All 280 tests pass, the three golden alignment tests against real weights pass, and
+`tools/verify_gpt2.py` still matches HuggingFace token for token.
 
 ## What the numbers say
 

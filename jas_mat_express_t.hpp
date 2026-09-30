@@ -216,12 +216,20 @@ public:
     // 计算所有元素的值，并赋值给一个新的mat_t对象并返回
     mat_t<ele_type> clone() const
     {
-        mat_t<ele_type> m(row_num(), col_num());
-        for (int i = 0; i < row_num(); ++i)
+        // Bounds are hoisted deliberately: for an expression node row_num() is
+        // max(m_left.row_num(), m_right.row_num()), which walks the whole subtree, so
+        // leaving it in the loop condition re-evaluated the tree once per element.
+        const int rows = row_num();
+        const int cols = col_num();
+        mat_t<ele_type> m(rows, cols);
+        for (int i = 0; i < rows; ++i)
         {
-            for (int j = 0; j < col_num(); ++j)
+            for (int j = 0; j < cols; ++j)
             {
-                m(i, j) = (*this)(i, j);
+                // `m` is exactly this node's shape, so the store needs no folding.
+                // The operands keep using operator(): a broadcast operand is genuinely
+                // smaller than the result, so its access must keep folding.
+                m.unchecked(i, j) = (*this)(i, j);
             }
         }
         return m;
@@ -567,13 +575,18 @@ public:
 
     mat_t<ele_type> clone() const
     {
-        mat_t<ele_type> m(row_num(), col_num());
+        // See the two-operand clone(): bounds are hoisted because for an expression
+        // node they walk the subtree, and the store cannot go out of range because
+        // `m` is built to exactly this node's shape. Operands keep folding.
+        const int rows = row_num();
+        const int cols = col_num();
+        mat_t<ele_type> m(rows, cols);
         // 不在 clone 里开 parallel：训练中会频繁物化表达式，并行区开销远大于收益
-        for (int i = 0; i < row_num(); ++i)
+        for (int i = 0; i < rows; ++i)
         {
-            for (int j = 0; j < col_num(); ++j)
+            for (int j = 0; j < cols; ++j)
             {
-                m(i, j) = (*this)(i, j);
+                m.unchecked(i, j) = (*this)(i, j);
             }
         }
         return m;
@@ -666,6 +679,21 @@ auto sigmoid(val_type&& val)
     return mat_sigmoid_t<val_type&&>(std::forward<val_type>(val));
 }
 
+/**
+ * Fold-free element read for loops that already know their bounds, for types that
+ * offer `unchecked`. Expression nodes do not (their operands may be broadcast, so
+ * they must keep folding), so this falls back to `operator()` for them. The choice
+ * is compile-time, so the folding path costs nothing when it is not needed.
+ */
+template <typename matrix_type>
+auto at_fast(matrix_type const& v, int i, int j)
+{
+    if constexpr (requires { v.unchecked(i, j); })
+        return v.unchecked(i, j);
+    else
+        return v(i, j);
+}
+
 template<typename val_type>
 requires std::is_arithmetic_v<val_type>
 auto sum(val_type const& val)
@@ -678,10 +706,12 @@ requires is_matrix<val_type>
 auto sum(val_type const& val)
 { 
     using ele_type = typename val_type::ele_type;
+    const int rows = val.row_num();
+    const int cols = val.col_num();
     ele_type s = 0.;
-    for (int i = 0; i < val.row_num(); ++i)
-        for (int j = 0; j < val.col_num(); ++j)
-            s += val(i, j);
+    for (int i = 0; i < rows; ++i)
+        for (int j = 0; j < cols; ++j)
+            s += at_fast(val, i, j);
     return s;
 }
 
@@ -690,15 +720,19 @@ requires is_matrix<val_type>
 auto vsum(val_type const& val)           // 每一列的和，返回一个1行col_num列的矩阵
 {
     using ele_type = typename val_type::ele_type;
-    mat_t<ele_type> result(1, val.col_num());
-    for (int j = 0; j < val.col_num(); ++j)
+    const int rows = val.row_num();
+    const int cols = val.col_num();
+    mat_t<ele_type> result(1, cols);
+    // Hoisted bounds and a fold-free read: this accessor is called rows*cols times,
+    // and the expression-layer definition of row_num() walks the subtree.
+    for (int j = 0; j < cols; ++j)
     {
         ele_type s = 0.;
-        for (int i = 0; i < val.row_num(); ++i)
+        for (int i = 0; i < rows; ++i)
         {
-            s += val(i, j);
+            s += at_fast(val, i, j);
         }
-        result(0, j) = s;
+        result.unchecked(0, j) = s;
     }
     return result;
 }
@@ -746,10 +780,25 @@ template <typename input_type>
 auto pow(input_type const& val, double const p = 2.)
 {
     using val_type = typename std::decay_t<input_type>::ele_type;
-    mat_t<val_type> ret(val.row_num(), val.col_num());
-    for (int i = 0; i < val.row_num(); ++i)
-        for (int j = 0; j < val.col_num(); ++j)
-            ret(i, j) = std::pow(val(i, j), p);
+    const int rows = val.row_num();
+    const int cols = val.col_num();
+    mat_t<val_type> ret(rows, cols);
+    // The square is special-cased because std::pow with a runtime exponent is a
+    // library call costing tens of cycles, and LayerNorm's variance step is by far
+    // its most frequent use (pow(x, 2.0) once per element per normalization).
+    if (p == 2.)
+    {
+        for (int i = 0; i < rows; ++i)
+            for (int j = 0; j < cols; ++j)
+            {
+                const val_type x = at_fast(val, i, j);
+                ret.unchecked(i, j) = x * x;
+            }
+        return ret;
+    }
+    for (int i = 0; i < rows; ++i)
+        for (int j = 0; j < cols; ++j)
+            ret.unchecked(i, j) = std::pow(static_cast<double>(at_fast(val, i, j)), p);
     return ret;
 }
 
