@@ -65,6 +65,15 @@ def run_jasmine(binary, weights, args, threads, label):
     # only when it is not already set, so a caller can override or opt out.
     if env.get("OPENBLAS_CORETYPE") is None and args.blas_coretype:
         env["OPENBLAS_CORETYPE"] = args.blas_coretype
+    # MKL's dispatcher (libmkl_rt) prefers its own OpenMP (libiomp) unless told
+    # otherwise. jasmine's own parallel loops are OpenMP too, and two OpenMP
+    # runtimes in one process is a known source of hangs, so MKL is pointed at the
+    # GNU layer. Only set when the binary actually links MKL -- the variable is
+    # meaningless for OpenBLAS and netlib. libmkl_intel_thread need not be present
+    # at all once this is set, which is also why it is not installed here.
+    if "mkl" in blas_description(binary).lower():
+        env["MKL_THREADING_LAYER"] = args.mkl_threading_layer
+        log(f"[{label}] MKL_THREADING_LAYER={env['MKL_THREADING_LAYER']}")
     log(f"[{label}] OPENBLAS_CORETYPE={env.get('OPENBLAS_CORETYPE', '(auto-detect)')}")
 
     cmd = [
@@ -235,6 +244,11 @@ def main():
                          "pass an empty string to let the library auto-detect). Older "
                          "OpenBLAS builds fall back to SSE-only kernels on recent CPUs, "
                          "which costs ~1.7x on this model.")
+    ap.add_argument("--mkl-threading-layer", default="GNU",
+                    help="MKL_THREADING_LAYER for jasmine builds that link MKL. GNU keeps "
+                         "MKL on the same OpenMP runtime as jasmine's own parallel loops; "
+                         "the default INTEL layer would put two OpenMP runtimes in one "
+                         "process.")
     args = ap.parse_args()
 
     for path in (args.jasmine_bin, args.weights):

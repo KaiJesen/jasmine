@@ -27,6 +27,39 @@ machine it detects the CPU correctly and is 1.79x faster on the forward than the
 was initially linked, purely because that one fell back to SSE3 kernels. Check with
 `OPENBLAS_VERBOSE=2` before trusting any comparison.
 
+## Which BLAS
+
+Three options were measured head-to-head on the same machine, same weights, 4 threads, alternating
+runs to control for thermal drift. `lm_head` is the single largest weight (154 MB of 328 MB).
+
+| BLAS | core/kernels actually used | full forward | decode, ms/token |
+|---|---|---|---|
+| netlib reference 3.12.0 (distro default) | scalar, single-threaded | 990.93 ms | 34.77 ms |
+| OpenBLAS 0.3.26 | `Haswell` (AVX2/FMA), auto-detected | **106.50 ms** | 9.52 ms |
+| MKL 2020.4 (Ubuntu multiverse) | AVX2, `MKL_THREADING_LAYER=GNU` | 108.18 ms | **8.30 ms** |
+
+So the two good BLAS libraries are **within 2% on the batched forward**, and MKL is **1.15x better on
+single-token decode**. That second number is real and was measured in one session rather than across
+sessions: decode goes through the hand-written GEMV kernel only for operands above 16 MiB (which is
+`lm_head` alone in fp32), and the remaining per-layer matrices still go through BLAS, where MKL's
+matrix-vector path is better. With MKL, decode at 4 threads reaches **parity with PyTorch** (7.75 vs
+7.85 ms).
+
+**MKL does not close the forward gap, and there is a reason to expect it cannot here.** The MKL that
+PyTorch uses is not this one. `find / -name 'libmkl*.so*'` returns nothing: torch's MKL is **statically
+linked** into `libtorch_cpu.so` (23,605 MKL/cblas symbols defined, zero undefined), and it is from a
+2024-era pip wheel rather than the 2020.4 package in Ubuntu 24.04's multiverse. The 570 GFLOP/s that
+torch reaches on these GEMM shapes is that newer, statically-linked MKL — it is not available as a
+shared library on this machine, so it cannot be linked here. What was measured above is a five-year-old
+MKL, and it is level with OpenBLAS.
+
+Linking MKL has one non-obvious requirement: `libmkl_rt.so` loads a threading layer at runtime and
+prefers Intel's own OpenMP (`libmkl_intel_thread`). jasmine's parallel loops are OpenMP too, and two
+OpenMP runtimes in one process is a well-known source of hangs, so this build uses the GNU layer
+(`libmkl_gnu_thread` plus `MKL_THREADING_LAYER=GNU`) and deliberately does not install the Intel one.
+Without the variable, the binary aborts with `Cannot load libmkl_intel_thread.so`.
+`tools/compare_gpt2_torch.py` sets it automatically when the binary links MKL.
+
 ## Environment
 
 | | |
@@ -35,7 +68,7 @@ was initially linked, purely because that one fell back to SSE3 kernels. Check w
 | Measured peak read bandwidth | ~50 GB/s at 14 threads, ~55 GB/s two-stream |
 | Compiler | g++ 13.3.0, CMake 3.28.3, `-O3 -DNDEBUG` (no `-march=native`) |
 | jasmine default BLAS | netlib reference BLAS 3.12.0 (`libblas3`) — **single-threaded, unoptimized** |
-| jasmine comparison BLAS | **OpenBLAS 0.3.26** (Ubuntu 24.04 `libopenblas0-pthread`), auto-detects `Haswell` |
+| jasmine comparison BLAS | **OpenBLAS 0.3.26** (Ubuntu 24.04 `libopenblas0-pthread`), auto-detects `Haswell`; MKL 2020.4 also measured, see *Which BLAS* |
 | PyTorch | 2.9.0+cu128, CPU, MKL |
 | transformers | 5.17.0 |
 
@@ -379,19 +412,23 @@ fp32 nothing changes at all, since the largest non-`lm_head` matrix is 9.4 MB, b
 either way. Re-tuning it would be worth a few percent on the double path only.
 
 **5. What is left is not one thing.** With a correctly-tuned BLAS the projection GEMMs are roughly
-55-60 ms of the 106 ms forward, and MKL does the same shapes in 40.66 ms, so GEMM efficiency is the
-larger remaining piece and it is bounded by the BLAS we link. The other ~50 ms is attention,
-normalization and elementwise work spread across many small operations; no single one of them is
-large enough to move the total, which is why micro-tuning there stopped paying.
+55-60 ms of the 107 ms forward, and the MKL that PyTorch actually uses does the same shapes in
+40.66 ms, so GEMM efficiency is the larger remaining piece and it is bounded by the BLAS that can be
+linked here (see *Which BLAS* — the measured MKL 2020.4 is level with OpenBLAS on the forward, and
+torch's newer MKL is statically linked into `libtorch_cpu.so` and not available as a library). The
+other ~50 ms is attention, normalization and elementwise work spread across many small operations;
+no single one of them is large enough to move the total, which is why micro-tuning there stopped
+paying.
 
 **6. We have not beaten PyTorch on the forward, and on this machine probably cannot.** Closing 2.36x
-would need a BLAS at MKL's level plus removing essentially all of the 50 ms of non-GEMM work. Decode
-at 8 threads is at parity (1.06x), and single-token decode is bandwidth-bound and within 1.27x at
-four threads. Those are the honest numbers.
+would need a BLAS at the level of torch's own MKL plus removing essentially all of the 50 ms of
+non-GEMM work; neither is available from where we are. Decode is the different story: it is
+bandwidth-bound, PyTorch is already near the memory ceiling, and with MKL at 4 threads jasmine is at
+**parity** (7.75 vs 7.85 ms/token). On decode there is nothing left for PyTorch to pull away with.
 
 ## Raw logs
 
-`gpt2_vs_torch_1threads.txt`, `gpt2_vs_torch_4threads.txt`, `gpt2_vs_torch_8threads.txt`,
-`gpt2_gemv_ab.txt` (the GEMV A/B run). The three `gpt2_vs_torch_*.txt` logs were recorded against
-OpenBLAS 0.3.26 with the core type auto-detected; earlier versions of them (older OpenBLAS,
-auto-detected or forced) are in the git history.
+`gpt2_vs_torch_1threads.txt`, `gpt2_vs_torch_4threads.txt`, `gpt2_vs_torch_8threads.txt` (OpenBLAS
+0.3.26, core type auto-detected), `gpt2_vs_torch_mkl_{1,4,8}threads.txt` (MKL 2020.4), and
+`gpt2_gemv_ab.txt` (the GEMV A/B run). Earlier versions of the `gpt2_vs_torch_*.txt` logs (older
+OpenBLAS, auto-detected or forced) are in the git history.

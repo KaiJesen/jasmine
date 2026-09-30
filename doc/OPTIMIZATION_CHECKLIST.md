@@ -112,6 +112,28 @@
   - **教训**：这条比同期任何代码优化都大。做性能对比前必须先确认 BLAS 的实际内核，
     否则测的是打包/CPU 检测，不是实现
 
+- [x] **试用 Intel MKL（对比「是不是换个 BLAS 就能追平」）**
+  - 拿法：`apt-get download` Ubuntu multiverse 的 `intel-mkl 2020.4`（`libmkl-rt/core/avx2/gnu-thread/intel-lp64`），
+    解压后用 RPATH 链接，**不安装任何系统包**
+  - 实测（4 线程，与 OpenBLAS 0.3.26 同轮交替）：
+
+    | BLAS | forward | decode/token |
+    |---|---|---|
+    | OpenBLAS 0.3.26（Haswell，自动） | **106.5 ms** | 9.52 ms |
+    | MKL 2020.4（AVX2） | 108.2 ms | **8.30 ms** |
+
+  - **forward 上 MKL 无改善（2% 内，噪声）**；**decode 上 MKL 快 1.15×**，使 4 线程 decode 与
+    PyTorch 打平（7.75 vs 7.85 ms）
+  - **关键认知**：PyTorch 用的 MKL **不是这个**。`find / -name 'libmkl*.so*'` 为空——
+    torch 的 MKL **静态链进了 `libtorch_cpu.so`**（23605 个符号已定义、未定义为 0），且来自
+    2024 年的 pip wheel，而 Ubuntu 里能拿到的是 2020.4。torch 那 570 GFLOP/s 来自那份更新的
+    静态 MKL，本机无法作为共享库链接。所以「forward 差 2.36×」不能简单归因于「换 MKL 就好」
+  - **链接 MKL 的必要前提**：`libmkl_rt` 默认加载 Intel 自带的 OpenMP；而 jasmine 的并行循环也是
+    OpenMP，同进程两个 OpenMP runtime 是已知的挂死来源。故用 `libmkl_gnu_thread` +
+    `MKL_THREADING_LAYER=GNU`，并**故意不装** intel-thread；不加该变量会直接
+    `Cannot load libmkl_intel_thread.so` 退出。`compare_gpt2_torch.py` 已自动处理
+  - 日志：`doc/bench/gpt2_vs_torch_mkl_{1,4,8}threads.txt`
+
 - [x] **单列输出（解码）走 GEMV，不走 GEMM**
   - 问题：解码恒为 `N=1`，每个权重只用一次，GEMM 的分块打包（把 A/B 复制成缓存友好的副本）
     收益为零，却把「必须搬 328 MB」变成搬了更多——时间没花在读权重，花在复制权重
@@ -119,6 +141,9 @@
     溢出到 DRAM 后 GEMV 单遍扫描赢，36 MB 时 1.38×、147 MB 时 1.76×
   - 实现：`jas_mat_gemm.hpp` 的 `gemv_rowmajor`，阈值 `gemv_byte_threshold = 16 MiB`（留在 L3 之下），
     只对 `N==1 && !trans_a` 生效；可用 `-DJASMINE_USE_GEMV=0` 关掉做 A/B
+  - 注：换更好的 BLAS 会把交叉点从 ~24 MB 上推到 ~40 MB，使 16 MiB 偏保守。**未调整**，因为
+    fp32 下最大的非 lm_head 矩阵只有 9.4 MB（无论怎么调都走 BLAS），而 double 下开 GEMV 仍明显更快
+    （13.8–15.0 vs 19.3–19.6 ms/token）——double 下 lm_head 是 309 MB，占绝对主导
   - 验收：`MatGemm.GemvDispatchPolicy` / `GemvKernelMatchesNaive` / `GemvKernelHandlesBothVectorStrides`；
     真实权重 `Gpt2AlignmentTest` 三例全绿、`verify_gpt2.py` 逐 token 一致
   - 实测（distilgpt2 / fp32 / 4 线程）：decode 16.33 → 12.41 ms/token（**1.32×**），

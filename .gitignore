@@ -7,6 +7,7 @@ build-openblas/
 build-openblas-nogemv/
 build-ob326/
 build-ob326-nogemv/
+build-mkl/
 cmake-build-*/
 *.o
 *.a
