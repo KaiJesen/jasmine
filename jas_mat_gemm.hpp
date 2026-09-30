@@ -37,6 +37,47 @@ inline constexpr long long gemm_omp_threshold = 64LL * 64 * 64;
 // Multi-head attend: rough work units ~ heads * seq * d_head
 inline constexpr long long mha_head_omp_threshold = 4LL * 32 * 32;
 
+// Set to 0 to force every GEMM through BLAS / the blocked kernel, for A/B
+// measurement of the single-column path below.
+#ifndef JASMINE_USE_GEMV
+#define JASMINE_USE_GEMV 1
+#endif
+
+/**
+ * N == 1 is the autoregressive-decode case: every weight is used exactly once, so
+ * there is no reuse for GEMM blocking to exploit, and BLAS's packing buffers turn
+ * into pure extra traffic. A plain GEMV streams the weight matrix exactly once.
+ *
+ * Measured on this machine (K = 768, 4 threads, GB/s counted over the weight
+ * matrix only, OpenBLAS against a scalar GEMV):
+ *
+ *   M      1024   2048   4096   8192  12288  16384  32768  50257
+ *   MB        3      6     12     24     36     48     96    147
+ *   sgemm  36.1   58.6   56.3   41.7   30.7   24.5   21.1   20.2
+ *   gemv   20.9   44.7   45.1   43.1   42.5   37.2   36.1   35.6
+ *
+ * The crossover sits at ~24 MB, which is this machine's L3 (24 MiB): while the
+ * matrix fits in cache the packing traffic stays on-chip and BLAS wins, and once
+ * it spills to DRAM the GEMV's single pass wins, by 1.38x at 36 MB and 1.76x at
+ * 147 MB. The threshold is therefore put just below L3, so only operands that
+ * clearly cannot be cache-resident take the GEMV path.
+ */
+inline constexpr long long gemv_byte_threshold = 16LL * 1024 * 1024;
+
+/**
+ * Whether the single-column path applies. trans_a is excluded because a
+ * transposed left operand is addressed column-wise, which defeats the streaming
+ * access the kernel relies on; callers already materialise it (see gemm_operand).
+ * N > 1 is excluded because the weights then get reused down the output columns
+ * and GEMM blocking earns its keep again.
+ */
+inline bool gemv_should_apply(int M, int N, int K, long long elem_bytes, bool trans_a)
+{
+    if (N != 1 || trans_a)
+        return false;
+    return static_cast<long long>(M) * K * elem_bytes >= gemv_byte_threshold;
+}
+
 inline bool gemm_should_parallel(int M, int N, int K)
 {
 #ifdef JASMINE_USE_OPENMP
@@ -131,6 +172,51 @@ void gemm_blocked_rowmajor(int M, int N, int K,
         gemm_blocked_rowmajor_impl<true, true, T>(M, N, K, A, lda, B, ldb, C, ldc);
 }
 
+/**
+ * Single-column kernel: C[:,0] = A * b, A is (M x K) row-major, b is a strided
+ * vector. Each row is an independent dot product, so A is read front to back
+ * exactly once and nothing is packed or copied.
+ *
+ * trans_b collapses into the vector's stride: with one column, a transposed
+ * right operand is just the same values stored contiguously instead of ldb apart.
+ * B_CONTIG keeps the multiply out of the address arithmetic in the common case.
+ */
+template <bool B_CONTIG, typename T>
+void gemv_rowmajor_impl(int M, int K, const T* A, int lda,
+                        const T* b, int b_stride, T* C, int ldc)
+{
+    const bool parallel = gemm_should_parallel(M, 1, K);
+#ifdef JASMINE_USE_OPENMP
+#pragma omp parallel for schedule(static) if(parallel)
+#endif
+    for (int i = 0; i < M; ++i)
+    {
+        const T* row = A + static_cast<std::size_t>(i) * lda;
+        T s = T{};
+        if constexpr (B_CONTIG)
+        {
+            for (int k = 0; k < K; ++k)
+                s += row[k] * b[k];
+        }
+        else
+        {
+            for (int k = 0; k < K; ++k)
+                s += row[k] * b[static_cast<std::size_t>(k) * b_stride];
+        }
+        C[static_cast<std::size_t>(i) * ldc] = s;
+    }
+}
+
+template <typename T>
+void gemv_rowmajor(int M, int K, const T* A, int lda,
+                   const T* b, int b_stride, T* C, int ldc)
+{
+    if (b_stride == 1)
+        gemv_rowmajor_impl<true, T>(M, K, A, lda, b, b_stride, C, ldc);
+    else
+        gemv_rowmajor_impl<false, T>(M, K, A, lda, b, b_stride, C, ldc);
+}
+
 template <typename T>
 void gemm_blas_or_blocked(int M, int N, int K,
                           const T* A, int lda,
@@ -138,6 +224,16 @@ void gemm_blas_or_blocked(int M, int N, int K,
                           T* C, int ldc,
                           bool trans_a, bool trans_b)
 {
+#if JASMINE_USE_GEMV
+    // Checked ahead of the BLAS branch because it also applies when no BLAS is
+    // available, where the blocked fallback is far worse for a single column.
+    if (gemv_should_apply(M, N, K, static_cast<long long>(sizeof(T)), trans_a))
+    {
+        const int b_stride = trans_b ? 1 : ldb;
+        gemv_rowmajor(M, K, A, lda, B, b_stride, C, ldc);
+        return;
+    }
+#endif
 #ifdef JASMINE_USE_BLAS
     if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>)
     {

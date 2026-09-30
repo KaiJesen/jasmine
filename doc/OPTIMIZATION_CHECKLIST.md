@@ -91,6 +91,19 @@
   - 验收：`tests/test_gemm.cpp`；`doc/bench/matmul_*.txt` 中 `BM_MatDot` 在 `n≥256` 有数量级加速
   - 基线（Release，优化前）→ 优化后对比见 `doc/bench/`
 
+- [x] **单列输出（解码）走 GEMV，不走 GEMM**
+  - 问题：解码恒为 `N=1`，每个权重只用一次，GEMM 的分块打包（把 A/B 复制成缓存友好的副本）
+    收益为零，却把「必须搬 328 MB」变成搬了更多——时间没花在读权重，花在复制权重
+  - 实测交叉点在 **24 MB，正好是本机 L3（24 MiB）**：矩阵能驻留 L3 时打包流量不出片、BLAS 赢；
+    溢出到 DRAM 后 GEMV 单遍扫描赢，36 MB 时 1.38×、147 MB 时 1.76×
+  - 实现：`jas_mat_gemm.hpp` 的 `gemv_rowmajor`，阈值 `gemv_byte_threshold = 16 MiB`（留在 L3 之下），
+    只对 `N==1 && !trans_a` 生效；可用 `-DJASMINE_USE_GEMV=0` 关掉做 A/B
+  - 验收：`MatGemm.GemvDispatchPolicy` / `GemvKernelMatchesNaive` / `GemvKernelHandlesBothVectorStrides`；
+    真实权重 `Gpt2AlignmentTest` 三例全绿、`verify_gpt2.py` 逐 token 一致
+  - 实测（distilgpt2 / fp32 / 4 线程）：decode 16.33 → 12.41 ms/token（**1.32×**），
+    double 下 20.10 → 15.76 ms（1.28×）；`forward`/`prefill` 不变（N=128 不走该路径），
+    logits 校验和逐位相同 → 见 `doc/bench/gpt2_gemv_ab.txt`
+
 - [x] **削减不必要的** `.clone()`
   - `jas_mat_storage.hpp::store_for_backward` + 层间 `net_forward` 完美转发（mat rvalue 移动）
   - 推理 KV：attend 直接读 cache view，不再每步 clone 全量 K/V

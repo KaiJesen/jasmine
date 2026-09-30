@@ -4,6 +4,7 @@ build-asan/
 build-cuda/
 build-tsan/
 build-openblas/
+build-openblas-nogemv/
 cmake-build-*/
 *.o
 *.a

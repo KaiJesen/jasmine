@@ -2,16 +2,16 @@ threads=8  prefill=128 tokens  decode=32 tokens  repeats=3  warmup=1
 weights=build/distilgpt2_weights.bin  HF model=distilgpt2
 [jasmine] build-openblas/benches/bench_gpt2_infer build/distilgpt2_weights.bin --dtype float --prefill 128 --decode 32 --repeats 3 --warmup 1
 [jasmine] OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=1
-Loading weights:   0%|          | 0/76 [00:00<?, ?it/s]Loading weights: 100%|██████████| 76/76 [00:00<00:00, 14943.14it/s]
+Loading weights:   0%|          | 0/76 [00:00<?, ?it/s]Loading weights: 100%|██████████| 76/76 [00:00<00:00, 21461.46it/s]
 
 ==============================================================================
 metric                                         jasmine               pytorch
 ------------------------------------------------------------------------------
-full forward, tokens                          259.0405        61.9284 ( 4.18x)
-prefill (cache), tokens                       257.0145        62.1985 ( 4.13x)
-decode, ms per token                           12.7536         8.2479 ( 1.55x)
+full forward, tokens                          267.1598        79.3254 ( 3.37x)
+prefill (cache), tokens                       272.1748        79.5558 ( 3.42x)
+decode, ms per token                           11.4129         8.9142 ( 1.28x)
 ------------------------------------------------------------------------------
-prefill + decode total                        665.1297              326.1322
+prefill + decode total                        637.3876              364.8109
 
 logits checksum (must agree)             -2518023.4670         -2518022.7500
 
